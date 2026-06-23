@@ -1,11 +1,13 @@
 # 运行时数据（挂载到容器 /data，勿打入镜像）
 data/
 test_data/
+md/
 
 # 文档与说明
 *.md
 README*
 LICENSE*
+GitHub命令.md
 
 # Python 缓存与编译产物
 __pycache__/

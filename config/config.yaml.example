@@ -1,0 +1,64 @@
+# qb-up-limit 种子配置示例
+# 首次启动时复制为 config/config.yaml 并挂载到容器 /config/config.yaml
+# 程序会自动导入到 /data/config.yaml；之后请在 Web 界面或 /data/config.yaml 中修改
+
+global:
+  timezone: Asia/Shanghai
+  collect_interval: 5
+  refresh_interval: 1
+  data_retention_years: 5
+  web_port: 8765
+  emby_enabled: false
+  emby_default_device_view: qb
+
+qbittorrent_instances:
+  - name: qB-示例1
+    host: 192.168.1.100
+    port: 8080
+    use_https: false
+    verify_ssl: false
+    username: ''
+    connection_timeout: 3
+    read_timeout: 3
+    cycle:
+      type: month
+      reset_anchor: 1
+      reset_limit_kbps: 0
+    speed_rules:
+      - cycle_upload_limit_gb: 500
+        speed_limit_kbps: 128
+      - cycle_upload_limit_gb: 800
+        speed_limit_kbps: 512
+    allow_manual_unlimit: true
+    display_priority: 1
+
+  - name: qB-示例2
+    host: qb.example.com
+    port: 443
+    use_https: true
+    verify_ssl: true
+    username: admin
+    connection_timeout: 3
+    read_timeout: 3
+    cycle:
+      type: month
+      reset_anchor: 1
+      reset_limit_kbps: 0
+    speed_rules:
+      - cycle_upload_limit_gb: 200
+        speed_limit_kbps: 256
+    allow_manual_unlimit: true
+    display_priority: 2
+
+# Emby 集成（可选；需挂载 Docker Socket 以统计容器外网流量）
+emby_instances:
+  - name: Emby-示例
+    host: 192.168.1.10
+    port: 8096
+    use_https: false
+    verify_ssl: false
+    container_name: emby
+    container_id: ''
+    connection_timeout: 3
+    display_priority: 1
+    wan_traffic_only: true

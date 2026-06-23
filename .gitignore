@@ -1,0 +1,53 @@
+# 运行时数据（含配置、密钥、数据库、日志、播放记录）
+data/
+test_data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 日志
+*.log
+*.log.*
+
+# 本地/敏感配置
+.env
+.env.*
+*.local.yaml
+*.local.yml
+
+# IDE / 编辑器
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 测试缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 本地开发修改记录（可选，不提交到公开仓库）
+*.md

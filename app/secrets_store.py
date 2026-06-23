@@ -1,0 +1,217 @@
+"""凭据存储：Web 密码哈希、qB 连接密码与 Emby API Key 加密，独立于 config.yaml"""
+
+import json
+import os
+import logging
+import threading
+
+from itsdangerous import URLSafeSerializer
+from werkzeug.security import check_password_hash, generate_password_hash
+
+logger = logging.getLogger(__name__)
+
+_lock = threading.RLock()
+
+DATA_KEY_PATH = '/data/.data_key'
+WEB_AUTH_PATH = '/data/.web_auth'
+QB_SECRETS_PATH = '/data/.qb_secrets'
+EMBY_SECRETS_PATH = '/data/.emby_secrets'
+
+DEFAULT_WEB_USER = 'admin'
+DEFAULT_WEB_PASS = 'adminadmin'
+
+
+def _ensure_parent(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _read_json(path: str, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"读取 {path} 失败: {e}")
+        return default
+
+
+def _write_json(path: str, data) -> None:
+    _ensure_parent(path)
+    tmp_path = f'{path}.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def ensure_data_key() -> str:
+    with _lock:
+        if os.path.exists(DATA_KEY_PATH):
+            with open(DATA_KEY_PATH, 'r', encoding='utf-8') as f:
+                key = f.read().strip()
+                if key:
+                    return key
+        key = os.urandom(32).hex()
+        _ensure_parent(DATA_KEY_PATH)
+        with open(DATA_KEY_PATH, 'w', encoding='utf-8') as f:
+            f.write(key)
+        logger.info(f"已生成数据加密密钥: {DATA_KEY_PATH}")
+        return key
+
+
+def _serializer() -> URLSafeSerializer:
+    return URLSafeSerializer(ensure_data_key(), salt='qb-up-limit-secrets')
+
+
+def encrypt_value(plain: str) -> str:
+    return _serializer().dumps(plain)
+
+
+def decrypt_value(token: str) -> str:
+    if not token:
+        return ''
+    try:
+        return _serializer().loads(token)
+    except Exception:
+        logger.warning("解密凭据失败，可能密钥已变更")
+        return ''
+
+
+def ensure_web_auth() -> dict:
+    with _lock:
+        auth = _read_json(WEB_AUTH_PATH, {})
+        if auth.get('username') and auth.get('password_hash'):
+            return auth
+        auth = {
+            'username': DEFAULT_WEB_USER,
+            'password_hash': generate_password_hash(DEFAULT_WEB_PASS),
+        }
+        _write_json(WEB_AUTH_PATH, auth)
+        logger.info(f"已创建默认 Web 登录凭据: {WEB_AUTH_PATH}")
+        return auth
+
+
+def get_web_username() -> str:
+    return ensure_web_auth().get('username', DEFAULT_WEB_USER)
+
+
+def verify_web_password(password: str) -> bool:
+    auth = ensure_web_auth()
+    password_hash = auth.get('password_hash', '')
+    if not password_hash:
+        return False
+    return check_password_hash(password_hash, password)
+
+
+def has_web_password() -> bool:
+    auth = _read_json(WEB_AUTH_PATH, {})
+    return bool(auth.get('password_hash'))
+
+
+def set_web_credentials(username: str, password: str = None) -> None:
+    with _lock:
+        auth = ensure_web_auth()
+        auth['username'] = str(username or '').strip() or DEFAULT_WEB_USER
+        if password:
+            if len(password) < 6:
+                raise ValueError('密码至少 6 位')
+            auth['password_hash'] = generate_password_hash(password)
+        _write_json(WEB_AUTH_PATH, auth)
+
+
+def _load_qb_secrets() -> dict:
+    return _read_json(QB_SECRETS_PATH, {})
+
+
+def _save_qb_secrets(secrets: dict) -> None:
+    _write_json(QB_SECRETS_PATH, secrets)
+
+
+def get_qb_password(instance_name: str) -> str:
+    if not instance_name:
+        return ''
+    token = _load_qb_secrets().get(instance_name)
+    if not token:
+        return ''
+    return decrypt_value(token)
+
+
+def set_qb_password(instance_name: str, password: str) -> None:
+    if not instance_name:
+        return
+    with _lock:
+        secrets = _load_qb_secrets()
+        if password:
+            secrets[instance_name] = encrypt_value(password)
+        else:
+            secrets.pop(instance_name, None)
+        _save_qb_secrets(secrets)
+
+
+def delete_qb_password(instance_name: str) -> None:
+    set_qb_password(instance_name, '')
+
+
+def has_qb_password(instance_name: str) -> bool:
+    return bool(get_qb_password(instance_name))
+
+
+def rename_qb_password(old_name: str, new_name: str) -> None:
+    if not old_name or not new_name or old_name == new_name:
+        return
+    with _lock:
+        secrets = _load_qb_secrets()
+        if old_name not in secrets:
+            return
+        secrets[new_name] = secrets.pop(old_name)
+        _save_qb_secrets(secrets)
+
+
+def _load_emby_secrets() -> dict:
+    return _read_json(EMBY_SECRETS_PATH, {})
+
+
+def _save_emby_secrets(secrets: dict) -> None:
+    _write_json(EMBY_SECRETS_PATH, secrets)
+
+
+def get_emby_api_key(instance_name: str) -> str:
+    if not instance_name:
+        return ''
+    token = _load_emby_secrets().get(instance_name)
+    if not token:
+        return ''
+    return decrypt_value(token)
+
+
+def set_emby_api_key(instance_name: str, api_key: str) -> None:
+    if not instance_name:
+        return
+    with _lock:
+        secrets = _load_emby_secrets()
+        if api_key:
+            secrets[instance_name] = encrypt_value(api_key)
+        else:
+            secrets.pop(instance_name, None)
+        _save_emby_secrets(secrets)
+
+
+def delete_emby_api_key(instance_name: str) -> None:
+    set_emby_api_key(instance_name, '')
+
+
+def has_emby_api_key(instance_name: str) -> bool:
+    return bool(get_emby_api_key(instance_name))
+
+
+def rename_emby_api_key(old_name: str, new_name: str) -> None:
+    if not old_name or not new_name or old_name == new_name:
+        return
+    with _lock:
+        secrets = _load_emby_secrets()
+        if old_name not in secrets:
+            return
+        secrets[new_name] = secrets.pop(old_name)
+        _save_emby_secrets(secrets)

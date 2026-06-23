@@ -1,0 +1,9 @@
+qbittorrent-api==2024.2.59
+flask==3.0.2
+flask-cors==4.0.0
+pyyaml==6.0.1
+requests==2.31.0
+waitress==3.0.0
+tzdata
+itsdangerous>=2.1.0
+werkzeug>=3.0.0

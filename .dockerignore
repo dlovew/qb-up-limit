@@ -1,0 +1,68 @@
+# 运行时数据（挂载到容器 /data，勿打入镜像）
+data/
+test_data/
+
+# 文档与说明
+*.md
+README*
+LICENSE*
+
+# Python 缓存与编译产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 日志
+*.log
+*.log.*
+
+# 本地/敏感配置（运行时由卷提供）
+.env
+.env.*
+*.local.yaml
+*.local.yml
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDE / 编辑器
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+*~
+
+# 操作系统杂项
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker 编排（构建不需要）
+docker-compose*.yml
+docker-compose*.yaml
+compose*.yml
+compose*.yaml
+
+# 测试与开发工具（当前项目未使用，预留）
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/

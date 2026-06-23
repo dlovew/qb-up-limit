@@ -1,0 +1,17 @@
+services:
+  qb-up-limit:
+    build: .
+    image: qb-up-limit:latest
+    container_name: qb-up-limit
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      # 运行时数据：配置、数据库、密钥、日志（首次启动自动创建）
+      - ./data:/data
+      # 可选：首次启动种子配置（复制 config.yaml.example 为 config.yaml）
+      - ./config/config.yaml:/config/config.yaml:ro
+      # 可选：Emby 容器外网流量统计（只读挂载 Docker Socket）
+      - /var/run/docker.sock:/var/run/docker.sock:ro

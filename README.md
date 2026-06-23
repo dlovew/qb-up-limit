@@ -65,7 +65,7 @@ services:
 
 - `/data`：运行时配置、SQLite 数据库、加密密钥、日志
 - `/config/config.yaml`：可选，仅**首次**无 `/data/config.yaml` 时导入
-- Docker Socket：仅 Emby 容器流量统计需要；不需要 Emby 功能时可去掉该挂载
+- Docker Socket：仅开始Emby功能需要；不需要 Emby 功能时可去掉该挂载
 
 
 

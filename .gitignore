@@ -1,6 +1,6 @@
 # 运行时数据（含配置、密钥、数据库、日志、播放记录）
 data/
-test_data/
+md/
 
 # Python
 __pycache__/

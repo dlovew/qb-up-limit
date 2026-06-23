@@ -37,8 +37,7 @@ services:
     image: luowenfu/qb-up-limit:latest
     container_name: qb-up-limit
     restart: unless-stopped
-    ports:
-      - "8765:8765"
+    network_mode: host
     environment:
       TZ: Asia/Shanghai
     volumes:

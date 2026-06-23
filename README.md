@@ -8,18 +8,18 @@
 
 > 例每月上传达到 500GB 自动限速为 512KB/s，每月 1 日恢复至无限速
 
-![image-20260624005902778](\\192.168.40.22\Container\qb-up-limit-test\assets\image-20260624005902778.png)
+![image-20260624005902778](.\assets\image-20260624005902778.png)
 
 ---
 
 ### Emby 集成（可选）：
 **Emby 与 qB 设备视图合并展示**
 
-![image-20260624010248383](\\192.168.40.22\Container\qb-up-limit-test\assets\image-20260624010248383.png)
+![image-20260624010248383](.\assets\image-20260624010248383.png)
 
 **完整信息的播放会话记录+外网上行估算：**
 
-![image-20260624012230492](\\192.168.40.22\Container\qb-up-limit-test\assets\image-20260624012230492.png)
+![image-20260624012230492](.\assets\image-20260624012230492.png)
 
 ---
 

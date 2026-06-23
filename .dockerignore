@@ -2,7 +2,8 @@
 data/
 test_data/
 md/
-
+.dockerignore
+.gitignore
 # 文档与说明
 *.md
 README*

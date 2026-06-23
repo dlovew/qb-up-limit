@@ -6,7 +6,8 @@ md/
 修复*.md
 开源准备*.md
 GitHub命令.md
-
+.gitignore
+.dockerignore
 # Python
 __pycache__/
 *.py[cod]

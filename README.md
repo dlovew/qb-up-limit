@@ -70,12 +70,13 @@ services:
 
 以下内容**切勿**提交到公开仓库或分享给他人：
 
-- `data/config.yaml`（真实主机地址）
-- `data/.qb_secrets`、`data/.emby_secrets`（API 密钥与密码）
+- `data/config.yaml`
+- `data/.qb_secrets`、`data/.emby_secrets`
 - `data/.web_auth`、`data/.web_secret`、`data/.data_key`
 - `data/*.db`、`data/app.log*`、`data/emby_events/`
 
-> 仅供学习测试
+
+> 本开源项目仅供学习测试
 
 ## 许可证
 

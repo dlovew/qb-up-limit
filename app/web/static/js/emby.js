@@ -5,6 +5,105 @@ const VALID_EMBY_TABS = new Set(['devices', 'stats', 'events', 'syslogs']);
 let embyNavExpanded = false;
 let embyCurrentTab = 'devices';
 let cachedEmbyInstances = [];
+let embyDebugTrafficConfig = null;
+const EMBY_DEBUG_QUERY_KEY = 'emby_debug';
+
+function isEmbyDebugModeEnabled() {
+    try {
+        const value = new URLSearchParams(window.location.search || '').get(EMBY_DEBUG_QUERY_KEY);
+        if (value == null) return false;
+        const normalized = String(value).trim().toLowerCase();
+        return normalized === '1' || normalized === 'true';
+    } catch (_) {
+        return false;
+    }
+}
+
+const EMBY_DEBUG_MODE_ENABLED = isEmbyDebugModeEnabled();
+const EMBY_DEBUG_NEW_WINDOW_DEFAULT = 8;
+const EMBY_DEBUG_SEEK_WINDOW_DEFAULT = 6;
+const EMBY_DEBUG_PRIORITY_DEFAULT = 'seek_first';
+const EMBY_DEBUG_PANEL_COLLAPSE_KEY = 'qb-up-limit-emby-debug-panel-collapsed';
+
+function isEmbyDebugPanelCollapsed() {
+    try {
+        return localStorage.getItem(EMBY_DEBUG_PANEL_COLLAPSE_KEY) !== '0';
+    } catch (_) {
+        return true;
+    }
+}
+
+function setEmbyDebugPanelCollapsed(collapsed) {
+    try {
+        localStorage.setItem(EMBY_DEBUG_PANEL_COLLAPSE_KEY, collapsed ? '1' : '0');
+    } catch (_) {
+        /* ignore */
+    }
+}
+
+// 每次带 ?emby_debug=1 进入页面时默认收起调试面板
+if (EMBY_DEBUG_MODE_ENABLED) {
+    setEmbyDebugPanelCollapsed(true);
+}
+
+function normalizeEmbyDebugTrafficConfig(raw = null) {
+    const src = raw || {};
+    const newWindowRaw = parseInt(
+        src.new_session_window_seconds ?? src.emby_burst_new_session_window_seconds,
+        10,
+    );
+    const seekWindowRaw = parseInt(
+        src.seek_window_seconds ?? src.emby_burst_seek_window_seconds,
+        10,
+    );
+    const priorityRaw = String(
+        src.priority_mode ?? src.emby_burst_priority_mode ?? EMBY_DEBUG_PRIORITY_DEFAULT,
+    ).trim().toLowerCase();
+    const newWindow = Number.isFinite(newWindowRaw) ? newWindowRaw : EMBY_DEBUG_NEW_WINDOW_DEFAULT;
+    const seekWindow = Number.isFinite(seekWindowRaw) ? seekWindowRaw : EMBY_DEBUG_SEEK_WINDOW_DEFAULT;
+    return {
+        new_session_window_seconds: Math.max(1, Math.min(30, newWindow)),
+        seek_window_seconds: Math.max(1, Math.min(30, seekWindow)),
+        priority_mode: priorityRaw === 'new_first' ? 'new_first' : EMBY_DEBUG_PRIORITY_DEFAULT,
+    };
+}
+
+function embyDebugPriorityLabel(mode) {
+    return mode === 'new_first' ? '新会话优先' : '跳转优先';
+}
+
+function inferEmbyDebugModeLabel(inst) {
+    const counts = getEmbyInstancePlaybackCounts(inst || {});
+    if ((counts.lan || 0) <= 0 && (counts.wan || 0) <= 0) return '无播放 M0';
+    if ((counts.lan || 0) > 0 && (counts.wan || 0) <= 0) return '仅局域网 M1';
+    if ((counts.wan || 0) > 0 && (counts.lan || 0) <= 0) return '仅外网 M2';
+    return '局域网+外网 M3';
+}
+
+function normalizeEmbyDebugTrafficMetrics(inst = null) {
+    const src = (inst && inst.debug_traffic_metrics) || {};
+    const parseNonNegativeInt = (value, fallback = 0) => {
+        const n = parseInt(value, 10);
+        if (!Number.isFinite(n) || n < 0) return Math.max(0, parseInt(fallback, 10) || 0);
+        return n;
+    };
+    const modeLabel = String(src.mode_label || '').trim() || inferEmbyDebugModeLabel(inst);
+    return {
+        modeLabel,
+        totalUploadBytes: parseNonNegativeInt(src.total_upload_bytes, inst?.recent_delta_bytes || 0),
+        wanUploadBytes: parseNonNegativeInt(src.wan_upload_bytes, 0),
+        lanUploadBytes: parseNonNegativeInt(src.lan_upload_bytes, 0),
+        programRemainderBytes: parseNonNegativeInt(src.program_remainder_bytes, 0),
+    };
+}
+
+function isEmbyEstimateUploadEnabled(instanceName) {
+    const name = String(instanceName || '').trim();
+    if (!name) return true;
+    const inst = (cachedEmbyInstances || []).find(i => i?.name === name);
+    if (!inst) return true;
+    return inst.estimate_upload_enabled !== false;
+}
 
 const EMBY_PLAYBACK_EVENT_TYPES = new Set([
     'VideoPlayback', 'VideoPlaybackStopped', 'VideoPlaybackPaused', 'VideoPlaybackUnpaused',
@@ -281,6 +380,24 @@ function buildEmbySessionBadgesHtml(session) {
     return badges.join('');
 }
 
+function formatEmbyLiveUploadDebugText(bytes) {
+    const value = Number(bytes);
+    if (!Number.isFinite(value) || value <= 0) return '0B';
+    return formatEmbyEstimatedUpload(Math.floor(value)) || '0B';
+}
+
+function buildEmbySessionUploadDebugHtml(session) {
+    if (!EMBY_DEBUG_MODE_ENABLED || !session?.is_remote) return '';
+    const liveTotalBytes = Math.max(0, parseInt(session.estimated_upload_bytes_live, 10) || 0);
+    const live1sBytes = Math.max(0, parseInt(session.estimated_upload_bytes_1s_live, 10) || 0);
+    const oneSecondText = formatEmbyLiveUploadDebugText(live1sBytes);
+    const totalText = formatEmbyLiveUploadDebugText(liveTotalBytes);
+    return `<div class="emby-session-debug">
+        <div class="emby-session-debug-row">1秒新增 ${escapeHtml(oneSecondText)}</div>
+        <div class="emby-session-debug-row">流量累积 ${escapeHtml(totalText)}</div>
+    </div>`;
+}
+
 const EMBY_SESSION_MESSAGE_TIMEOUT_MS = 8000;
 
 function formatEmbySessionPercent(value) {
@@ -431,6 +548,19 @@ function patchEmbySessionItemElement(el, session, instanceName) {
         const metaHtml = buildEmbySessionMetaLine(session);
         if (metaEl.innerHTML !== metaHtml) metaEl.innerHTML = metaHtml;
     }
+    const debugHtml = buildEmbySessionUploadDebugHtml(session);
+    const debugEl = el.querySelector('.emby-session-debug');
+    if (debugHtml) {
+        if (debugEl) {
+            if (debugEl.outerHTML !== debugHtml) debugEl.outerHTML = debugHtml;
+        } else if (metaEl) {
+            metaEl.insertAdjacentHTML('afterend', debugHtml);
+        } else {
+            el.insertAdjacentHTML('beforeend', debugHtml);
+        }
+    } else if (debugEl) {
+        debugEl.remove();
+    }
     const oldStandaloneTime = el.querySelector(':scope > .emby-session-time');
     if (oldStandaloneTime) oldStandaloneTime.remove();
     const footerEl = el.querySelector('.emby-session-footer');
@@ -540,6 +670,7 @@ function buildEmbySessionItemHtml(session, instanceName, compact = false) {
                 <div class="emby-session-badges">${buildEmbySessionBadgesHtml(session)}</div>
             </div>
             <div class="emby-session-meta">${buildEmbySessionMetaLine(session)}</div>
+            ${buildEmbySessionUploadDebugHtml(session)}
             ${compact ? buildEmbySessionCompactFooterHtml(session) : buildEmbySessionProgressHtml(session)}
         </div>`;
 }
@@ -996,6 +1127,13 @@ async function refreshEmbyStatus(forceRender = false, silent = false) {
         const response = await axios.get('/api/emby/status');
         if (!response.data.success) return;
         cachedEmbyInstances = response.data.data || [];
+        if (response.data.debug_traffic_config) {
+            embyDebugTrafficConfig = normalizeEmbyDebugTrafficConfig(
+                response.data.debug_traffic_config,
+            );
+        } else if (!embyDebugTrafficConfig) {
+            embyDebugTrafficConfig = normalizeEmbyDebugTrafficConfig();
+        }
         updateEmbyInstanceSelects(cachedEmbyInstances);
         updateEmbyHeaderStats(cachedEmbyInstances);
         if (typeof embyInstanceCount !== 'undefined') {
@@ -1226,6 +1364,248 @@ function buildEmbyInstanceBadgesRightHTML(inst) {
     return html;
 }
 
+function buildEmbyDebugTrafficConfigPanelHtml(inst) {
+    if (!EMBY_DEBUG_MODE_ENABLED) return '';
+    const cfg = normalizeEmbyDebugTrafficConfig(embyDebugTrafficConfig);
+    const metrics = normalizeEmbyDebugTrafficMetrics(inst);
+    const collapsed = isEmbyDebugPanelCollapsed();
+    const chevron = `<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    return `
+        <div class="emby-debug-config-panel" data-collapsed="${collapsed ? '1' : '0'}">
+            <button type="button" class="emby-debug-config-toggle" onclick="toggleEmbyDebugConfigPanel(this)" aria-expanded="${collapsed ? 'false' : 'true'}">
+                <span class="emby-debug-config-toggle-main">
+                    <span class="emby-debug-config-toggle-title">
+                        <span class="emby-debug-config-dot"></span>会话分摊调试
+                    </span>
+                    <span class="emby-debug-config-toggle-sub">
+                        <span class="emby-debug-config-mode-chip" data-field="mode-label">${escapeHtml(metrics.modeLabel)}</span>
+                    </span>
+                </span>
+                <span class="emby-debug-config-toggle-icon" data-field="toggle-icon" aria-hidden="true">${chevron}</span>
+            </button>
+            <div class="emby-debug-config-body" data-field="debug-body" ${collapsed ? 'hidden' : ''}>
+                <div class="emby-debug-section">
+                    <div class="emby-debug-section-title">实时流量拆分</div>
+                    <div class="emby-debug-traffic-grid">
+                        <div class="emby-debug-traffic-item" data-accent="upload">
+                            <span class="emby-debug-traffic-label">总上传流量</span>
+                            <strong class="emby-debug-traffic-value" data-field="total-upload">${escapeHtml(formatCardTrafficText(metrics.totalUploadBytes))}</strong>
+                        </div>
+                        <div class="emby-debug-traffic-item" data-accent="wan">
+                            <span class="emby-debug-traffic-label">总 WAN 流量</span>
+                            <strong class="emby-debug-traffic-value" data-field="total-wan">${escapeHtml(formatCardTrafficText(metrics.wanUploadBytes))}</strong>
+                        </div>
+                        <div class="emby-debug-traffic-item" data-accent="lan">
+                            <span class="emby-debug-traffic-label">总 LAN 流量</span>
+                            <strong class="emby-debug-traffic-value" data-field="total-lan">${escapeHtml(formatCardTrafficText(metrics.lanUploadBytes))}</strong>
+                        </div>
+                        <div class="emby-debug-traffic-item" data-accent="remainder">
+                            <span class="emby-debug-traffic-label">程序余量</span>
+                            <strong class="emby-debug-traffic-value" data-field="program-remainder">${escapeHtml(formatCardTrafficText(metrics.programRemainderBytes))}</strong>
+                        </div>
+                    </div>
+                </div>
+                <div class="emby-debug-section">
+                    <div class="emby-debug-section-title">
+                        分摊参数
+                        <span class="emby-debug-section-hint">保存后立即生效</span>
+                    </div>
+                    <div class="emby-debug-config-grid">
+                        <label class="emby-debug-config-field">
+                            <span class="emby-debug-config-field-label">新会话突发窗口<span class="emby-debug-help" tabindex="0" data-tip="新会话开始播放后的这段时间（秒）内视为突发期，瞬时上传增量优先计入突发流量池分摊，建议8秒，范围 1-30 秒。">?</span></span>
+                            <input type="number" min="1" max="30" step="1" value="${cfg.new_session_window_seconds}" data-field="new-window" />
+                        </label>
+                        <label class="emby-debug-config-field">
+                            <span class="emby-debug-config-field-label">跳转突发窗口<span class="emby-debug-help" tabindex="0" data-tip="会话发生进度跳转（Seek）后的这段时间（秒）内视为突发期，瞬时上传增量优先计入突发流量池分摊，建议6秒，范围 1-30 秒。">?</span></span>
+                            <input type="number" min="1" max="30" step="1" value="${cfg.seek_window_seconds}" data-field="seek-window" />
+                        </label>
+                        <label class="emby-debug-config-field">
+                            <span class="emby-debug-config-field-label">突发优先级<span class="emby-debug-help" tabindex="0" data-tip="当同时存在新会话与跳转会话时，决定突发流量池优先分摊给哪一类会话：Seek 优先 或 新会话优先。">?</span></span>
+                            <select data-field="priority-mode">
+                                <option value="seek_first" ${cfg.priority_mode === 'seek_first' ? 'selected' : ''}>${embyDebugPriorityLabel('seek_first')}</option>
+                                <option value="new_first" ${cfg.priority_mode === 'new_first' ? 'selected' : ''}>${embyDebugPriorityLabel('new_first')}</option>
+                            </select>
+                        </label>
+                    </div>
+                    <div class="emby-debug-config-actions">
+                        <button type="button" class="emby-debug-config-save" onclick="saveEmbyDebugTrafficConfig(this)">保存并应用</button>
+                        <button type="button" class="emby-debug-config-exit" onclick="exitEmbyDebugMode()">退出调试模式</button>
+                    </div>
+                </div>
+            </div>
+        </div>`;
+}
+
+let embyDebugTipEl = null;
+
+function ensureEmbyDebugTipEl() {
+    if (embyDebugTipEl && document.body.contains(embyDebugTipEl)) return embyDebugTipEl;
+    const el = document.createElement('div');
+    el.className = 'emby-debug-tip';
+    el.setAttribute('role', 'tooltip');
+    document.body.appendChild(el);
+    embyDebugTipEl = el;
+    return el;
+}
+
+function showEmbyDebugTip(target) {
+    const text = target?.getAttribute('data-tip');
+    if (!text) return;
+    const el = ensureEmbyDebugTipEl();
+    el.textContent = text;
+    el.classList.add('visible');
+    const rect = target.getBoundingClientRect();
+    const tipRect = el.getBoundingClientRect();
+    const margin = 8;
+    let left = rect.left + rect.width / 2 - tipRect.width / 2;
+    left = Math.max(margin, Math.min(left, window.innerWidth - tipRect.width - margin));
+    let top = rect.top - tipRect.height - 9;
+    if (top < margin) top = rect.bottom + 9;
+    el.style.left = `${Math.round(left)}px`;
+    el.style.top = `${Math.round(top)}px`;
+}
+
+function hideEmbyDebugTip() {
+    if (embyDebugTipEl) embyDebugTipEl.classList.remove('visible');
+}
+
+function bindEmbyDebugTipEvents() {
+    if (window.__embyDebugTipBound) return;
+    window.__embyDebugTipBound = true;
+    const resolve = (e) => (e.target?.closest ? e.target.closest('.emby-debug-help') : null);
+    document.addEventListener('mouseover', (e) => {
+        const t = resolve(e);
+        if (t) showEmbyDebugTip(t);
+    });
+    document.addEventListener('mouseout', (e) => {
+        if (resolve(e)) hideEmbyDebugTip();
+    });
+    document.addEventListener('focusin', (e) => {
+        const t = resolve(e);
+        if (t) showEmbyDebugTip(t);
+    });
+    document.addEventListener('focusout', (e) => {
+        if (resolve(e)) hideEmbyDebugTip();
+    });
+    window.addEventListener('scroll', hideEmbyDebugTip, true);
+}
+
+if (typeof document !== 'undefined') {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', bindEmbyDebugTipEvents);
+    } else {
+        bindEmbyDebugTipEvents();
+    }
+}
+
+function setEmbyDebugConfigPanelCollapsedState(panel, collapsed) {
+    if (!panel) return;
+    panel.dataset.collapsed = collapsed ? '1' : '0';
+    const body = panel.querySelector('[data-field="debug-body"]');
+    const toggle = panel.querySelector('.emby-debug-config-toggle');
+    const icon = panel.querySelector('[data-field="toggle-icon"]');
+    if (body) body.hidden = collapsed;
+    if (toggle) toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    if (icon) icon.setAttribute('aria-hidden', 'true');
+}
+
+function toggleEmbyDebugConfigPanel(button) {
+    const panel = button?.closest('.emby-debug-config-panel');
+    if (!panel) return;
+    const nextCollapsed = panel.dataset.collapsed !== '1';
+    setEmbyDebugPanelCollapsed(nextCollapsed);
+    document.querySelectorAll('.emby-debug-config-panel').forEach(item => {
+        setEmbyDebugConfigPanelCollapsedState(item, nextCollapsed);
+    });
+    if (typeof scheduleSyncMergeViewCardHeights === 'function') {
+        scheduleSyncMergeViewCardHeights();
+    }
+}
+
+function patchEmbyDebugTrafficPanel(card, inst) {
+    if (!EMBY_DEBUG_MODE_ENABLED || !card) return;
+    const panel = card.querySelector('.emby-debug-config-panel');
+    if (!panel) return;
+    const metrics = normalizeEmbyDebugTrafficMetrics(inst);
+    const modeEl = panel.querySelector('[data-field="mode-label"]');
+    if (modeEl) modeEl.textContent = metrics.modeLabel;
+    const setText = (field, bytes) => {
+        const el = panel.querySelector(`[data-field="${field}"]`);
+        if (!el) return;
+        el.textContent = formatCardTrafficText(bytes);
+    };
+    setText('total-upload', metrics.totalUploadBytes);
+    setText('total-wan', metrics.wanUploadBytes);
+    setText('total-lan', metrics.lanUploadBytes);
+    setText('program-remainder', metrics.programRemainderBytes);
+}
+
+function exitEmbyDebugMode() {
+    if (!EMBY_DEBUG_MODE_ENABLED) return;
+    try {
+        const url = new URL(window.location.href);
+        url.searchParams.delete(EMBY_DEBUG_QUERY_KEY);
+        const search = url.searchParams.toString();
+        const nextUrl = `${url.pathname}${search ? `?${search}` : ''}${url.hash || ''}`;
+        window.location.replace(nextUrl);
+    } catch (_) {
+        window.location.replace(window.location.pathname);
+    }
+}
+
+async function saveEmbyDebugTrafficConfig(button) {
+    if (!EMBY_DEBUG_MODE_ENABLED) return;
+    const panel = button?.closest('.emby-debug-config-panel');
+    if (!panel) return;
+    const newWindow = parseInt(panel.querySelector('[data-field="new-window"]')?.value, 10);
+    const seekWindow = parseInt(panel.querySelector('[data-field="seek-window"]')?.value, 10);
+    const priorityMode = String(
+        panel.querySelector('[data-field="priority-mode"]')?.value || EMBY_DEBUG_PRIORITY_DEFAULT,
+    ).trim().toLowerCase();
+    if (!Number.isFinite(newWindow) || newWindow < 1 || newWindow > 30) {
+        if (typeof showToast === 'function') showToast('新会话突发窗口请输入 1-30 秒', 'error');
+        return;
+    }
+    if (!Number.isFinite(seekWindow) || seekWindow < 1 || seekWindow > 30) {
+        if (typeof showToast === 'function') showToast('跳转突发窗口请输入 1-30 秒', 'error');
+        return;
+    }
+    if (priorityMode !== 'seek_first' && priorityMode !== 'new_first') {
+        if (typeof showToast === 'function') showToast('突发优先级无效', 'error');
+        return;
+    }
+    const payload = {
+        new_session_window_seconds: newWindow,
+        seek_window_seconds: seekWindow,
+        priority_mode: priorityMode,
+    };
+    if (button) {
+        button.disabled = true;
+        button.textContent = '保存中...';
+    }
+    try {
+        const res = await axios.put('/api/emby/debug-traffic-config', payload);
+        if (!res.data?.success) {
+            if (typeof showToast === 'function') {
+                showToast(res.data?.error || '保存失败', 'error');
+            }
+            return;
+        }
+        embyDebugTrafficConfig = normalizeEmbyDebugTrafficConfig(res.data?.data || payload);
+        if (typeof showToast === 'function') showToast('调试参数已保存并应用', 'success');
+        await refreshEmbyStatus(true, true);
+    } catch (e) {
+        if (typeof showToast === 'function') {
+            showToast(e.response?.data?.error || '保存失败', 'error');
+        }
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = '保存并应用';
+        }
+    }
+}
+
 function buildEmbyInstanceInfoHTML(inst) {
     const recent = getEmbyRecentDisplays(inst);
     const presenceAccent = getEmbyPresencePanelAccentClass(inst);
@@ -1283,32 +1663,33 @@ function buildEmbyInstanceInfoHTML(inst) {
                         valueClass: 'info-value-emby-recent-down info-metric-value--speed',
                         icon: 'download',
                     })}
-                    ${buildInfoMetricCell('今日上传', formatCardTrafficText(inst.today_uploaded_bytes || 0), {
+                    ${buildInfoMetricCell('今日会话上传', formatCardTrafficText(inst.today_uploaded_bytes || 0), {
                         valueClass: 'info-value-emby-today-up info-metric-value--traffic',
                     })}
                     ${buildInfoMetricCell('今日下载', formatCardTrafficText(inst.today_downloaded_bytes || 0), {
                         valueClass: 'info-value-emby-today-down info-metric-value--traffic',
                     })}
-                    ${buildInfoMetricCell('昨日上传', formatCardTrafficText(inst.yesterday_uploaded_bytes || 0), {
+                    ${buildInfoMetricCell('昨日会话上传', formatCardTrafficText(inst.yesterday_uploaded_bytes || 0), {
                         valueClass: 'info-value-emby-yesterday-up info-metric-value--traffic',
                     })}
                     ${buildInfoMetricCell('昨日下载', formatCardTrafficText(inst.yesterday_downloaded_bytes || 0), {
                         valueClass: 'info-value-emby-yesterday-down info-metric-value--traffic',
                     })}
-                    ${buildInfoMetricCell('本月上传', formatCardTrafficText(inst.monthly_uploaded_bytes || 0), {
+                    ${buildInfoMetricCell('本月会话上传', formatCardTrafficText(inst.monthly_uploaded_bytes || 0), {
                         valueClass: 'info-value-emby-month-up info-metric-value--traffic',
                     })}
                     ${buildInfoMetricCell('本月下载', formatCardTrafficText(inst.monthly_downloaded_bytes || 0), {
                         valueClass: 'info-value-emby-month-down info-metric-value--traffic',
                     })}
-                    ${buildInfoMetricCell('设备总上传', formatCardTrafficText(inst.device_uploaded_bytes || 0), {
+                    ${buildInfoMetricCell('会话总上传', formatCardTrafficText(inst.device_uploaded_bytes || 0), {
                         valueClass: 'info-value-emby-device-up info-metric-value--total',
                     })}
                     ${buildInfoMetricCell('设备总下载', formatCardTrafficText(inst.device_downloaded_bytes || 0), {
                         valueClass: 'info-value-emby-device-down info-metric-value--total',
                     })}
                 </div>
-                <p class="info-panel-data-hint info-metric-label">局域网流量不计入统计，不保证准确性</p>
+                <p class="info-panel-data-hint info-metric-label">上传按外网播放会话分摊统计（估算值）</p>
+                ${buildEmbyDebugTrafficConfigPanelHtml(inst)}
             </div>
         </div>`;
 }
@@ -1527,6 +1908,7 @@ function patchEmbyCardMetrics(inst, card) {
 
     setText('.info-value-emby-collect', formatEmbyCollectStatusLabel(inst));
     setText('.info-value-emby-playback-count', formatEmbyPlaybackCountsLabel(inst));
+    patchEmbyDebugTrafficPanel(card, inst);
 
     const apiBadge = card.querySelector('[data-field="badge-api"]');
     if (apiBadge) apiBadge.textContent = `API ${inst.api_online ? '在线' : '离线'}`;
@@ -1620,7 +2002,7 @@ function buildEmbyInstanceForm(inst, mode) {
     const nameMax = typeof INSTANCE_NAME_MAX_LENGTH !== 'undefined' ? INSTANCE_NAME_MAX_LENGTH : 16;
     const priorityMax = typeof DISPLAY_PRIORITY_MAX !== 'undefined' ? DISPLAY_PRIORITY_MAX : 99999;
     const displayPriority = inst?.display_priority ?? (mode === 'add' ? cachedEmbyInstances.length + 1 : 1);
-    const wanOnly = inst?.wan_traffic_only !== false;
+    const estimateUploadEnabled = inst?.estimate_upload_enabled !== false;
 
     return `
         <div class="modal-form modal-form--instance modal-form--emby">
@@ -1701,11 +2083,11 @@ function buildEmbyInstanceForm(inst, mode) {
                 <div class="form-field">
                     <div class="form-row form-row--checkboxes">
                         <label class="checkbox-label">
-                            <input type="checkbox" id="${prefix}EmbyWanTrafficOnly" ${wanOnly ? 'checked' : ''} />
-                            仅统计外网流量
+                            <input type="checkbox" id="${prefix}EmbyEstimateUploadEnabled" ${estimateUploadEnabled ? 'checked' : ''} />
+                            上传估算
                         </label>
                     </div>
-                    <p class="form-hint form-hint--field">开启后局域网播放会话不计入；按客户端 IP 与码率比例从 Docker 总量中估算外网部分</p>
+                    <p class="form-hint form-hint--field">用于播放日志卡片的上传估算展示，建议保持开启，地址栏加 ?emby_debug=1 进入调试模式</p>
                 </div>
                 <div class="connection-test-panel">
                     <div class="test-actions">
@@ -1936,7 +2318,7 @@ function collectEmbyFormData(mode) {
         api_key: String(document.getElementById(`${prefix}EmbyApiKey`)?.value || '').trim(),
         container_name: String(document.getElementById(`${prefix}EmbyContainerName`)?.value || '').trim(),
         container_id: String(document.getElementById(`${prefix}EmbyContainerId`)?.value || '').trim(),
-        wan_traffic_only: !!document.getElementById(`${prefix}EmbyWanTrafficOnly`)?.checked,
+        estimate_upload_enabled: !!document.getElementById(`${prefix}EmbyEstimateUploadEnabled`)?.checked,
     };
 }
 
@@ -2489,16 +2871,11 @@ function resolveEmbyWallClockPlayedSeconds(event, startEvent = null) {
 }
 
 function resolveEmbyPlayedSeconds(event, startEvent = null) {
-    if (resolveEmbySeekCount(event) > 0) {
-        const played = parseInt(event?.played_seconds, 10);
-        if (!Number.isNaN(played) && played > 0) return played;
-    }
+    const played = parseInt(event?.played_seconds, 10);
+    if (!Number.isNaN(played) && played > 0) return played;
 
     const wall = resolveEmbyWallClockPlayedSeconds(event, startEvent);
     if (wall > 0) return wall;
-
-    const played = parseInt(event?.played_seconds, 10);
-    if (!Number.isNaN(played) && played > 0) return played;
 
     const end = parseInt(event?.end_position_seconds, 10);
     const startPos = parseInt(event?.start_position_seconds, 10);
@@ -2679,22 +3056,15 @@ function formatEmbyEstimatedUpload(bytes) {
     return `${mb.toFixed(2)}MB`;
 }
 
-function embyEstimatedUploadSourceLabel(source) {
-    if (source === 'accumulator') return '流量分摊';
-    if (source === 'formula') return '按观看进度';
-    return '';
-}
-
 function buildEmbyEventUploadBadgeHtml(event, options = {}) {
     if (!isEmbyPlaybackStopEvent(event.type)) return '';
     const uploadAnyRemote = options.uploadAnyRemote;
     const remoteOk = uploadAnyRemote != null ? uploadAnyRemote : event.is_remote;
     if (!remoteOk) return '';
+    if (!isEmbyEstimateUploadEnabled(event.instance_name)) return '';
     const text = formatEmbyEstimatedUpload(event.estimated_upload_bytes);
     if (!text) return '';
-    const sourceLabel = embyEstimatedUploadSourceLabel(event.estimated_upload_source);
-    const suffix = sourceLabel ? `（${sourceLabel}）` : '';
-    return `<span class="emby-session-badge emby-event-badge--upload">估算上行${escapeHtml(text)}${escapeHtml(suffix)}</span>`;
+    return `<span class="emby-session-badge emby-event-badge--upload">上传估算${escapeHtml(text)}</span>`;
 }
 
 function buildEmbyPlaybackRecordStatusBadgeHtml(rec) {

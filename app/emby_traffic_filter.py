@@ -54,10 +54,19 @@ def is_wan_endpoint(remote_endpoint: str) -> bool:
     return not is_lan_ip(ip)
 
 
-def is_wan_playback_session(session: dict) -> bool:
-    if not session:
+def is_active_playback_session(session: dict) -> bool:
+    if not isinstance(session, dict):
         return False
-    if not (session.get('is_playing') or session.get('item_id')):
+    # 仅把“真实播放中且非暂停”的会话纳入流量分摊，避免伪活跃会话稀释占比。
+    if not bool(session.get('is_playing')):
+        return False
+    if bool(session.get('is_paused')):
+        return False
+    return True
+
+
+def is_wan_playback_session(session: dict) -> bool:
+    if not is_active_playback_session(session):
         return False
     return is_wan_endpoint(session.get('remote_endpoint') or '')
 
@@ -95,15 +104,7 @@ def session_stream_bps(session: dict) -> int:
 def _active_playback_sessions(sessions: Iterable[dict]) -> List[dict]:
     return [
         s for s in (sessions or [])
-        if s.get('is_playing') or s.get('item_id')
-    ]
-
-
-def _active_upload_sessions(sessions: Iterable[dict]) -> List[dict]:
-    """参与外网上行分摊的会话：播放中且未暂停。"""
-    return [
-        s for s in _active_playback_sessions(sessions)
-        if not bool(s.get('is_paused'))
+        if is_active_playback_session(s)
     ]
 
 
@@ -152,6 +153,13 @@ def playback_accumulator_key(record: dict) -> str:
     """外网播放流量累加键：优先 user+client+item_id，其次集数标签，最后剧名标题。"""
     user = (record.get('user_name') or record.get('UserName') or '').strip().casefold()
     client = (record.get('client') or record.get('Client') or '').strip().casefold()
+    sid = str(
+        record.get('emby_session_id')
+        or record.get('session_id')
+        or record.get('id')
+        or record.get('SessionId')
+        or '',
+    ).strip()
     item_id = str(record.get('item_id') or record.get('ItemId') or '').strip()
     series = (record.get('series_name') or '').casefold()
     episode_label = (record.get('episode_label') or '').strip().casefold()
@@ -160,6 +168,12 @@ def playback_accumulator_key(record: dict) -> str:
         or record.get('episode_title') or ''
     ).casefold()
 
+    if sid and user and client:
+        return f'{user}|{client}|sid:{sid}'
+    if sid and user:
+        return f'{user}|sid:{sid}'
+    if sid:
+        return f'sid:{sid}'
     if user and client and item_id:
         return f'{user}|{client}|{item_id}'
     if user and client and episode_label:
@@ -178,56 +192,3 @@ def legacy_playback_accumulator_key(record: dict) -> str:
         or record.get('episode_title') or ''
     ).casefold()
     return f'{user}|{series}|{title}'
-
-
-def allocate_wan_upload_per_session(delta_up: int,
-                                    sessions: Iterable[dict],
-                                    wan_pool_only: bool = False) -> dict:
-    """将上传增量中的外网部分，按外网会话码率占比分摊。"""
-    delta_up = max(0, int(delta_up or 0))
-    if delta_up == 0:
-        return {}
-
-    playing = _active_upload_sessions(sessions)
-    wan = [s for s in playing if is_wan_playback_session(s)]
-    if not wan:
-        return {}
-
-    if wan_pool_only:
-        wan_pool = delta_up
-    else:
-        lan = [s for s in playing if not is_wan_playback_session(s)]
-        if lan:
-            wan_bps = sum(session_stream_bps(s) for s in wan)
-            total_bps = sum(session_stream_bps(s) for s in playing)
-            if total_bps <= 0:
-                ratio = len(wan) / len(playing)
-            else:
-                ratio = wan_bps / total_bps
-            wan_pool = int(delta_up * max(0.0, min(1.0, ratio)))
-        else:
-            wan_pool = delta_up
-
-    if wan_pool <= 0:
-        return {}
-
-    wan_bps_total = sum(session_stream_bps(s) for s in wan)
-    result: dict = {}
-    if wan_bps_total <= 0:
-        share = wan_pool // len(wan)
-        remainder = wan_pool % len(wan)
-        for idx, session in enumerate(wan):
-            key = playback_accumulator_key(session)
-            result[key] = result.get(key, 0) + share + (1 if idx < remainder else 0)
-        return result
-
-    assigned = 0
-    for idx, session in enumerate(wan):
-        key = playback_accumulator_key(session)
-        if idx == len(wan) - 1:
-            part = wan_pool - assigned
-        else:
-            part = int(wan_pool * session_stream_bps(session) / wan_bps_total)
-            assigned += part
-        result[key] = result.get(key, 0) + part
-    return result

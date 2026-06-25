@@ -141,6 +141,7 @@ class EmbyClient:
         except (TypeError, ValueError):
             self.display_priority = 500
         self.wan_traffic_only = bool(config.get('wan_traffic_only', True))
+        self.estimate_upload_enabled = bool(config.get('estimate_upload_enabled', True))
 
     def update_config(self, config: dict):
         self.__init__(config)

@@ -22,6 +22,7 @@ SEED_CONFIG_PATH = '/config/config.yaml'
 _lock = threading.RLock()
 
 EMBY_DEFAULT_DEVICE_VIEWS = ('qb', 'emby', 'merge')
+EMBY_BURST_PRIORITY_MODES = ('seek_first', 'new_first')
 
 DEFAULT_GLOBAL = {
     'timezone': 'Asia/Shanghai',
@@ -31,6 +32,9 @@ DEFAULT_GLOBAL = {
     'web_port': 8765,
     'emby_enabled': False,
     'emby_default_device_view': 'qb',
+    'emby_burst_new_session_window_seconds': 8,
+    'emby_burst_seek_window_seconds': 6,
+    'emby_burst_priority_mode': 'seek_first',
 }
 
 REFRESH_INTERVAL_MIN = 1
@@ -89,6 +93,7 @@ DEFAULT_EMBY_INSTANCE = {
     'connection_timeout': INSTANCE_HTTP_TIMEOUT,
     'display_priority': 1,
     'wan_traffic_only': True,
+    'estimate_upload_enabled': True,
 }
 
 
@@ -558,6 +563,33 @@ def _validate_global(global_cfg: dict, strict: bool = False,
     if default_view not in EMBY_DEFAULT_DEVICE_VIEWS:
         default_view = 'qb'
     result['emby_default_device_view'] = default_view
+    burst_new_window = _safe_int(
+        result.get('emby_burst_new_session_window_seconds'),
+        DEFAULT_GLOBAL['emby_burst_new_session_window_seconds'],
+    )
+    burst_seek_window = _safe_int(
+        result.get('emby_burst_seek_window_seconds'),
+        DEFAULT_GLOBAL['emby_burst_seek_window_seconds'],
+    )
+    if strict:
+        if burst_new_window < 1 or burst_new_window > 30:
+            raise ValueError('新会话突发窗口须在 1～30 秒之间')
+        if burst_seek_window < 1 or burst_seek_window > 30:
+            raise ValueError('跳转突发窗口须在 1～30 秒之间')
+    else:
+        burst_new_window = max(1, min(30, burst_new_window))
+        burst_seek_window = max(1, min(30, burst_seek_window))
+    result['emby_burst_new_session_window_seconds'] = burst_new_window
+    result['emby_burst_seek_window_seconds'] = burst_seek_window
+    burst_priority_mode = str(
+        result.get(
+            'emby_burst_priority_mode',
+            DEFAULT_GLOBAL['emby_burst_priority_mode'],
+        ) or ''
+    ).strip().lower()
+    if burst_priority_mode not in EMBY_BURST_PRIORITY_MODES:
+        burst_priority_mode = DEFAULT_GLOBAL['emby_burst_priority_mode']
+    result['emby_burst_priority_mode'] = burst_priority_mode
     if strict and emby_instances is not None:
         if not result['emby_enabled'] and len(emby_instances) > 0:
             raise ValueError('请先删除所有 Emby 设备后再关闭 Emby 功能')
@@ -778,8 +810,10 @@ def update_global(global_cfg: dict, base_config: dict = None) -> tuple:
 
         config.setdefault('qbittorrent_instances', [])
         config.setdefault('emby_instances', [])
+        current_global = {**DEFAULT_GLOBAL, **(config.get('global') or {})}
+        merged_global = {**current_global, **(global_cfg or {})}
         config['global'] = _validate_global(
-            global_cfg,
+            merged_global,
             strict=True,
             emby_instances=config.get('emby_instances') or [],
         )
@@ -1002,6 +1036,7 @@ def _migrate_emby_instance_fields(inst: dict) -> dict:
     item['display_priority'] = max(1, min(DISPLAY_PRIORITY_MAX, priority))
     item['connection_timeout'] = INSTANCE_HTTP_TIMEOUT
     item['wan_traffic_only'] = bool(item.get('wan_traffic_only', True))
+    item['estimate_upload_enabled'] = bool(item.get('estimate_upload_enabled', True))
     return item
 
 
@@ -1066,6 +1101,7 @@ def _validate_emby_instance(inst: dict, existing_names: list = None,
     result['display_priority'] = max(1, min(DISPLAY_PRIORITY_MAX, priority))
     result['connection_timeout'] = INSTANCE_HTTP_TIMEOUT
     result['wan_traffic_only'] = bool(result.get('wan_traffic_only', True))
+    result['estimate_upload_enabled'] = bool(result.get('estimate_upload_enabled', True))
     for key in ('reachable', 'attempt_sync', 'apply_rules_now'):
         result.pop(key, None)
     return result

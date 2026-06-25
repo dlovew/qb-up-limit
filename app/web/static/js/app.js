@@ -79,6 +79,7 @@ function getChartInstanceStorageKey(platform = getChartPlatform()) {
 }
 const CHART_ALL_DEVICES_VALUE = '__all__';
 const CHART_ALL_DEVICES_LABEL = '全部设备';
+// 兼容历史缓存值，UI 已移除“整个设备”选项。
 const CHART_PLAYBACK_DEVICE_VALUE = '__device__';
 const CHART_PLAYBACK_ALL_USERS_VALUE = '__all_users__';
 const CHART_PLAYBACK_DEVICE_LABEL = '整个设备';
@@ -1509,7 +1510,7 @@ function buildChartInstanceTitleHTML(instanceName, service = 'qb', playbackLabel
     }
     let titleText = escapeHtml(name);
     if (service === 'emby') {
-        const suffix = String(playbackLabel ?? '').trim() || CHART_PLAYBACK_DEVICE_LABEL;
+        const suffix = String(playbackLabel ?? '').trim() || CHART_PLAYBACK_ALL_USERS_LABEL;
         titleText += ` - ${escapeHtml(suffix)}`;
     }
     return `${buildInstanceServiceIconHTML(service)}<span class="chart-instance-title-text">${titleText}</span>`;
@@ -1531,7 +1532,7 @@ function isChartPlaybackUserQuery(value) {
 
 function migrateChartPlaybackUserValue(value) {
     const v = String(value ?? '').trim();
-    if (!v) return CHART_PLAYBACK_DEVICE_VALUE;
+    if (!v || isChartPlaybackDeviceValue(v)) return CHART_PLAYBACK_ALL_USERS_VALUE;
     return v;
 }
 
@@ -1557,19 +1558,15 @@ function resolveChartPlaybackUserPrev(select) {
 }
 
 function getChartPlaybackUserDisplayLabel(value) {
-    if (isChartPlaybackDeviceValue(value)) return CHART_PLAYBACK_DEVICE_LABEL;
+    if (isChartPlaybackDeviceValue(value)) return CHART_PLAYBACK_ALL_USERS_LABEL;
     if (isChartPlaybackAllUsersValue(value)) return CHART_PLAYBACK_ALL_USERS_LABEL;
-    return String(value ?? '').trim() || CHART_PLAYBACK_DEVICE_LABEL;
+    return String(value ?? '').trim() || CHART_PLAYBACK_ALL_USERS_LABEL;
 }
 
 function buildChartPlaybackUserSelectOptions() {
     const select = document.getElementById('chartPlaybackUser');
     if (!select) return;
     select.innerHTML = '';
-    const deviceOpt = document.createElement('option');
-    deviceOpt.value = CHART_PLAYBACK_DEVICE_VALUE;
-    deviceOpt.textContent = CHART_PLAYBACK_DEVICE_LABEL;
-    select.appendChild(deviceOpt);
     const allUsersOpt = document.createElement('option');
     allUsersOpt.value = CHART_PLAYBACK_ALL_USERS_VALUE;
     allUsersOpt.textContent = CHART_PLAYBACK_ALL_USERS_LABEL;
@@ -3235,7 +3232,7 @@ function getChartPlaybackUserSelection() {
     return (select?.value || '').trim();
 }
 
-/** 查询用外网用户：列表就绪后仅以选框为准；__device__=Docker 总上行，__all_users__=各用户合计 */
+/** 查询用外网用户：列表就绪后仅以选框为准；__all_users__=各用户合计 */
 function getChartPlaybackUserForQuery() {
     if (_chartPlaybackUsersReady) {
         return getChartPlaybackUserSelection();
@@ -3325,7 +3322,7 @@ async function refreshChartPlaybackUsers() {
             }
         }
     } catch (e) {
-        /* 用户列表加载失败时仍可用设备总上行 */
+        /* 用户列表加载失败时仍可用全部用户汇总 */
     } finally {
         finishPlaybackUsersRefresh();
     }
@@ -6175,8 +6172,8 @@ async function updateChart(silent = false) {
 
     try {
         const params = getChartQueryParams();
-        const playbackUser = platform === 'emby' && !isAllDevices
-            ? getChartPlaybackUserForQuery()
+        const playbackUser = platform === 'emby'
+            ? (isAllDevices ? CHART_PLAYBACK_ALL_USERS_VALUE : getChartPlaybackUserForQuery())
             : CHART_PLAYBACK_DEVICE_VALUE;
         const targetNames = isAllDevices
             ? getChartInstanceNamesForPlatform(platform)

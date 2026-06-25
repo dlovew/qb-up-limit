@@ -889,16 +889,38 @@ def _emby_required():
     return None
 
 
+def _emby_debug_traffic_config_payload(global_cfg: dict = None) -> dict:
+    cfg = dict(global_cfg or {})
+    try:
+        new_window = int(cfg.get('emby_burst_new_session_window_seconds', 8))
+    except (TypeError, ValueError):
+        new_window = 8
+    try:
+        seek_window = int(cfg.get('emby_burst_seek_window_seconds', 6))
+    except (TypeError, ValueError):
+        seek_window = 6
+    mode = str(cfg.get('emby_burst_priority_mode') or '').strip().lower()
+    if mode not in ('seek_first', 'new_first'):
+        mode = 'seek_first'
+    return {
+        'new_session_window_seconds': max(1, min(30, new_window)),
+        'seek_window_seconds': max(1, min(30, seek_window)),
+        'priority_mode': mode,
+    }
+
+
 @app.route('/api/emby/status')
 def api_emby_status():
     err = _emby_required()
     if err:
         return err
     try:
+        global_cfg = config_manager.get_global_config(emby_monitor.config)
         return jsonify({
             'success': True,
             'data': emby_monitor.get_status_summary(),
             'docker_socket_available': emby_monitor.docker.is_available(),
+            'debug_traffic_config': _emby_debug_traffic_config_payload(global_cfg),
             'timestamp': traffic_db.now_local().isoformat(),
         })
     except Exception as e:
@@ -919,6 +941,65 @@ def api_emby_status_live():
         })
     except Exception as e:
         logger.error(f'API /emby/status/live 错误: {e}', exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/emby/debug-traffic-config')
+def api_emby_debug_traffic_config_get():
+    err = _emby_required()
+    if err:
+        return err
+    try:
+        global_cfg = config_manager.get_global_config(emby_monitor.config)
+        return jsonify({
+            'success': True,
+            'data': _emby_debug_traffic_config_payload(global_cfg),
+        })
+    except Exception as e:
+        logger.error(f'API GET /emby/debug-traffic-config 错误: {e}', exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/emby/debug-traffic-config', methods=['PUT'])
+def api_emby_debug_traffic_config_update():
+    err = _emby_required()
+    if err:
+        return err
+    try:
+        data = request.get_json() or {}
+        if not isinstance(data, dict):
+            return jsonify({'success': False, 'error': '请求无效'}), 400
+
+        current_global = config_manager.get_global_config(monitor.config)
+        merged_global = dict(current_global)
+        if 'new_session_window_seconds' in data:
+            merged_global['emby_burst_new_session_window_seconds'] = data.get(
+                'new_session_window_seconds',
+            )
+        if 'seek_window_seconds' in data:
+            merged_global['emby_burst_seek_window_seconds'] = data.get(
+                'seek_window_seconds',
+            )
+        if 'priority_mode' in data:
+            merged_global['emby_burst_priority_mode'] = data.get('priority_mode')
+
+        validated, full_config = config_manager.update_global(
+            merged_global, base_config=monitor.config,
+        )
+        if not monitor.apply_config(full_config, refresh_status=False):
+            return jsonify({'success': False, 'error': '配置应用失败'}), 500
+        if emby_monitor and not emby_monitor.apply_config(full_config):
+            return jsonify({'success': False, 'error': 'Emby 配置应用失败'}), 500
+
+        return jsonify({
+            'success': True,
+            'message': '调试参数已保存并应用',
+            'data': _emby_debug_traffic_config_payload(validated),
+        })
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        logger.error(f'API PUT /emby/debug-traffic-config 错误: {e}', exc_info=True)
         return jsonify({'success': False, 'error': str(e)}), 500
 
 

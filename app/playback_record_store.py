@@ -225,6 +225,9 @@ def _apply_session_meta(record: dict, session: dict) -> None:
             record[key] = meta[key]
     if 'is_paused' in prepared:
         record['is_paused'] = bool(prepared.get('is_paused'))
+    record['estimate_upload_enabled'] = bool(
+        prepared.get('estimate_upload_enabled', record.get('estimate_upload_enabled', True)),
+    )
     pos = prepared.get('position_seconds')
     if pos is not None and record.get('status') == 'playing':
         record['end_position_seconds'] = max(0, int(pos))
@@ -247,6 +250,8 @@ def _apply_watch_snapshot(record: dict, snapshot: dict) -> None:
 
 def _resolve_upload_bytes(instance_name: str, record: dict) -> None:
     if not record.get('is_remote'):
+        return
+    if record.get('estimate_upload_enabled') is False:
         return
     if record.get('estimated_upload_bytes') is not None:
         return
@@ -381,7 +386,7 @@ def _find_open_record(store: dict, session: dict,
 
 def enrich_sessions_playback_started_at(instance_name: str,
                                         sessions: list) -> list:
-    """为 Sessions 附加播放段 started_at，供前端按开始时间稳定排序。"""
+    """为 Sessions 附加播放段 started_at 与观看快照字段。"""
     name = (instance_name or '').strip()
     if not name or not sessions:
         return list(sessions or [])
@@ -390,25 +395,39 @@ def enrich_sessions_playback_started_at(instance_name: str,
         rec for rec in (store.get('records') or [])
         if rec.get('status') == 'playing'
     ]
-    by_sid: Dict[str, str] = {}
-    by_track: Dict[tuple, str] = {}
+    by_sid: Dict[str, dict] = {}
+    by_track: Dict[tuple, dict] = {}
     for rec in playing:
         started = str(rec.get('started_at') or '').strip()
-        if not started:
-            continue
+        meta = {
+            'playback_started_at': started,
+            'seek_count': max(0, int(rec.get('seek_count') or 0)),
+            'last_seek_at': str(rec.get('last_seek_at') or '').strip(),
+            'played_seconds': max(0, int(rec.get('played_seconds') or 0)),
+        }
         sid = str(rec.get('emby_session_id') or '').strip()
         if sid:
-            by_sid[sid] = started
-        by_track[_segment_key(rec)] = started
+            by_sid[sid] = meta
+        by_track[_segment_key(rec)] = meta
 
     enriched = []
     for raw in sessions:
         session = dict(raw)
         prepared = _prepare_session(session)
         sid = str(prepared.get('id') or '').strip()
-        started = by_sid.get(sid) or by_track.get(_session_track_key(prepared), '')
+        meta = by_sid.get(sid) or by_track.get(_session_track_key(prepared), {})
+        started = str(meta.get('playback_started_at') or '').strip()
         if started:
             session['playback_started_at'] = started
+        seek_count = int(meta.get('seek_count') or 0)
+        if seek_count > 0:
+            session['seek_count'] = seek_count
+        last_seek_at = str(meta.get('last_seek_at') or '').strip()
+        if last_seek_at:
+            session['last_seek_at'] = last_seek_at
+        played_seconds = int(meta.get('played_seconds') or 0)
+        if played_seconds > 0:
+            session['played_seconds'] = played_seconds
         enriched.append(session)
     return enriched
 

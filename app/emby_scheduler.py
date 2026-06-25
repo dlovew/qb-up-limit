@@ -20,6 +20,79 @@ from scheduler import clamp_interval, ticks_per_full_collect
 logger = logging.getLogger(__name__)
 
 
+def _active_playback_sessions(sessions: list) -> list:
+    return [
+        s for s in (sessions or [])
+        if isinstance(s, dict) and bool(s.get('is_playing')) and not bool(s.get('is_paused'))
+    ]
+
+
+def _debug_mode_from_sessions(sessions: list) -> tuple:
+    active = _active_playback_sessions(sessions)
+    if not active:
+        return 'M0', '无播放 M0', 0, 0
+    wan = [s for s in active if bool(s.get('is_remote'))]
+    lan = [s for s in active if not bool(s.get('is_remote'))]
+    wan_count = len(wan)
+    lan_count = len(lan)
+    if wan_count <= 0 and lan_count > 0:
+        return 'M1', '仅局域网 M1', lan_count, wan_count
+    if wan_count > 0 and lan_count <= 0:
+        return 'M2', '仅外网 M2', lan_count, wan_count
+    return 'M3', '局域网+外网 M3', lan_count, wan_count
+
+
+def _build_debug_traffic_metrics(total_upload_bytes: int, sessions: list,
+                                 wan_upload_bytes: int,
+                                 lan_upload_bytes: int = 0,
+                                 program_remainder_bytes: int = 0) -> dict:
+    total_up = max(0, int(total_upload_bytes or 0))
+    wan_up = max(0, min(total_up, int(wan_upload_bytes or 0)))
+    lan_up = max(0, min(total_up, int(lan_upload_bytes or 0)))
+    mode_code, mode_label, lan_count, wan_count = _debug_mode_from_sessions(sessions)
+    if wan_up + lan_up > total_up:
+        overflow = wan_up + lan_up - total_up
+        lan_up = max(0, lan_up - overflow)
+        if wan_up + lan_up > total_up:
+            wan_up = max(0, total_up - lan_up)
+
+    remainder_max = max(0, total_up - wan_up - lan_up)
+    remainder_in = max(0, int(program_remainder_bytes or 0))
+    remainder = min(remainder_max, remainder_in) if remainder_in > 0 else remainder_max
+
+    if mode_code == 'M0':
+        wan_up = 0
+        lan_up = 0
+        remainder = total_up
+    elif mode_code == 'M1':
+        wan_up = 0
+        if lan_up <= 0:
+            lan_up = total_up
+        lan_up = min(total_up, lan_up)
+        remainder = max(0, total_up - lan_up)
+    elif mode_code == 'M2':
+        lan_up = 0
+        if wan_up <= 0:
+            wan_up = total_up
+        wan_up = min(total_up, wan_up)
+        remainder = max(0, total_up - wan_up)
+    else:
+        assigned = wan_up + lan_up + remainder
+        if assigned < total_up:
+            lan_up += (total_up - assigned)
+
+    return {
+        'mode_code': mode_code,
+        'mode_label': mode_label,
+        'lan_session_count': lan_count,
+        'wan_session_count': wan_count,
+        'total_upload_bytes': total_up,
+        'wan_upload_bytes': max(0, int(wan_up)),
+        'lan_upload_bytes': max(0, int(lan_up)),
+        'program_remainder_bytes': max(0, int(remainder)),
+    }
+
+
 def _online_since_from_prev(prev: dict, was_online: bool = None) -> str:
     if was_online is None:
         was_online = prev.get('is_online')
@@ -63,9 +136,10 @@ class EmbyInstanceWorker:
     def wake(self):
         self._wake.set()
 
-    def _sleep_interval(self):
+    def _sleep_interval(self, tick_elapsed_seconds: float = 0.0):
         interval = clamp_interval(self.monitor.refresh_interval)
-        self._wake.wait(timeout=interval)
+        wait_seconds = max(0.0, float(interval) - max(0.0, float(tick_elapsed_seconds or 0.0)))
+        self._wake.wait(timeout=wait_seconds)
         self._wake.clear()
 
     def _ticks_per_full(self) -> int:
@@ -101,6 +175,7 @@ class EmbyInstanceWorker:
 
     def _loop(self):
         while self._running and self.monitor._running:
+            tick_started = time.monotonic()
             try:
                 if self._should_run_full_tick():
                     self._tick(full=True)
@@ -110,7 +185,8 @@ class EmbyInstanceWorker:
                 self._light_ticks += 1
             except Exception as e:
                 logger.error(f'[Emby:{self.name}] 采集循环异常: {e}', exc_info=True)
-            self._sleep_interval()
+            tick_elapsed = time.monotonic() - tick_started
+            self._sleep_interval(tick_elapsed)
 
     def _apply_traffic_filter(self, client: EmbyClient, delta_up: int, delta_dl: int,
                               sessions: list) -> tuple:
@@ -130,6 +206,14 @@ class EmbyInstanceWorker:
         docker_stats = self._fetch_docker_stats(client) if full else None
         sessions = self._fetch_sessions(client) if api_online else []
         if api_online:
+            estimate_upload_enabled = bool(
+                getattr(client, 'estimate_upload_enabled', True),
+            )
+            sessions = [
+                {**s, 'estimate_upload_enabled': estimate_upload_enabled}
+                if isinstance(s, dict) else s
+                for s in (sessions or [])
+            ]
             self._last_sessions = sessions
             with self.monitor._config_lock:
                 inst_cfg = config_manager.get_emby_instance(
@@ -154,22 +238,46 @@ class EmbyInstanceWorker:
         recovering = not was_online and is_online
         is_backfill = False
         backfill_up = backfill_dl = 0
+        raw_up = raw_dl = 0
+        live_raw_up = live_raw_dl = 0
+        delta_up = delta_dl = 0
+        live_delta_up = live_delta_dl = 0
+        allocation_debug = {
+            'total_upload_bytes': 0,
+            'wan_upload_bytes': 0,
+            'lan_upload_bytes': 0,
+            'wan_pool_bytes': 0,
+            'assigned_bytes': 0,
+            'remainder_bytes': 0,
+            'program_remainder_bytes': 0,
+            'target_session_count': 0,
+        }
 
         if full and docker_stats and has_container:
+            tx = docker_stats['tx_bytes']
+            rx = docker_stats['rx_bytes']
             raw_up, raw_dl = emby_traffic_db.peek_snapshot_deltas(
                 self.name,
-                docker_stats['tx_bytes'],
-                docker_stats['rx_bytes'],
+                tx,
+                rx,
             )
             filt_up, filt_dl = self._apply_traffic_filter(
                 client, raw_up, raw_dl, sessions)
+            live_raw_up = raw_up
+            live_raw_dl = raw_dl
+            if self._was_online and self._baseline_tx is not None and self._baseline_rx is not None:
+                live_raw_up = max(0, tx - self._baseline_tx) if tx >= self._baseline_tx else 0
+                live_raw_dl = max(0, rx - self._baseline_rx) if rx >= self._baseline_rx else 0
+            live_delta_up, live_delta_dl = self._apply_traffic_filter(
+                client, live_raw_up, live_raw_dl, sessions,
+            )
             is_backfill = (
                 recovering and emby_traffic_db.has_docker_baseline(self.name)
             )
             delta_up, delta_dl, backfill_up, backfill_dl = emby_traffic_db.save_snapshot(
                 self.name,
-                docker_stats['tx_bytes'],
-                docker_stats['rx_bytes'],
+                tx,
+                rx,
                 record_up=filt_up,
                 record_down=filt_dl,
                 is_backfill=is_backfill,
@@ -180,8 +288,8 @@ class EmbyInstanceWorker:
                     f'{backfill_up / 1024 / 1024:.2f}MB'
                     f'/下行={backfill_dl / 1024 / 1024:.2f}MB'
                 )
-            self._baseline_tx = docker_stats['tx_bytes']
-            self._baseline_rx = docker_stats['rx_bytes']
+            self._baseline_tx = tx
+            self._baseline_rx = rx
         elif not full and self._was_online and self._baseline_tx is not None:
             stats = self._fetch_docker_stats(client)
             if stats:
@@ -191,12 +299,14 @@ class EmbyInstanceWorker:
                 raw_dl = max(0, rx - self._baseline_rx) if rx >= self._baseline_rx else 0
                 delta_up, delta_dl = self._apply_traffic_filter(
                     client, raw_up, raw_dl, sessions)
+                live_raw_up = raw_up
+                live_raw_dl = raw_dl
+                live_delta_up = delta_up
+                live_delta_dl = delta_dl
                 self._baseline_tx = tx
                 self._baseline_rx = rx
-            else:
-                delta_up = delta_dl = 0
-        else:
-            delta_up = delta_dl = 0
+
+        mode_sessions = sessions if sessions else self._last_sessions
 
         if not is_online and self._was_online:
             logger.warning(f'[Emby:{self.name}] 连接中断，进入离线探测模式')
@@ -208,30 +318,71 @@ class EmbyInstanceWorker:
             docker_available=docker_available and has_container,
         )
 
+        allocation_tick_seconds = max(1, int(self.monitor.refresh_interval or 1))
+        if full and raw_up > 0 and live_raw_up == raw_up:
+            allocation_tick_seconds = max(1, int(self.monitor.collect_interval or 1))
+        # 离线补录 tick 不把间隙流量分摊到当前会话（无法准确归属），但会清空本轮新增展示。
+        if sessions is not None:
+            alloc_input_up = 0 if is_backfill else live_raw_up
+            try:
+                alloc_debug = emby_playback_traffic.accumulate_wan_upload(
+                    self.name,
+                    sessions,
+                    alloc_input_up,
+                    wan_pool_only=getattr(client, 'wan_traffic_only', True),
+                    new_session_window_seconds=self.monitor.burst_new_session_window_seconds,
+                    seek_window_seconds=self.monitor.burst_seek_window_seconds,
+                    priority_mode=self.monitor.burst_priority_mode,
+                    tick_seconds=allocation_tick_seconds,
+                )
+                if isinstance(alloc_debug, dict):
+                    allocation_debug.update(alloc_debug)
+            except Exception as e:
+                logger.debug(
+                    f'[Emby:{self.name}] 外网播放上行累计失败: {e}',
+                )
+        alloc_wan_up = allocation_debug.get('wan_upload_bytes')
+        if alloc_wan_up is None:
+            alloc_wan_up = allocation_debug.get('wan_pool_bytes')
+        alloc_total_up = allocation_debug.get('total_upload_bytes')
+        if alloc_total_up is None:
+            alloc_total_up = live_raw_up
+        if getattr(client, 'wan_traffic_only', True):
+            live_delta_up = max(0, int(alloc_wan_up or 0))
+        else:
+            live_delta_up = max(0, int(alloc_total_up or 0))
+        debug_traffic_metrics = _build_debug_traffic_metrics(
+            live_raw_up,
+            mode_sessions,
+            allocation_debug.get('wan_upload_bytes')
+            if allocation_debug.get('wan_upload_bytes') is not None
+            else allocation_debug.get('wan_pool_bytes') or 0,
+            allocation_debug.get('lan_upload_bytes')
+            if allocation_debug.get('lan_upload_bytes') is not None
+            else allocation_debug.get('lan_pool_bytes') or 0,
+            allocation_debug.get('program_remainder_bytes')
+            if allocation_debug.get('program_remainder_bytes') is not None
+            else allocation_debug.get('remainder_bytes') or 0,
+        )
+        try:
+            sessions = emby_playback_traffic.annotate_live_sessions_upload(
+                self.name, sessions,
+            )
+        except Exception as e:
+            logger.debug(
+                f'[Emby:{self.name}] 实时会话上行调试字段附加失败: {e}',
+            )
         self.monitor.update_live_cache(
             self.name,
             is_online=is_online,
             api_online=api_online,
             docker_available=docker_available and has_container,
-            delta_up=delta_up,
-            delta_dl=delta_dl,
+            delta_up=live_delta_up,
+            delta_dl=live_delta_dl,
             sessions=sessions,
+            debug_metrics=debug_traffic_metrics,
             full=full,
         )
-        # 与 save_snapshot 同源：仅完整采集周期累计，避免轻量探测重复计入约 2 倍
-        # 离线补录 tick 不把间隙流量分摊到当前会话（无法准确归属）
-        if full and delta_up > 0 and sessions and not is_backfill:
-            try:
-                emby_playback_traffic.accumulate_wan_upload(
-                    self.name,
-                    sessions,
-                    delta_up,
-                    wan_pool_only=getattr(client, 'wan_traffic_only', True),
-                )
-            except Exception as e:
-                logger.debug(
-                    f'[Emby:{self.name}] 外网播放上行累计失败: {e}',
-                )
         self._was_online = is_online
 
 
@@ -255,6 +406,22 @@ class EmbyMonitor:
         self.global_cfg = config_manager.get_global_config(self.config)
         self.collect_interval = self.global_cfg.get('collect_interval', 5)
         self.refresh_interval = self.global_cfg.get('refresh_interval', 1)
+        try:
+            burst_new_window = int(
+                self.global_cfg.get('emby_burst_new_session_window_seconds', 8),
+            )
+        except (TypeError, ValueError):
+            burst_new_window = 8
+        try:
+            burst_seek_window = int(
+                self.global_cfg.get('emby_burst_seek_window_seconds', 6),
+            )
+        except (TypeError, ValueError):
+            burst_seek_window = 6
+        self.burst_new_session_window_seconds = max(1, min(30, burst_new_window))
+        self.burst_seek_window_seconds = max(1, min(30, burst_seek_window))
+        mode = str(self.global_cfg.get('emby_burst_priority_mode') or '').strip().lower()
+        self.burst_priority_mode = mode if mode in ('seek_first', 'new_first') else 'seek_first'
         tz_name = self.global_cfg.get('timezone', 'Asia/Shanghai')
         try:
             self.timezone = ZoneInfo(tz_name)
@@ -355,7 +522,7 @@ class EmbyMonitor:
 
     def update_live_cache(self, name: str, is_online: bool, api_online: bool,
                           docker_available: bool, delta_up: int, delta_dl: int,
-                          sessions: list, full: bool):
+                          sessions: list, debug_metrics: dict, full: bool):
         with self._live_cache_lock:
             prev = self._live_cache.get(name, {})
             prev_api_online = prev.get('api_online', False)
@@ -381,6 +548,7 @@ class EmbyMonitor:
                 'recent_delta_download_bytes': delta_dl,
                 'session_count': len(sessions),
                 'sessions': sessions,
+                'debug_traffic_metrics': dict(debug_metrics or {}),
                 'collect_generation': self._collect_generation.get(name, 0),
                 'state_generation': self._state_generation.get(name, 0),
             }
@@ -445,6 +613,7 @@ class EmbyMonitor:
                 'container_id': client.container_id,
                 'display_priority': client.display_priority,
                 'wan_traffic_only': client.wan_traffic_only,
+                'estimate_upload_enabled': client.estimate_upload_enabled,
                 'is_online': live.get('is_online', status.get('is_online', 0) == 1),
                 'api_online': api_online,
                 'offline_since': offline_since,

@@ -2,6 +2,8 @@
 data/
 test_data/
 md/
+.cursorrules
+.cursorignore
 
 # 文档与说明
 *.md

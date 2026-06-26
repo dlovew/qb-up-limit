@@ -1859,6 +1859,30 @@ html:not(.emby-feature-enabled) .chart-control--device-type {
     letter-spacing: 0.2px;
 }
 
+.emby-debug-traffic-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.emby-debug-traffic-meta-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: #f3f4f6;
+    color: #4b5563;
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.emby-debug-traffic-meta-item strong {
+    color: #111827;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
 .emby-debug-config-grid {
     display: flex;
     flex-direction: column;
@@ -1870,7 +1894,7 @@ html:not(.emby-feature-enabled) .chart-control--device-type {
     flex-direction: row;
     align-items: center;
     justify-content: flex-start;
-    gap: 12px;
+    gap: 10px;
     min-width: 0;
     padding: 7px 10px;
     border-radius: 9px;
@@ -1879,8 +1903,8 @@ html:not(.emby-feature-enabled) .chart-control--device-type {
 }
 
 .emby-debug-config-field-label {
-    flex: 0 0 120px;
-    width: 120px;
+    flex: 0 0 108px;
+    width: 108px;
     min-width: 0;
     font-size: 12px;
     color: #4b5563;
@@ -1943,6 +1967,11 @@ html:not(.emby-feature-enabled) .chart-control--device-type {
     opacity: 1;
     visibility: visible;
     transform: translateY(0);
+}
+
+.emby-debug-tip-highlight {
+    color: #86efac;
+    font-weight: 700;
 }
 
 .emby-debug-config-field input,

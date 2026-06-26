@@ -899,13 +899,22 @@ def _emby_debug_traffic_config_payload(global_cfg: dict = None) -> dict:
         seek_window = int(cfg.get('emby_burst_seek_window_seconds', 6))
     except (TypeError, ValueError):
         seek_window = 6
+    try:
+        mode_switch_grace = int(cfg.get('emby_mode_switch_grace_seconds', 2))
+    except (TypeError, ValueError):
+        mode_switch_grace = 2
     mode = str(cfg.get('emby_burst_priority_mode') or '').strip().lower()
     if mode not in ('seek_first', 'new_first'):
         mode = 'seek_first'
+    m3_scale = config_manager.clamp_emby_m3_wan_pool_scale(
+        cfg.get('emby_m3_wan_pool_scale', 1.0),
+    )
     return {
         'new_session_window_seconds': max(1, min(30, new_window)),
         'seek_window_seconds': max(1, min(30, seek_window)),
         'priority_mode': mode,
+        'mode_switch_grace_seconds': max(0, min(10, mode_switch_grace)),
+        'm3_wan_pool_scale': m3_scale,
     }
 
 
@@ -941,6 +950,40 @@ def api_emby_status_live():
         })
     except Exception as e:
         logger.error(f'API /emby/status/live 错误: {e}', exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/emby/traffic-verify')
+def api_emby_traffic_verify():
+    err = _emby_required()
+    if err:
+        return err
+    try:
+        instance_name = (request.args.get('instance') or '').strip() or None
+        return jsonify({
+            'success': True,
+            'data': emby_monitor.get_traffic_verify_summary(instance_name),
+            'timestamp': traffic_db.now_local().isoformat(),
+        })
+    except Exception as e:
+        logger.error(f'API /emby/traffic-verify 错误: {e}', exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/emby/traffic-verify/reset', methods=['POST'])
+def api_emby_traffic_verify_reset():
+    err = _emby_required()
+    if err:
+        return err
+    try:
+        data = request.get_json(silent=True) or {}
+        instance_name = str(data.get('instance') or request.args.get('instance') or '').strip()
+        if not instance_name:
+            return jsonify({'success': False, 'error': '缺少 instance'}), 400
+        emby_monitor.reset_traffic_verify(instance_name)
+        return jsonify({'success': True, 'message': f'已重置 {instance_name} 在线验算累计'})
+    except Exception as e:
+        logger.error(f'API POST /emby/traffic-verify/reset 错误: {e}', exc_info=True)
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -982,6 +1025,12 @@ def api_emby_debug_traffic_config_update():
             )
         if 'priority_mode' in data:
             merged_global['emby_burst_priority_mode'] = data.get('priority_mode')
+        if 'mode_switch_grace_seconds' in data:
+            merged_global['emby_mode_switch_grace_seconds'] = data.get(
+                'mode_switch_grace_seconds',
+            )
+        if 'm3_wan_pool_scale' in data:
+            merged_global['emby_m3_wan_pool_scale'] = data.get('m3_wan_pool_scale')
 
         validated, full_config = config_manager.update_global(
             merged_global, base_config=monitor.config,

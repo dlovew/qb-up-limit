@@ -23,6 +23,10 @@ const EMBY_DEBUG_MODE_ENABLED = isEmbyDebugModeEnabled();
 const EMBY_DEBUG_NEW_WINDOW_DEFAULT = 8;
 const EMBY_DEBUG_SEEK_WINDOW_DEFAULT = 6;
 const EMBY_DEBUG_PRIORITY_DEFAULT = 'seek_first';
+const EMBY_DEBUG_MODE_SWITCH_GRACE_DEFAULT = 2;
+const EMBY_M3_WAN_POOL_SCALE_DEFAULT = 1.0;
+const EMBY_M3_WAN_POOL_SCALE_MIN = 0.5;
+const EMBY_M3_WAN_POOL_SCALE_MAX = 1.5;
 const EMBY_DEBUG_PANEL_COLLAPSE_KEY = 'qb-up-limit-emby-debug-panel-collapsed';
 
 function isEmbyDebugPanelCollapsed() {
@@ -56,16 +60,39 @@ function normalizeEmbyDebugTrafficConfig(raw = null) {
         src.seek_window_seconds ?? src.emby_burst_seek_window_seconds,
         10,
     );
+    const modeSwitchGraceRaw = parseInt(
+        src.mode_switch_grace_seconds ?? src.emby_mode_switch_grace_seconds,
+        10,
+    );
     const priorityRaw = String(
         src.priority_mode ?? src.emby_burst_priority_mode ?? EMBY_DEBUG_PRIORITY_DEFAULT,
     ).trim().toLowerCase();
     const newWindow = Number.isFinite(newWindowRaw) ? newWindowRaw : EMBY_DEBUG_NEW_WINDOW_DEFAULT;
     const seekWindow = Number.isFinite(seekWindowRaw) ? seekWindowRaw : EMBY_DEBUG_SEEK_WINDOW_DEFAULT;
+    const modeSwitchGrace = Number.isFinite(modeSwitchGraceRaw)
+        ? modeSwitchGraceRaw
+        : EMBY_DEBUG_MODE_SWITCH_GRACE_DEFAULT;
+    const m3ScaleRaw = parseFloat(
+        src.m3_wan_pool_scale ?? src.emby_m3_wan_pool_scale,
+    );
+    const m3Scale = Number.isFinite(m3ScaleRaw) ? m3ScaleRaw : EMBY_M3_WAN_POOL_SCALE_DEFAULT;
     return {
         new_session_window_seconds: Math.max(1, Math.min(30, newWindow)),
         seek_window_seconds: Math.max(1, Math.min(30, seekWindow)),
         priority_mode: priorityRaw === 'new_first' ? 'new_first' : EMBY_DEBUG_PRIORITY_DEFAULT,
+        mode_switch_grace_seconds: Math.max(0, Math.min(10, modeSwitchGrace)),
+        m3_wan_pool_scale: Math.max(
+            EMBY_M3_WAN_POOL_SCALE_MIN,
+            Math.min(EMBY_M3_WAN_POOL_SCALE_MAX, Math.round(m3Scale * 100) / 100),
+        ),
     };
+}
+
+function resolveEmbyModeSwitchRefreshSeconds(inst = null) {
+    const refreshRaw = parseInt(inst?.refresh_interval, 10);
+    return Number.isFinite(refreshRaw) && refreshRaw > 0
+        ? Math.max(1, Math.min(30, refreshRaw))
+        : 1;
 }
 
 function embyDebugPriorityLabel(mode) {
@@ -94,6 +121,18 @@ function normalizeEmbyDebugTrafficMetrics(inst = null) {
         wanUploadBytes: parseNonNegativeInt(src.wan_upload_bytes, 0),
         lanUploadBytes: parseNonNegativeInt(src.lan_upload_bytes, 0),
         programRemainderBytes: parseNonNegativeInt(src.program_remainder_bytes, 0),
+        modeSwitchPendingBytes: parseNonNegativeInt(src.mode_switch_pending_bytes, 0),
+        modeSwitchReplayBytes: parseNonNegativeInt(src.mode_switch_replay_bytes, 0),
+        modeSwitchReplayAllocBytes: parseNonNegativeInt(src.mode_switch_replay_alloc_bytes, 0),
+        modeSwitchReplayTotalBytes: parseNonNegativeInt(src.mode_switch_replay_total_bytes, 0),
+        modeSwitchReplayAllocTotalBytes: parseNonNegativeInt(
+            src.mode_switch_replay_alloc_total_bytes, 0,
+        ),
+        wanAllocBacklogBytes: parseNonNegativeInt(src.wan_alloc_backlog_bytes, 0),
+        wanAllocBacklogAppliedBytes: parseNonNegativeInt(
+            src.wan_alloc_backlog_applied_bytes, 0,
+        ),
+        m1WanCaptureBytes: parseNonNegativeInt(src.m1_wan_capture_bytes, 0),
     };
 }
 
@@ -386,14 +425,32 @@ function formatEmbyLiveUploadDebugText(bytes) {
     return formatEmbyEstimatedUpload(Math.floor(value)) || '0B';
 }
 
-function buildEmbySessionUploadDebugHtml(session) {
+function resolveEmbySessionDebugWindowSeconds(session, instanceName = '') {
+    const sessionSeconds = parseInt(session?.estimated_upload_window_seconds_live, 10);
+    if (Number.isFinite(sessionSeconds) && sessionSeconds > 0) {
+        return Math.max(1, Math.min(60, sessionSeconds));
+    }
+    const name = String(instanceName || '').trim();
+    if (name) {
+        const inst = (cachedEmbyInstances || []).find(i => i?.name === name);
+        const refreshSeconds = parseInt(inst?.refresh_interval, 10);
+        if (Number.isFinite(refreshSeconds) && refreshSeconds > 0) {
+            return Math.max(1, Math.min(60, refreshSeconds));
+        }
+    }
+    return 1;
+}
+
+function buildEmbySessionUploadDebugHtml(session, instanceName = '') {
     if (!EMBY_DEBUG_MODE_ENABLED || !session?.is_remote) return '';
     const liveTotalBytes = Math.max(0, parseInt(session.estimated_upload_bytes_live, 10) || 0);
-    const live1sBytes = Math.max(0, parseInt(session.estimated_upload_bytes_1s_live, 10) || 0);
-    const oneSecondText = formatEmbyLiveUploadDebugText(live1sBytes);
+    const liveWindowBytes = Math.max(0, parseInt(session.estimated_upload_bytes_1s_live, 10) || 0);
+    const windowSeconds = resolveEmbySessionDebugWindowSeconds(session, instanceName);
+    const windowText = formatEmbyLiveUploadDebugText(liveWindowBytes);
     const totalText = formatEmbyLiveUploadDebugText(liveTotalBytes);
+    const windowLabel = `近${windowSeconds}秒新增`;
     return `<div class="emby-session-debug">
-        <div class="emby-session-debug-row">1秒新增 ${escapeHtml(oneSecondText)}</div>
+        <div class="emby-session-debug-row">${escapeHtml(windowLabel)} ${escapeHtml(windowText)}</div>
         <div class="emby-session-debug-row">流量累积 ${escapeHtml(totalText)}</div>
     </div>`;
 }
@@ -548,7 +605,7 @@ function patchEmbySessionItemElement(el, session, instanceName) {
         const metaHtml = buildEmbySessionMetaLine(session);
         if (metaEl.innerHTML !== metaHtml) metaEl.innerHTML = metaHtml;
     }
-    const debugHtml = buildEmbySessionUploadDebugHtml(session);
+    const debugHtml = buildEmbySessionUploadDebugHtml(session, instanceName);
     const debugEl = el.querySelector('.emby-session-debug');
     if (debugHtml) {
         if (debugEl) {
@@ -670,7 +727,7 @@ function buildEmbySessionItemHtml(session, instanceName, compact = false) {
                 <div class="emby-session-badges">${buildEmbySessionBadgesHtml(session)}</div>
             </div>
             <div class="emby-session-meta">${buildEmbySessionMetaLine(session)}</div>
-            ${buildEmbySessionUploadDebugHtml(session)}
+            ${buildEmbySessionUploadDebugHtml(session, instanceName)}
             ${compact ? buildEmbySessionCompactFooterHtml(session) : buildEmbySessionProgressHtml(session)}
         </div>`;
 }
@@ -974,7 +1031,9 @@ function openEmbySessionDetail(instanceName, sessionId) {
 }
 
 function getEmbyActivePlaybackSessions(inst) {
-    const filtered = (inst?.sessions || []).filter(s => s.is_playing || s.item_id || s.title);
+    const filtered = (inst?.sessions || []).filter(
+        s => s.is_playing && !s.is_paused,
+    );
     return sortEmbySessionsByPlaybackStart(filtered);
 }
 
@@ -1368,6 +1427,9 @@ function buildEmbyDebugTrafficConfigPanelHtml(inst) {
     if (!EMBY_DEBUG_MODE_ENABLED) return '';
     const cfg = normalizeEmbyDebugTrafficConfig(embyDebugTrafficConfig);
     const metrics = normalizeEmbyDebugTrafficMetrics(inst);
+    const modeSwitchRefreshSeconds = resolveEmbyModeSwitchRefreshSeconds(inst);
+    const modeSwitchGraceTip = `模式切换时若会话接口晚于 Docker 流量更新，可在这段时间（秒）内暂缓把上传计入程序余量，待会话确认再回放到目标模式，建议与页面刷新间隔 [[${modeSwitchRefreshSeconds}]] 秒一致，范围 0-10 秒。`;
+    const m3WanPoolScaleTip = `仅 M3（局域网+外网）生效：对码率权重切出的 WAN 池乘以该系数。分摊权重已按各会话 transcode_kind 与音视频分量码率自动计算（直串流/音视频转码/仅音频转码等组合无需逐个调参）。1.0 为默认；若 Emby 上报码率与路由仍有系统性偏差，可用 1.05～1.10 或 0.90～0.95 做全局微调（长时间播放可能漂移）。M2 不受影响。范围 ${EMBY_M3_WAN_POOL_SCALE_MIN}～${EMBY_M3_WAN_POOL_SCALE_MAX}。`;
     const collapsed = isEmbyDebugPanelCollapsed();
     const chevron = `<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
     return `
@@ -1404,6 +1466,14 @@ function buildEmbyDebugTrafficConfigPanelHtml(inst) {
                             <strong class="emby-debug-traffic-value" data-field="program-remainder">${escapeHtml(formatCardTrafficText(metrics.programRemainderBytes))}</strong>
                         </div>
                     </div>
+                    <div class="emby-debug-traffic-meta">
+                        <span class="emby-debug-traffic-meta-item">待判定挂起 <strong data-field="mode-switch-pending">${escapeHtml(formatCardTrafficText(metrics.modeSwitchPendingBytes))}</strong></span>
+                        <span class="emby-debug-traffic-meta-item">累计回放 <strong data-field="mode-switch-replay-total">${escapeHtml(formatCardTrafficText(metrics.modeSwitchReplayTotalBytes))}</strong></span>
+                        <span class="emby-debug-traffic-meta-item">累计回放入分摊 <strong data-field="mode-switch-replay-alloc-total">${escapeHtml(formatCardTrafficText(metrics.modeSwitchReplayAllocTotalBytes))}</strong></span>
+                        <span class="emby-debug-traffic-meta-item">分摊 backlog <strong data-field="wan-alloc-backlog">${escapeHtml(formatCardTrafficText(metrics.wanAllocBacklogBytes))}</strong></span>
+                        <span class="emby-debug-traffic-meta-item">本 tick 分摊 backlog <strong data-field="wan-alloc-backlog-applied">${escapeHtml(formatCardTrafficText(metrics.wanAllocBacklogAppliedBytes))}</strong></span>
+                        <span class="emby-debug-traffic-meta-item">M1 首段捕获 <strong data-field="m1-wan-capture">${escapeHtml(formatCardTrafficText(metrics.m1WanCaptureBytes))}</strong></span>
+                    </div>
                 </div>
                 <div class="emby-debug-section">
                     <div class="emby-debug-section-title">
@@ -1425,6 +1495,14 @@ function buildEmbyDebugTrafficConfigPanelHtml(inst) {
                                 <option value="seek_first" ${cfg.priority_mode === 'seek_first' ? 'selected' : ''}>${embyDebugPriorityLabel('seek_first')}</option>
                                 <option value="new_first" ${cfg.priority_mode === 'new_first' ? 'selected' : ''}>${embyDebugPriorityLabel('new_first')}</option>
                             </select>
+                        </label>
+                        <label class="emby-debug-config-field">
+                            <span class="emby-debug-config-field-label">切换缓冲窗口<span class="emby-debug-help" tabindex="0" data-tip="${escapeHtml(modeSwitchGraceTip)}">?</span></span>
+                            <input type="number" min="0" max="10" step="1" value="${cfg.mode_switch_grace_seconds}" data-field="mode-switch-grace" />
+                        </label>
+                        <label class="emby-debug-config-field">
+                            <span class="emby-debug-config-field-label">M3 WAN 池系数<span class="emby-debug-help" tabindex="0" data-tip="${escapeHtml(m3WanPoolScaleTip)}">?</span></span>
+                            <input type="number" min="${EMBY_M3_WAN_POOL_SCALE_MIN}" max="${EMBY_M3_WAN_POOL_SCALE_MAX}" step="0.01" value="${cfg.m3_wan_pool_scale}" data-field="m3-wan-pool-scale" />
                         </label>
                     </div>
                     <div class="emby-debug-config-actions">
@@ -1452,7 +1530,15 @@ function showEmbyDebugTip(target) {
     const text = target?.getAttribute('data-tip');
     if (!text) return;
     const el = ensureEmbyDebugTipEl();
-    el.textContent = text;
+    const highlighted = String(text).replace(
+        /\[\[([^\]]+)\]\]/g,
+        '<span class="emby-debug-tip-highlight">$1</span>',
+    );
+    if (highlighted !== text) {
+        el.innerHTML = highlighted;
+    } else {
+        el.textContent = text;
+    }
     el.classList.add('visible');
     const rect = target.getBoundingClientRect();
     const tipRect = el.getBoundingClientRect();
@@ -1538,6 +1624,12 @@ function patchEmbyDebugTrafficPanel(card, inst) {
     setText('total-wan', metrics.wanUploadBytes);
     setText('total-lan', metrics.lanUploadBytes);
     setText('program-remainder', metrics.programRemainderBytes);
+    setText('mode-switch-pending', metrics.modeSwitchPendingBytes);
+    setText('mode-switch-replay-total', metrics.modeSwitchReplayTotalBytes);
+    setText('mode-switch-replay-alloc-total', metrics.modeSwitchReplayAllocTotalBytes);
+    setText('wan-alloc-backlog', metrics.wanAllocBacklogBytes);
+    setText('wan-alloc-backlog-applied', metrics.wanAllocBacklogAppliedBytes);
+    setText('m1-wan-capture', metrics.m1WanCaptureBytes);
 }
 
 function exitEmbyDebugMode() {
@@ -1559,6 +1651,13 @@ async function saveEmbyDebugTrafficConfig(button) {
     if (!panel) return;
     const newWindow = parseInt(panel.querySelector('[data-field="new-window"]')?.value, 10);
     const seekWindow = parseInt(panel.querySelector('[data-field="seek-window"]')?.value, 10);
+    const modeSwitchGrace = parseInt(
+        panel.querySelector('[data-field="mode-switch-grace"]')?.value,
+        10,
+    );
+    const m3WanPoolScale = parseFloat(
+        panel.querySelector('[data-field="m3-wan-pool-scale"]')?.value,
+    );
     const priorityMode = String(
         panel.querySelector('[data-field="priority-mode"]')?.value || EMBY_DEBUG_PRIORITY_DEFAULT,
     ).trim().toLowerCase();
@@ -1574,10 +1673,29 @@ async function saveEmbyDebugTrafficConfig(button) {
         if (typeof showToast === 'function') showToast('突发优先级无效', 'error');
         return;
     }
+    if (!Number.isFinite(modeSwitchGrace) || modeSwitchGrace < 0 || modeSwitchGrace > 10) {
+        if (typeof showToast === 'function') showToast('切换缓冲窗口请输入 0-10 秒', 'error');
+        return;
+    }
+    if (
+        !Number.isFinite(m3WanPoolScale)
+        || m3WanPoolScale < EMBY_M3_WAN_POOL_SCALE_MIN
+        || m3WanPoolScale > EMBY_M3_WAN_POOL_SCALE_MAX
+    ) {
+        if (typeof showToast === 'function') {
+            showToast(
+                `M3 WAN 池系数请输入 ${EMBY_M3_WAN_POOL_SCALE_MIN}～${EMBY_M3_WAN_POOL_SCALE_MAX}`,
+                'error',
+            );
+        }
+        return;
+    }
     const payload = {
         new_session_window_seconds: newWindow,
         seek_window_seconds: seekWindow,
         priority_mode: priorityMode,
+        mode_switch_grace_seconds: modeSwitchGrace,
+        m3_wan_pool_scale: Math.round(m3WanPoolScale * 100) / 100,
     };
     if (button) {
         button.disabled = true;

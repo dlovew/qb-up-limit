@@ -352,6 +352,30 @@ class EmbyClient:
         return []
 
     @staticmethod
+    def _session_is_actively_playing(now_playing: dict, play_state: dict,
+                                     transcoding: dict) -> bool:
+        """Emby Web 外网停止后常保留 NowPlayingItem；需结合 PlayState/转码信息判定。"""
+        if not now_playing:
+            return False
+        play_state = play_state or {}
+        if 'IsPlaying' in play_state:
+            return bool(play_state.get('IsPlaying'))
+        if bool(play_state.get('IsPaused')):
+            return True
+        if transcoding:
+            return True
+        play_method = str(play_state.get('PlayMethod') or '').strip()
+        return bool(play_method)
+
+    @staticmethod
+    def is_live_playback_session(session: dict) -> bool:
+        if not isinstance(session, dict):
+            return False
+        if not bool(session.get('is_playing')):
+            return False
+        return not bool(session.get('is_paused'))
+
+    @staticmethod
     def _is_remote_session(remote_endpoint: str) -> bool:
         return is_wan_endpoint(remote_endpoint)
 
@@ -992,7 +1016,9 @@ class EmbyClient:
 
         return {
             'id': session.get('Id') or '',
-            'is_playing': bool(now_playing),
+            'is_playing': EmbyClient._session_is_actively_playing(
+                now_playing, play_state, transcoding,
+            ),
             'user_name': session.get('UserName') or '',
             'user_id': session.get('UserId') or '',
             'client': session.get('Client') or '',

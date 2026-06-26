@@ -35,7 +35,12 @@ DEFAULT_GLOBAL = {
     'emby_burst_new_session_window_seconds': 8,
     'emby_burst_seek_window_seconds': 6,
     'emby_burst_priority_mode': 'seek_first',
+    'emby_mode_switch_grace_seconds': 2,
+    'emby_m3_wan_pool_scale': 1.0,
 }
+
+EMBY_M3_WAN_POOL_SCALE_MIN = 0.5
+EMBY_M3_WAN_POOL_SCALE_MAX = 1.5
 
 REFRESH_INTERVAL_MIN = 1
 REFRESH_INTERVAL_MAX = 30
@@ -507,6 +512,22 @@ def get_instance(name: str, config: dict = None) -> dict:
     return None
 
 
+def clamp_emby_m3_wan_pool_scale(value, *, strict: bool = False) -> float:
+    """M3 WAN 池补偿系数：1.0=不调整；>1 放大；<1 缩小。仅 M3 生效。"""
+    try:
+        scale = float(value)
+    except (TypeError, ValueError):
+        scale = float(DEFAULT_GLOBAL['emby_m3_wan_pool_scale'])
+    if strict:
+        if scale < EMBY_M3_WAN_POOL_SCALE_MIN or scale > EMBY_M3_WAN_POOL_SCALE_MAX:
+            raise ValueError(
+                f'M3 WAN 池系数须在 {EMBY_M3_WAN_POOL_SCALE_MIN}～{EMBY_M3_WAN_POOL_SCALE_MAX} 之间',
+            )
+        return round(scale, 2)
+    scale = max(EMBY_M3_WAN_POOL_SCALE_MIN, min(EMBY_M3_WAN_POOL_SCALE_MAX, scale))
+    return round(scale, 2)
+
+
 def _safe_int(value, default: int) -> int:
     try:
         return int(value)
@@ -590,6 +611,20 @@ def _validate_global(global_cfg: dict, strict: bool = False,
     if burst_priority_mode not in EMBY_BURST_PRIORITY_MODES:
         burst_priority_mode = DEFAULT_GLOBAL['emby_burst_priority_mode']
     result['emby_burst_priority_mode'] = burst_priority_mode
+    mode_switch_grace = _safe_int(
+        result.get('emby_mode_switch_grace_seconds'),
+        DEFAULT_GLOBAL['emby_mode_switch_grace_seconds'],
+    )
+    if strict:
+        if mode_switch_grace < 0 or mode_switch_grace > 10:
+            raise ValueError('模式切换缓冲须在 0～10 秒之间')
+    else:
+        mode_switch_grace = max(0, min(10, mode_switch_grace))
+    result['emby_mode_switch_grace_seconds'] = mode_switch_grace
+    result['emby_m3_wan_pool_scale'] = clamp_emby_m3_wan_pool_scale(
+        result.get('emby_m3_wan_pool_scale', DEFAULT_GLOBAL['emby_m3_wan_pool_scale']),
+        strict=strict,
+    )
     if strict and emby_instances is not None:
         if not result['emby_enabled'] and len(emby_instances) > 0:
             raise ValueError('请先删除所有 Emby 设备后再关闭 Emby 功能')

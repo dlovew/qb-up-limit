@@ -385,12 +385,14 @@ def _find_open_record(store: dict, session: dict,
 
 
 def enrich_sessions_playback_started_at(instance_name: str,
-                                        sessions: list) -> list:
+                                        sessions: list,
+                                        store: dict = None) -> list:
     """为 Sessions 附加播放段 started_at 与观看快照字段。"""
     name = (instance_name or '').strip()
     if not name or not sessions:
         return list(sessions or [])
-    store = _load_store(name)
+    if store is None:
+        store = _load_store(name)
     playing = [
         rec for rec in (store.get('records') or [])
         if rec.get('status') == 'playing'
@@ -436,7 +438,7 @@ def _active_playing_sessions(sessions: list) -> List[dict]:
     result = []
     for raw in sessions or []:
         session = _prepare_session(raw)
-        if not session.get('is_playing') and not session.get('item_id'):
+        if not session.get('is_playing') or session.get('is_paused'):
             continue
         if not session.get('title') and not session.get('series_name'):
             continue
@@ -466,10 +468,16 @@ def _handle_offline(instance_name: str, store: dict, now_mono: float) -> bool:
 
 
 def tick_from_sessions(instance_name: str, sessions: list, *,
-                       api_online: bool = True) -> bool:
+                       api_online: bool = True,
+                       return_store: bool = False):
     """Sessions 轮询入口：热更新 open 段，检测开始/结束/超时。"""
+    def _wrap_return(changed_flag: bool, store_obj: dict = None):
+        if return_store:
+            return bool(changed_flag), store_obj
+        return bool(changed_flag)
+
     if not instance_name:
-        return False
+        return _wrap_return(False, None)
     now_mono = time.monotonic()
     with _lock:
         store = _load_store(instance_name)
@@ -481,7 +489,7 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
             if _handle_offline(instance_name, store, now_mono):
                 changed = True
                 _save_store(store)
-            return changed
+            return _wrap_return(changed, store)
 
         if not bucket.get('was_api_online', True):
             bucket['offline_since'] = None
@@ -551,7 +559,7 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
             others.sort(key=_ended_record_sort_key, reverse=True)
             store['records'] = (playing + others)[:MAX_STORED_RECORDS]
             _save_store(store)
-        return changed
+        return _wrap_return(changed, store)
 
 
 def list_records(instance_name: str = None, limit: int = 200) -> List[dict]:

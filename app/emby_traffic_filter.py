@@ -79,6 +79,35 @@ def _is_transcode_session(session: dict) -> bool:
     return (session.get('transcode_kind') or '').strip() in _TRANSCODE_KINDS
 
 
+def resolve_transcode_kind(session: dict) -> str:
+    """与 emby_client.derive_transcode_kind 口径一致。"""
+    kind = (session.get('transcode_kind') or '').strip()
+    if kind:
+        return kind
+    play_method = (session.get('play_method') or '').strip()
+    if play_method == 'DirectPlay':
+        return 'direct_play'
+    if play_method == 'DirectStream':
+        return 'direct_stream'
+    if play_method != 'Transcode':
+        return ''
+    is_video_direct = session.get('is_video_direct')
+    is_audio_direct = session.get('is_audio_direct')
+    if is_video_direct is None:
+        is_video_direct = False
+    if is_audio_direct is None:
+        is_audio_direct = False
+    video_direct = bool(is_video_direct)
+    audio_direct = bool(is_audio_direct)
+    if not video_direct and audio_direct:
+        return 'video_transcode'
+    if video_direct and not audio_direct:
+        return 'audio_transcode'
+    if not video_direct and not audio_direct:
+        return 'full_transcode'
+    return ''
+
+
 def session_stream_bps(session: dict) -> int:
     """有效码率：优先 video+audio 分量，过滤占位低码率，转码缺省 8Mbps。"""
     video = int(session.get('video_bitrate') or 0)
@@ -99,6 +128,32 @@ def session_stream_bps(session: dict) -> int:
     if session.get('is_playing') or session.get('item_id'):
         return DEFAULT_STREAM_BPS
     return 0
+
+
+def session_container_egress_bps(session: dict) -> int:
+    """估算容器→该会话客户端的出口码率（LAN / 外网同一公式）。
+
+    按 transcode_kind + 音视频分量自动区分，无需为每种组合单独调系数：
+    - direct_play：DirectPlay，容器几乎无串流出口
+    - direct_stream / 各类转码 / 直播串流：容器向客户端送出 video+audio 输出
+      （仅音频转码时仍包含直传视频 + 转码音频；仅视频转码时仍含直传音频）
+    """
+    if not is_active_playback_session(session):
+        return 0
+    kind = resolve_transcode_kind(session)
+    if kind == 'direct_play':
+        return 0
+    video = max(0, int(session.get('video_bitrate') or 0))
+    audio = max(0, int(session.get('audio_bitrate') or 0))
+    component_sum = video + audio
+    if component_sum > 0:
+        return component_sum
+    return max(0, int(session_stream_bps(session) or 0))
+
+
+def session_docker_share_bps(session: dict) -> int:
+    """Docker 出口分摊权重 = 容器→该会话的出口码率（LAN / WAN 统一）。"""
+    return session_container_egress_bps(session)
 
 
 def _active_playback_sessions(sessions: Iterable[dict]) -> List[dict]:
@@ -131,14 +186,30 @@ def allocate_wan_deltas(delta_up: int, delta_dl: int,
     if not lan:
         return delta_up, delta_dl
 
-    wan_bps = sum(session_stream_bps(s) for s in wan)
-    total_bps = sum(session_stream_bps(s) for s in playing)
+    wan_bps = sum(session_docker_share_bps(s) for s in wan)
+    total_bps = sum(session_docker_share_bps(s) for s in playing)
     if total_bps <= 0:
         ratio = len(wan) / len(playing)
     else:
         ratio = wan_bps / total_bps
     ratio = max(0.0, min(1.0, ratio))
     return int(delta_up * ratio), int(delta_dl * ratio)
+
+
+def scale_m3_wan_pool_bytes(delta_up: int, raw_up: int, scale: float) -> int:
+    """M3 稳态 WAN 池补偿；结果不超过 Docker 本 tick 上行。"""
+    pool = max(0, int(delta_up or 0))
+    raw = max(0, int(raw_up or 0))
+    try:
+        factor = float(scale)
+    except (TypeError, ValueError):
+        factor = 1.0
+    if factor == 1.0 or pool <= 0:
+        return pool
+    scaled = int(pool * factor)
+    if raw > 0:
+        return min(raw, max(0, scaled))
+    return max(0, scaled)
 
 
 def apply_wan_traffic_filter(delta_up: int, delta_dl: int,

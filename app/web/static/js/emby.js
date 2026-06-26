@@ -1031,9 +1031,7 @@ function openEmbySessionDetail(instanceName, sessionId) {
 }
 
 function getEmbyActivePlaybackSessions(inst) {
-    const filtered = (inst?.sessions || []).filter(
-        s => s.is_playing && !s.is_paused,
-    );
+    const filtered = (inst?.sessions || []).filter(s => s.is_playing);
     return sortEmbySessionsByPlaybackStart(filtered);
 }
 
@@ -1185,7 +1183,11 @@ async function refreshEmbyStatus(forceRender = false, silent = false) {
     try {
         const response = await axios.get('/api/emby/status');
         if (!response.data.success) return;
-        cachedEmbyInstances = response.data.data || [];
+        let fresh = response.data.data || [];
+        if (typeof reconcileStatusInstancesWithPendingRenames === 'function') {
+            fresh = reconcileStatusInstancesWithPendingRenames(fresh, 'emby');
+        }
+        cachedEmbyInstances = fresh;
         if (response.data.debug_traffic_config) {
             embyDebugTrafficConfig = normalizeEmbyDebugTrafficConfig(
                 response.data.debug_traffic_config,
@@ -2117,7 +2119,7 @@ function buildEmbyInstanceForm(inst, mode) {
     const useHttps = !!inst?.use_https;
     const verifySsl = !!inst?.verify_ssl;
     const apiKeyPlaceholder = mode === 'edit' ? '留空表示不修改已保存的 API Key' : '必填';
-    const nameMax = typeof INSTANCE_NAME_MAX_LENGTH !== 'undefined' ? INSTANCE_NAME_MAX_LENGTH : 16;
+    const nameMax = typeof INSTANCE_NAME_MAX_LENGTH !== 'undefined' ? INSTANCE_NAME_MAX_LENGTH : 10;
     const priorityMax = typeof DISPLAY_PRIORITY_MAX !== 'undefined' ? DISPLAY_PRIORITY_MAX : 99999;
     const displayPriority = inst?.display_priority ?? (mode === 'add' ? cachedEmbyInstances.length + 1 : 1);
     const estimateUploadEnabled = inst?.estimate_upload_enabled !== false;
@@ -2322,7 +2324,7 @@ function validateEmbyTestForm(data) {
 }
 
 function validateEmbySaveForm(data, mode) {
-    const nameMax = typeof INSTANCE_NAME_MAX_LENGTH !== 'undefined' ? INSTANCE_NAME_MAX_LENGTH : 16;
+    const nameMax = typeof INSTANCE_NAME_MAX_LENGTH !== 'undefined' ? INSTANCE_NAME_MAX_LENGTH : 10;
     const priorityMax = typeof DISPLAY_PRIORITY_MAX !== 'undefined' ? DISPLAY_PRIORITY_MAX : 99999;
     if (!data.name) {
         if (typeof showToast === 'function') showToast('请填写显示名称', 'error');
@@ -2398,6 +2400,10 @@ function openEmbyInstanceModal(mode, name = '', instData = null) {
     const title = document.getElementById('modalTitle');
     if (!body || !title) return;
 
+    _embyInstanceEditBaseline = mode === 'edit'
+        ? collectEmbyBaselineFromInst(inst)
+        : null;
+
     title.textContent = mode === 'add' ? '➕ 添加设备' : '⚙ 设备设置';
     if (mode === 'edit') {
         title.dataset.instanceName = name;
@@ -2440,6 +2446,45 @@ function collectEmbyFormData(mode) {
     };
 }
 
+let _embyInstanceEditBaseline = null;
+
+function collectEmbyBaselineFromInst(inst) {
+    return {
+        name: inst?.name || '',
+        display_priority: inst?.display_priority ?? 1,
+        host: inst?.host || '',
+        port: inst?.port ?? 8096,
+        use_https: !!inst?.use_https,
+        verify_ssl: !!inst?.verify_ssl,
+        container_name: inst?.container_name || '',
+        container_id: inst?.container_id || '',
+        estimate_upload_enabled: inst?.estimate_upload_enabled !== false,
+    };
+}
+
+function embyInstanceOnlyBasicsChanged(baseline, updated) {
+    if (!baseline || !updated) return false;
+    if (String(updated.api_key || '').trim()) return false;
+    const keys = [
+        'host', 'port', 'use_https', 'verify_ssl',
+        'container_name', 'container_id', 'estimate_upload_enabled',
+    ];
+    for (const key of keys) {
+        const a = baseline[key];
+        const b = updated[key];
+        if (key === 'port') {
+            if (Number(a) !== Number(b)) return false;
+            continue;
+        }
+        if (key === 'use_https' || key === 'verify_ssl' || key === 'estimate_upload_enabled') {
+            if (!!a !== !!b) return false;
+            continue;
+        }
+        if (String(a ?? '') !== String(b ?? '')) return false;
+    }
+    return true;
+}
+
 async function saveEmbyInstanceSettings(mode, originalName) {
     const payload = collectEmbyFormData(mode);
     if (!validateEmbySaveForm(payload, mode)) return;
@@ -2452,7 +2497,11 @@ async function saveEmbyInstanceSettings(mode, originalName) {
     }
 
     const saveBtn = document.getElementById('saveEmbyInstanceBtn');
-    if (saveBtn) saveBtn.disabled = true;
+    const saveBtnText = saveBtn?.textContent;
+    if (saveBtn) {
+        saveBtn.disabled = true;
+        saveBtn.textContent = '保存中…';
+    }
 
     try {
         const body = { ...payload };
@@ -2464,13 +2513,23 @@ async function saveEmbyInstanceSettings(mode, originalName) {
             res = await axios.put(`/api/emby/config/instances/${encodeURIComponent(originalName)}`, body);
         }
         if (res.data.success) {
-            if (typeof showToast === 'function') showToast(res.data.message || '保存成功', 'success');
-            if (typeof closeModal === 'function') closeModal();
-            if (typeof refreshEmbyFeatureLockState === 'function') {
-                await refreshEmbyFeatureLockState();
+            const basicsOnly = mode === 'edit'
+                && embyInstanceOnlyBasicsChanged(_embyInstanceEditBaseline, payload);
+            if (mode === 'edit' && originalName !== payload.name
+                && typeof updateMergeDeviceNameOnRename === 'function') {
+                updateMergeDeviceNameOnRename('emby', originalName, payload.name);
             }
-            await refreshEmbyStatus(true);
-            if (typeof switchTab === 'function') switchTab(currentTab || 'devices');
+            if (typeof closeModal === 'function') closeModal();
+            if (typeof showToast === 'function') showToast(res.data.message || '保存成功', 'success');
+            const refreshAfterSave = async () => {
+                if (!basicsOnly && typeof refreshEmbyFeatureLockState === 'function') {
+                    await refreshEmbyFeatureLockState();
+                }
+                if (typeof refreshEmbyStatus === 'function') {
+                    await refreshEmbyStatus(true);
+                }
+            };
+            refreshAfterSave();
         } else if (typeof showToast === 'function') {
             showToast(res.data.error || '保存失败', 'error');
         }
@@ -2478,7 +2537,10 @@ async function saveEmbyInstanceSettings(mode, originalName) {
         const msg = e.response?.data?.error || '保存失败';
         if (typeof showToast === 'function') showToast(msg, 'error');
     } finally {
-        if (saveBtn) saveBtn.disabled = false;
+        if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.textContent = saveBtnText || '✔ 保存';
+        }
     }
 }
 
@@ -2628,7 +2690,6 @@ async function deleteEmbyInstance(name, keepData = false) {
                 await refreshEmbyFeatureLockState();
             }
             await refreshEmbyStatus(true);
-            if (typeof switchTab === 'function') switchTab(currentTab || 'devices');
         } else if (typeof showToast === 'function') {
             showToast(res.data.error || '删除失败', 'error');
         }
@@ -3182,7 +3243,7 @@ function buildEmbyEventUploadBadgeHtml(event, options = {}) {
     if (!isEmbyEstimateUploadEnabled(event.instance_name)) return '';
     const text = formatEmbyEstimatedUpload(event.estimated_upload_bytes);
     if (!text) return '';
-    return `<span class="emby-session-badge emby-event-badge--upload">上传估算${escapeHtml(text)}</span>`;
+    return `<span class="emby-session-badge emby-event-badge--upload">估算上传${escapeHtml(text)}</span>`;
 }
 
 function buildEmbyPlaybackRecordStatusBadgeHtml(rec) {
@@ -3299,29 +3360,121 @@ function playbackRecordAsEvent(rec) {
     };
 }
 
+const EMBY_LOG_STATE_LABEL = {
+    playing: '播放中',
+    paused: '已暂停',
+    interrupt: '超时中断',
+    stopped: '播放完毕',
+};
+
+function resolvePlaybackRecordState(rec) {
+    if (rec.status === 'playing') return rec.is_paused ? 'paused' : 'playing';
+    if (rec.status === 'incomplete' && rec.interrupt_reason === 'timeout_offline') return 'interrupt';
+    return 'stopped';
+}
+
+function buildPlaybackRecordTimeRangeText(rec) {
+    if (rec.status === 'playing') return formatEmbyEventDateTime(rec.started_at);
+    const startMs = new Date(rec.started_at).getTime();
+    const stopMs = new Date(rec.stopped_at).getTime();
+    if (!Number.isNaN(startMs) && !Number.isNaN(stopMs)) {
+        const sameDay = new Date(rec.started_at).toDateString()
+            === new Date(rec.stopped_at).toDateString();
+        return sameDay
+            ? `${formatEmbyEventDateTime(rec.started_at)} - ${formatEmbyEventTimeOnly(rec.stopped_at)}`
+            : `${formatEmbyEventDateTime(rec.started_at)} - ${formatEmbyEventDateTime(rec.stopped_at)}`;
+    }
+    return `${formatEmbyEventTime(rec.started_at)} - ${formatEmbyEventTime(rec.stopped_at)}`;
+}
+
+function embyLogMetaIcon(key) {
+    switch (key) {
+        case 'user':
+            return '<svg class="emby-log-meta-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="5" r="2.6" stroke="currentColor" stroke-width="1.3"/><path d="M3.2 13c0-2.5 2.1-4 4.8-4s4.8 1.5 4.8 4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>';
+        case 'device':
+            return '<svg class="emby-log-meta-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="2.5" y="3" width="11" height="7.5" rx="1.2" stroke="currentColor" stroke-width="1.3"/><path d="M6 13h4M8 10.5V13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>';
+        case 'instance':
+            return '<svg class="emby-log-meta-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="2.5" y="2.6" width="11" height="4" rx="1" stroke="currentColor" stroke-width="1.3"/><rect x="2.5" y="9.4" width="11" height="4" rx="1" stroke="currentColor" stroke-width="1.3"/><path d="M5 4.6h.01M5 11.4h.01" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>';
+        case 'ip':
+            return '<svg class="emby-log-meta-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="8" cy="8" r="5.5" stroke="currentColor" stroke-width="1.3"/><path d="M2.5 8h11M8 2.5c1.7 1.7 1.7 9.3 0 11M8 2.5c-1.7 1.7-1.7 9.3 0 11" stroke="currentColor" stroke-width="1.3"/></svg>';
+        default:
+            return '';
+    }
+}
+
+function buildEmbyLogMetaItem(iconKey, text, modifier) {
+    const value = String(text || '').trim();
+    if (!value) return '';
+    return `<span class="emby-log-meta-item emby-log-meta-item--${modifier}">`
+        + `${embyLogMetaIcon(iconKey)}<span class="emby-log-meta-text">${escapeHtml(value)}</span></span>`;
+}
+
+function buildEmbyLogIpMetaItem(event) {
+    const ip = event.client_ip || event.remote_endpoint || '';
+    if (!ip) return '';
+    const masked = maskEmbyEndpointDisplay(ip);
+    return `<span class="emby-log-meta-item emby-log-meta-item--ip">${embyLogMetaIcon('ip')}`
+        + `<span class="emby-event-ip-wrap"><span class="emby-event-ip">${escapeHtml(masked)}</span>`
+        + `<button type="button" class="emby-event-ip-toggle" aria-label="显示 IP" aria-pressed="false" data-ip="${escapeHtml(ip)}">${buildEmbyEventIpEyeIcon(false)}</button>`
+        + `</span></span>`;
+}
+
 function renderPlaybackRecordCard(rec) {
     const viewRec = mergeLiveSessionIntoPlaybackRecord(rec);
     const event = playbackRecordAsEvent(viewRec);
     const startEvent = { ...event, date: viewRec.started_at, type: 'VideoPlayback' };
     const mediaEvent = resolveEmbyPlaybackMediaEvent(event, startEvent);
-    const mediaTitleHtml = buildEmbyEventMediaTitleHtml(mediaEvent);
-    const timeLineHtml = buildPlaybackRecordTimeLine(viewRec);
     const isPlaying = viewRec.status === 'playing';
-    const tailHtml = buildEmbyPlaybackCardTailHtml(event, {
-        includePlayingWatch: isPlaying,
-        includeWatch: !isPlaying,
-        startEvent,
-    });
-    const statusBadgeHtml = buildEmbyPlaybackRecordStatusBadgeHtml(viewRec);
-    const cardClass = isPlaying
-        ? `emby-playback emby-playback-playing emby-event-videoplayback${viewRec.is_paused ? ' emby-playback-paused' : ''}`
-        : 'emby-playback emby-playback-record emby-event-videoplaybackstopped';
+
+    const state = resolvePlaybackRecordState(viewRec);
+    const stateLabel = EMBY_LOG_STATE_LABEL[state] || '播放完毕';
+    const timeText = buildPlaybackRecordTimeRangeText(viewRec);
+
+    const titleHtml = buildEmbyEventMediaTitleHtml(mediaEvent)
+        || '<span class="emby-log-card-title-text emby-log-card-title-text--empty">未知内容</span>';
+
+    const metaItems = [
+        buildEmbyLogMetaItem('user', viewRec.user_name, 'user'),
+        buildEmbyLogMetaItem('device', resolveEmbyEventDeviceName(viewRec), 'device'),
+        buildEmbyLogMetaItem('instance', viewRec.instance_name, 'instance'),
+        buildEmbyLogIpMetaItem(viewRec),
+    ].filter(Boolean).join('');
+    const metaHtml = metaItems ? `<div class="emby-log-card-meta">${metaItems}</div>` : '';
+
+    const statsText = isPlaying
+        ? buildEmbyEventPlayingWatchTextLine(event)
+        : buildEmbyEventWatchTextLine(event);
+    const statsHtml = statsText ? `<div class="emby-log-card-stats">${statsText}</div>` : '';
+
+    const badges = [];
+    if (!isPlaying) {
+        badges.push(buildEmbyWatchStatusBadgeHtml(event));
+        badges.push(buildEmbyWatchDurationBadgeHtml(event, { startEvent }));
+    }
+    badges.push(buildEmbyEventNetworkBadgeHtml(event));
+    badges.push(buildEmbyEventTranscodeBadgeHtml(event));
+    badges.push(buildEmbySeekBadgeHtml(event));
+    badges.push(buildEmbyEventUploadBadgeHtml(event));
+    const tagHtml = badges.filter(Boolean).join('');
+    const tagsHtml = tagHtml ? `<div class="emby-log-card-tags">${tagHtml}</div>` : '';
+
     return `
-        <div class="event-item ${cardClass}">
-            <div class="event-time">${timeLineHtml}</div>
-            <div class="event-playback-meta">${buildEmbyEventTypeLine(event, { includeInstance: false, statusBadgeHtml })}</div>
-            ${mediaTitleHtml ? `<div class="event-media-title">${mediaTitleHtml}</div>` : ''}
-            ${tailHtml}
+        <div class="emby-log-card emby-log-card--${state}">
+            <span class="emby-log-card-rail" aria-hidden="true"></span>
+            <div class="emby-log-card-body">
+                <div class="emby-log-card-head">
+                    <span class="emby-log-card-status">
+                        <span class="emby-log-status-dot" aria-hidden="true"></span>
+                        <span class="emby-log-status-text">${escapeHtml(stateLabel)}</span>
+                    </span>
+                    ${tagsHtml}
+                </div>
+                <div class="emby-log-card-divider" aria-hidden="true"></div>
+                <div class="emby-log-card-time">${escapeHtml(timeText)}</div>
+                <div class="emby-log-card-title">${titleHtml}</div>
+                ${metaHtml}
+                ${statsHtml}
+            </div>
         </div>`;
 }
 

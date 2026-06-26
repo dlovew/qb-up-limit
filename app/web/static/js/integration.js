@@ -40,6 +40,12 @@ function isDevicesPanelDataReady() {
     return devicesPanelDataReady.qb && devicesPanelDataReady.emby;
 }
 
+function mergeSideHasDisplayableData(side) {
+    if (devicesPanelDataReady[side]) return true;
+    const names = side === 'qb' ? getQbInstanceNames() : getEmbyInstanceNames();
+    return names.length > 0;
+}
+
 const MERGE_DEVICES_DRAG_HANDLE_ICON = `<svg class="merge-devices-drag-icon" viewBox="0 0 20 20" aria-hidden="true">
     <circle cx="7.5" cy="5" r="1.35" fill="currentColor"/>
     <circle cx="12.5" cy="5" r="1.35" fill="currentColor"/>
@@ -114,6 +120,94 @@ function saveMergeSelectionToStorage() {
             localStorage.setItem(MERGE_EMBY_ORDER_KEY, JSON.stringify(mergeEmbyOrder));
         }
     } catch (e) { /* ignore */ }
+}
+
+const _pendingInstanceRenames = { qb: new Map(), emby: new Map() };
+
+function registerPendingInstanceRename(side, oldName, newName) {
+    if (side !== 'qb' && side !== 'emby') return;
+    const prev = String(oldName || '').trim();
+    const next = String(newName || '').trim();
+    if (!prev || !next || prev === next) return;
+    _pendingInstanceRenames[side].set(prev, next);
+    if (side === 'qb' && typeof cachedInstances !== 'undefined') {
+        const inst = cachedInstances.find(i => i.name === prev);
+        if (inst) inst.name = next;
+    } else if (side === 'emby' && typeof cachedEmbyInstances !== 'undefined') {
+        const inst = cachedEmbyInstances.find(i => i.name === prev);
+        if (inst) inst.name = next;
+    }
+}
+
+function reconcileStatusInstancesWithPendingRenames(instances, side) {
+    const pending = _pendingInstanceRenames[side];
+    if (!pending.size) return instances || [];
+    const list = [...(instances || [])];
+    for (const [oldName, newName] of [...pending.entries()]) {
+        if (list.some(i => i.name === newName)) {
+            pending.delete(oldName);
+            continue;
+        }
+        const oldIdx = list.findIndex(i => i.name === oldName);
+        if (oldIdx !== -1) {
+            list[oldIdx] = { ...list[oldIdx], name: newName };
+            pending.delete(oldName);
+        }
+    }
+    return list;
+}
+
+function renameNameInMergePrefs(collection, oldName, newName) {
+    if (!collection) return false;
+    if (collection instanceof Set) {
+        if (!collection.has(oldName)) return false;
+        collection.delete(oldName);
+        collection.add(newName);
+        return true;
+    }
+    if (Array.isArray(collection)) {
+        let changed = false;
+        for (let i = 0; i < collection.length; i++) {
+            if (collection[i] === oldName) {
+                collection[i] = newName;
+                changed = true;
+            }
+        }
+        return changed;
+    }
+    return false;
+}
+
+/** 合并视图下设备改名后，同步勾选、排序与本地缓存，避免跳离合并视图 */
+function updateMergeDeviceNameOnRename(side, oldName, newName) {
+    if (side !== 'qb' && side !== 'emby') return;
+    const prev = String(oldName || '').trim();
+    const next = String(newName || '').trim();
+    if (!prev || !next || prev === next) return;
+
+    registerPendingInstanceRename(side, prev, next);
+
+    let prefsChanged = false;
+    if (side === 'qb') {
+        prefsChanged = renameNameInMergePrefs(mergeQbSelection, prev, next) || prefsChanged;
+        prefsChanged = renameNameInMergePrefs(mergeQbOrder, prev, next) || prefsChanged;
+    } else {
+        prefsChanged = renameNameInMergePrefs(mergeEmbySelection, prev, next) || prefsChanged;
+        prefsChanged = renameNameInMergePrefs(mergeEmbyOrder, prev, next) || prefsChanged;
+    }
+
+    if (prefsChanged) {
+        saveMergeSelectionToStorage();
+        persistDeviceViewPreferencesToServer(buildDevicePrefsPayload());
+    }
+    if (mergePopoverOpen) {
+        renderMergeDevicesPopoverContent();
+    }
+    if (typeof currentTab !== 'undefined' && currentTab === 'devices'
+        && normalizeDeviceViewMode(deviceViewMode) === 'merge'
+        && typeof renderDevicesPanel === 'function') {
+        renderDevicesPanel(true);
+    }
 }
 
 function buildDevicePrefsPayload() {
@@ -795,14 +889,14 @@ function applyDevicesTabEntryView() {
 
 let isBootTabSwitch = true;
 
-function handleDevicesTabViewOnSwitch() {
+function handleDevicesTabViewOnSwitch(prevTab) {
     if (!embyFeatureEnabled) {
         deviceViewMode = 'qb';
         return;
     }
     if (isBootTabSwitch) {
         restoreDeviceViewModeFromStorage();
-    } else {
+    } else if (prevTab !== 'devices') {
         applyDevicesTabEntryView();
     }
 }
@@ -815,11 +909,14 @@ function normalizeEmbyDefaultDeviceView(mode) {
 
 function applyEmbyFeatureConfig(globalData) {
     const g = globalData || {};
+    const prevEnabled = embyFeatureEnabled;
     embyFeatureEnabled = !!g.emby_enabled;
     embyDefaultDeviceView = normalizeEmbyDefaultDeviceView(g.emby_default_device_view);
     embyInstanceCount = Number(g.emby_instance_count) || 0;
     embyFeatureLocked = !!g.emby_feature_locked;
-    resetDevicesPanelDataReady();
+    if (prevEnabled !== embyFeatureEnabled) {
+        resetDevicesPanelDataReady();
+    }
     if (!embyFeatureEnabled) {
         deviceViewMode = 'qb';
         setDeviceTypeFilter('qb');
@@ -933,6 +1030,19 @@ function syncDeviceViewSwitchUi() {
     }
 }
 
+function syncDeviceTypeToggle(filter) {
+    const toggle = document.getElementById('eventDeviceTypeSwitch');
+    if (!toggle) return;
+    const effective = filter === 'emby' ? 'emby' : 'qb';
+    toggle.hidden = !embyFeatureEnabled;
+    toggle.setAttribute('aria-hidden', embyFeatureEnabled ? 'false' : 'true');
+    toggle.querySelectorAll('.log-device-btn').forEach((btn) => {
+        const active = btn.dataset.deviceType === effective;
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+}
+
 function syncDeviceTypeFilterControls() {
     const filter = getDeviceTypeFilter();
     document.querySelectorAll('[data-device-type-filter]').forEach(select => {
@@ -947,6 +1057,7 @@ function syncDeviceTypeFilterControls() {
         select.disabled = false;
         syncDeviceTypeSelectValue(select, filter);
     });
+    syncDeviceTypeToggle(filter);
 }
 
 function setEventInstanceFilter(service, instanceName) {
@@ -973,6 +1084,7 @@ function openDeviceEvents(service, instanceName) {
         document.querySelectorAll('[data-device-type-filter]').forEach(sel => {
             syncDeviceTypeSelectValue(sel, deviceType);
         });
+        if (typeof syncDeviceTypeToggle === 'function') syncDeviceTypeToggle(deviceType);
     }
     setEventInstanceFilter(deviceType, instanceName);
     if (typeof switchTab === 'function') {
@@ -987,6 +1099,7 @@ function setChartInstanceFilter(service, instanceName) {
         document.querySelectorAll('[data-device-type-filter]').forEach(sel => {
             syncDeviceTypeSelectValue(sel, deviceType);
         });
+        if (typeof syncDeviceTypeToggle === 'function') syncDeviceTypeToggle(deviceType);
     }
     if (instanceName && typeof getChartInstanceStorageKey === 'function') {
         try {
@@ -1050,25 +1163,32 @@ function syncPlatformPanelUi(tab) {
     const platform = tab === 'syslogs'
         ? getSyslogTypeFilter()
         : getDeviceTypeFilter();
+    const effectivePlatform = platform || 'qb';
     root.querySelectorAll('[data-platform-panel]').forEach(el => {
         const panelType = el.dataset.platformPanel;
-        let show;
-        if (tab === 'stats' && !platform) {
-            show = panelType === 'qb';
-        } else {
-            show = platform ? panelType === platform : false;
-        }
+        const show = panelType === effectivePlatform;
         el.hidden = !show;
         el.setAttribute('aria-hidden', show ? 'false' : 'true');
     });
 }
 
+function onEventDeviceTypeToggle(value) {
+    if (!embyFeatureEnabled) return;
+    applyDeviceTypeFilter(value);
+}
+
 function onDeviceTypeFilterChange(selectEl) {
     if (!selectEl || !embyFeatureEnabled) return;
-    const next = setDeviceTypeFilter(selectEl.value);
+    applyDeviceTypeFilter(selectEl.value);
+}
+
+function applyDeviceTypeFilter(value) {
+    if (!embyFeatureEnabled) return;
+    const next = setDeviceTypeFilter(value);
     document.querySelectorAll('[data-device-type-filter]').forEach(sel => {
         syncDeviceTypeSelectValue(sel, next);
     });
+    syncDeviceTypeToggle(next);
     if (typeof persistChartControls === 'function') {
         persistChartControls();
     }
@@ -1145,8 +1265,10 @@ function renderDevicesPanel(forceFull = false) {
         const bothReady = isDevicesPanelDataReady();
 
         if (!bothReady) {
-            const qbInstances = devicesPanelDataReady.qb ? getFilteredQbInstancesForMerge() : [];
-            const embyInstances = devicesPanelDataReady.emby ? getFilteredEmbyInstancesForMerge() : [];
+            const qbInstances = mergeSideHasDisplayableData('qb')
+                ? getFilteredQbInstancesForMerge() : [];
+            const embyInstances = mergeSideHasDisplayableData('emby')
+                ? getFilteredEmbyInstancesForMerge() : [];
             if (typeof renderInstanceCards === 'function') {
                 renderInstanceCards(qbInstances, forceFull);
             }
@@ -1176,6 +1298,20 @@ function renderDevicesPanel(forceFull = false) {
         const qbInstances = getFilteredQbInstancesForMerge();
         const embyInstances = getFilteredEmbyInstancesForMerge();
         if (!qbInstances.length || !embyInstances.length) {
+            const keepMerge = normalizeDeviceViewMode(deviceViewMode) === 'merge'
+                && qbNames.length > 0 && embyNames.length > 0;
+            if (keepMerge) {
+                if (typeof renderInstanceCards === 'function') {
+                    renderInstanceCards(qbInstances, forceFull);
+                }
+                if (typeof renderEmbyInstanceCards === 'function') {
+                    renderEmbyInstanceCards(embyInstances, forceFull);
+                }
+                if (typeof scheduleSyncMergeViewCardHeights === 'function') {
+                    scheduleSyncMergeViewCardHeights();
+                }
+                return;
+            }
             setDeviceViewMode(qbNames.length ? 'qb' : 'emby');
             syncDevicesPanelModeClass();
             renderDevicesPanel(forceFull);
@@ -1229,8 +1365,7 @@ function applyUnifiedTabPanels(tab) {
 }
 
 async function refreshEventsLog() {
-    const platform = document.getElementById('eventDeviceType')?.value
-        || (typeof getDeviceTypeFilter === 'function' ? getDeviceTypeFilter() : 'qb')
+    const platform = (typeof getDeviceTypeFilter === 'function' ? getDeviceTypeFilter() : 'qb')
         || 'qb';
     if (platform === 'emby' && typeof loadEmbyEvents === 'function') {
         await loadEmbyEvents();

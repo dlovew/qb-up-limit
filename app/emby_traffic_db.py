@@ -662,6 +662,15 @@ _EMBY_DATA_INSTANCE_TABLES = (
     'emby_instance_status', 'emby_traffic_hourly', 'emby_traffic_monthly',
 )
 
+_EMBY_MEANINGFUL_DATA_TABLES = (
+    'emby_traffic_hourly', 'emby_traffic_monthly',
+    'emby_playback_upload_facts', 'emby_playback_upload_hourly',
+)
+
+_EMBY_RENAME_DATA_TABLES = _EMBY_DATA_INSTANCE_TABLES + (
+    'emby_playback_upload_facts', 'emby_playback_upload_hourly',
+)
+
 
 def _ensure_emby_schema():
     if not _emby_schema_ensured:
@@ -674,6 +683,17 @@ def _collect_emby_db_instance_names_unlocked(cursor) -> set:
         cursor.execute(f'SELECT DISTINCT instance_name FROM {table}')
         names.update(row['instance_name'] for row in cursor.fetchall())
     return names
+
+
+def _has_meaningful_emby_instance_data_unlocked(cursor, instance_name: str) -> bool:
+    for table in _EMBY_MEANINGFUL_DATA_TABLES:
+        cursor.execute(
+            f'SELECT 1 FROM {table} WHERE instance_name = ? LIMIT 1',
+            (instance_name,),
+        )
+        if cursor.fetchone():
+            return True
+    return False
 
 
 def has_instance_data(instance_name: str) -> bool:
@@ -694,11 +714,32 @@ def has_instance_data(instance_name: str) -> bool:
             conn.close()
 
 
-def is_orphaned_instance(instance_name: str, active_names: list) -> bool:
+def has_meaningful_instance_data(instance_name: str) -> bool:
+    _ensure_emby_schema()
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            return _has_meaningful_emby_instance_data_unlocked(c, instance_name)
+        finally:
+            conn.close()
+
+
+def is_orphaned_instance(instance_name: str, active_names: list,
+                         renaming_from: str = None) -> bool:
     _ensure_emby_schema()
     if instance_name in set(active_names or []):
         return False
-    return has_instance_data(instance_name)
+    if not has_instance_data(instance_name):
+        return False
+    if renaming_from:
+        renaming_from = str(renaming_from).strip()
+        active = set(active_names or [])
+        if renaming_from and renaming_from in active:
+            if (has_instance_data(renaming_from)
+                    and not has_meaningful_instance_data(instance_name)):
+                return False
+    return True
 
 
 def mark_instance_orphan_deleted(instance_name: str):
@@ -780,21 +821,39 @@ def rename_instance_data(old_name: str, new_name: str):
                 'SELECT 1 FROM emby_instance_status WHERE instance_name = ?',
                 (new_name,),
             )
-            if c.fetchone():
-                c.execute(
-                    'DELETE FROM emby_instance_status WHERE instance_name = ?',
-                    (old_name,),
-                )
+            new_status_exists = c.fetchone() is not None
+            if new_status_exists:
+                if not _has_meaningful_emby_instance_data_unlocked(c, new_name):
+                    c.execute(
+                        'DELETE FROM emby_instance_status WHERE instance_name = ?',
+                        (new_name,),
+                    )
+                    c.execute(
+                        'UPDATE emby_instance_status SET instance_name = ? '
+                        'WHERE instance_name = ?',
+                        (new_name, old_name),
+                    )
+                else:
+                    c.execute(
+                        'DELETE FROM emby_instance_status WHERE instance_name = ?',
+                        (old_name,),
+                    )
             else:
                 c.execute(
-                    'UPDATE emby_instance_status SET instance_name = ? WHERE instance_name = ?',
+                    'UPDATE emby_instance_status SET instance_name = ? '
+                    'WHERE instance_name = ?',
                     (new_name, old_name),
                 )
-            for table in ('emby_traffic_hourly', 'emby_traffic_monthly',
-                          'emby_playback_upload_facts', 'emby_playback_upload_hourly'):
+            for table in _EMBY_MEANINGFUL_DATA_TABLES:
                 c.execute(
-                    f'UPDATE {table} SET instance_name = ? WHERE instance_name = ?',
+                    f'UPDATE {table} SET instance_name = ? '
+                    f'WHERE instance_name = ?',
                     (new_name, old_name),
+                )
+            for table in _EMBY_RENAME_DATA_TABLES:
+                c.execute(
+                    f'DELETE FROM {table} WHERE instance_name = ?',
+                    (old_name,),
                 )
             conn.commit()
             logger.info(f'Emby 实例数据已重命名: {old_name} -> {new_name}')

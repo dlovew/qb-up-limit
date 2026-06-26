@@ -67,7 +67,7 @@ DEFAULT_CYCLE = {
     'reset_limit_kbps': 0,
 }
 
-INSTANCE_NAME_MAX_LENGTH = 16
+INSTANCE_NAME_MAX_LENGTH = 10
 INSTANCE_HTTP_TIMEOUT = 3
 DISPLAY_PRIORITY_MAX = 99999
 
@@ -949,6 +949,36 @@ def instance_only_basics_changed(existing: dict, updated: dict) -> bool:
     if instance_connection_changed(existing, updated):
         return False
     if instance_cycle_settings_changed(existing, updated):
+        return False
+    return True
+
+
+_EMBY_CONNECTION_KEYS = (
+    'host', 'port', 'use_https', 'verify_ssl',
+    'container_name', 'container_id', 'estimate_upload_enabled',
+)
+
+
+def emby_instance_connection_changed(existing: dict, updated: dict,
+                                     api_key_in_request: str = '') -> bool:
+    """Emby 连接/采集参数是否变更"""
+    if not existing:
+        return True
+    for key in _EMBY_CONNECTION_KEYS:
+        if _config_value_key(existing.get(key)) != _config_value_key(updated.get(key)):
+            return True
+    key_text = str(api_key_in_request or '').strip()
+    if key_text and not is_password_mask(key_text):
+        return True
+    return False
+
+
+def emby_instance_only_basics_changed(existing: dict, updated: dict,
+                                    api_key_in_request: str = '') -> bool:
+    """仅显示名称或设备序号有变更（其余 Emby 配置未动）"""
+    if not existing:
+        return False
+    if emby_instance_connection_changed(existing, updated, api_key_in_request):
         return False
     return True
 

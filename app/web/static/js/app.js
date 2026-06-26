@@ -589,7 +589,7 @@ function bindNumberSteppers(root) {
     scope.querySelectorAll(NUMBER_STEPPER_SELECTOR).forEach(attachNumberStepper);
 }
 
-const INSTANCE_NAME_MAX_LENGTH = 16;
+const INSTANCE_NAME_MAX_LENGTH = 10;
 const INSTANCE_HTTP_TIMEOUT = 3;
 const DISPLAY_PRIORITY_MAX = 99999;
 
@@ -668,10 +668,11 @@ async function logout() {
 
 function switchTab(tab) {
     if (!VALID_TABS.has(tab)) tab = 'devices';
+    const prevTab = currentTab;
     currentTab = tab;
     sessionStorage.setItem(TAB_STORAGE_KEY, tab);
     if (tab === 'devices' && typeof handleDevicesTabViewOnSwitch === 'function') {
-        handleDevicesTabViewOnSwitch();
+        handleDevicesTabViewOnSwitch(prevTab);
     }
     if (typeof isBootTabSwitch !== 'undefined' && isBootTabSwitch) {
         isBootTabSwitch = false;
@@ -747,7 +748,10 @@ function updateHeaderStats(instances) {
     const total = list.length;
     const online = list.filter(i => i.is_online).length;
     const limited = list.filter(i =>
-        i.limit_source === 'auto' || i.limit_source === 'manual'
+        i.has_upload_limit &&
+        (i.limit_source === 'auto' ||
+            i.limit_source === 'manual' ||
+            i.limit_source === 'cycle_reset')
     ).length;
     const nextPlan = list.filter(i =>
         i.has_next_cycle_plan || i.next_cycle_plan
@@ -1014,7 +1018,11 @@ async function refreshStatus(forceRender = false, silent = false) {
     try {
         const response = await axios.get('/api/status');
         if (response.data.success) {
-            cachedInstances = response.data.data;
+            let fresh = response.data.data;
+            if (typeof reconcileStatusInstancesWithPendingRenames === 'function') {
+                fresh = reconcileStatusInstancesWithPendingRenames(fresh, 'qb');
+            }
+            cachedInstances = fresh;
             syncGenerationTrackersFromInstances(cachedInstances);
             updateHeaderStats(cachedInstances);
             updateInstanceSelects(cachedInstances);
@@ -3351,6 +3359,7 @@ async function onChartInstanceChange() {
                 syncDeviceTypeSelectValue(sel, platform);
             }
         });
+        if (typeof syncDeviceTypeToggle === 'function') syncDeviceTypeToggle(platform);
     }
     await refreshChartPlaybackUsers();
     await updateChart();
@@ -8411,9 +8420,13 @@ async function promptOrphanDataPolicyIfNeeded(mode, originalName, data, platform
     const checkUrl = platform === 'emby'
         ? '/api/emby/config/instances/orphan-check'
         : '/api/config/instances/orphan-check';
+    const checkParams = { name: targetName, _: Date.now() };
+    if (mode === 'edit' && originalName && targetName !== originalName) {
+        checkParams.renaming_from = originalName;
+    }
     try {
         const res = await axios.get(checkUrl, {
-            params: { name: targetName, _: Date.now() },
+            params: checkParams,
         });
         if (!res.data.success || !res.data.has_orphaned_data) {
             return null;
@@ -8559,6 +8572,9 @@ async function doSaveInstanceSettings(mode, originalName, data, saveOptions = {}
 
         if (mode === 'edit' && originalName !== data.name) {
             document.getElementById('modalTitle').dataset.instanceName = data.name;
+            if (typeof updateMergeDeviceNameOnRename === 'function') {
+                updateMergeDeviceNameOnRename('qb', originalName, data.name);
+            }
         }
 
         closeModal();

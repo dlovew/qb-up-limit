@@ -358,10 +358,11 @@ class EmbyClient:
         if not now_playing:
             return False
         play_state = play_state or {}
-        if 'IsPlaying' in play_state:
-            return bool(play_state.get('IsPlaying'))
+        # 暂停时 Emby 常设 IsPlaying=false；须先于 IsPlaying 判定，避免误判为停止。
         if bool(play_state.get('IsPaused')):
             return True
+        if 'IsPlaying' in play_state:
+            return bool(play_state.get('IsPlaying'))
         if transcoding:
             return True
         play_method = str(play_state.get('PlayMethod') or '').strip()

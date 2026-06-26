@@ -11,7 +11,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/style.css?v=2025062283">
+    <link rel="stylesheet" href="/static/css/style.css?v=2025062710">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
     <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
 </head>
@@ -413,14 +413,26 @@
                         </div>
                     </div>
                     <div class="log-filter-body">
+                        <div id="eventDeviceTypeSwitch" class="log-device-switch" role="group" aria-label="设备类型" hidden aria-hidden="true">
+                            <button type="button" class="log-device-btn" data-device-type="qb" aria-pressed="true" onclick="onEventDeviceTypeToggle('qb')" title="qB 设备">
+                                <svg class="log-device-btn-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                                    <path d="M10 3v9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                                    <path d="M7 6l3-3 3 3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                                    <path d="M4 14h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                                    <path d="M6 17h8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                                </svg>
+                                <span class="log-device-btn-label">qB 设备</span>
+                            </button>
+                            <button type="button" class="log-device-btn log-device-btn--emby" data-device-type="emby" aria-pressed="false" onclick="onEventDeviceTypeToggle('emby')" title="Emby 设备">
+                                <svg class="log-device-btn-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                                    <rect x="3" y="4.5" width="14" height="9.5" rx="1.5" stroke="currentColor" stroke-width="1.6"/>
+                                    <path d="M8.5 8.2v3.6l3.8-1.8-3.8-1.8z" fill="currentColor"/>
+                                </svg>
+                                <span class="log-device-btn-label">Emby 设备</span>
+                            </button>
+                            <span class="log-device-segment-indicator" aria-hidden="true"></span>
+                        </div>
                         <div class="chart-filter-row chart-filter-row--selects log-filter-row--selects">
-                            <label class="chart-control chart-control--device-type">
-                                <span class="chart-control-label">设备类型</span>
-                                <select id="eventDeviceType" data-device-type-filter disabled onchange="onDeviceTypeFilterChange(this)">
-                                    <option value="qb">qB 设备</option>
-                                    <option value="emby">Emby 设备</option>
-                                </select>
-                            </label>
                             <label class="chart-control" data-platform-panel="qb">
                                 <span class="chart-control-label">设备名称</span>
                                 <select id="eventInstance" onchange="loadEvents()"></select>
@@ -429,17 +441,17 @@
                                 <span class="chart-control-label">设备名称</span>
                                 <select id="embyEventInstance" onchange="loadEmbyEvents()"></select>
                             </label>
-                            <label class="chart-control" data-platform-panel="emby" hidden aria-hidden="true">
-                                <span class="chart-control-label">日志文件</span>
-                                <select id="embyEventLogType" onchange="onEmbyEventLogTypeChange()">
-                                    <option value="playback" selected>新版日志</option>
-                                    <option value="activity">原始日志</option>
-                                </select>
-                            </label>
                             <label class="chart-control" data-platform-panel="emby" data-emby-playback-user-filter hidden aria-hidden="true">
                                 <span class="chart-control-label">用户名称</span>
                                 <select id="embyEventPlaybackUser" onchange="onEmbyEventPlaybackUserChange()">
                                     <option value="">全部用户</option>
+                                </select>
+                            </label>
+                            <label class="chart-control" data-platform-panel="emby" hidden aria-hidden="true">
+                                <span class="chart-control-label">日志类型</span>
+                                <select id="embyEventLogType" onchange="onEmbyEventLogTypeChange()">
+                                    <option value="playback" selected>新版日志</option>
+                                    <option value="activity">原始日志</option>
                                 </select>
                             </label>
                         </div>
@@ -552,8 +564,8 @@
     </div>
 
     <script src="/static/js/version.js?v=2025062025"></script>
-    <script src="/static/js/integration.js?v=2025062273"></script>
-    <script src="/static/js/app.js?v=2025062259"></script>
-    <script src="/static/js/emby.js?v=2025062279"></script>
+    <script src="/static/js/integration.js?v=2025062710"></script>
+    <script src="/static/js/app.js?v=2025062710"></script>
+    <script src="/static/js/emby.js?v=2025062710"></script>
 </body>
 </html>

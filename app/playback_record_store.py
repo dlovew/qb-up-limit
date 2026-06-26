@@ -438,7 +438,7 @@ def _active_playing_sessions(sessions: list) -> List[dict]:
     result = []
     for raw in sessions or []:
         session = _prepare_session(raw)
-        if not session.get('is_playing') or session.get('is_paused'):
+        if not session.get('is_playing'):
             continue
         if not session.get('title') and not session.get('series_name'):
             continue

@@ -550,11 +550,12 @@ class EmbyInstanceWorker:
             self._last_tick_audit = {}
             self._mode_switch_pending_upload_bytes = 0
             self._mode_switch_pending_since_mono = None
-        live_sessions = [
-            s for s in sessions if EmbyClient.is_live_playback_session(s)
+        open_sessions = [
+            s for s in sessions
+            if isinstance(s, dict) and bool(s.get('is_playing'))
         ]
-        self._last_sessions = live_sessions
-        return live_sessions
+        self._last_sessions = open_sessions
+        return open_sessions
 
     def _tick(self, full: bool):
         client = self._get_client()

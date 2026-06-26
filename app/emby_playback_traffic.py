@@ -734,7 +734,7 @@ def purge_stopped_wan_live_upload_state(instance_name: str, sessions: list) -> N
             continue
         if not raw.get('is_remote'):
             continue
-        if bool(raw.get('is_playing')) and not bool(raw.get('is_paused')):
+        if bool(raw.get('is_playing')):
             continue
         if not (raw.get('item_id') or raw.get('title')):
             continue

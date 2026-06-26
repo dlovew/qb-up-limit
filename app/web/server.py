@@ -62,6 +62,26 @@ def _reload_all_config(skip_qb_ops: bool = False):
             logger.error(f"Emby 配置重载失败: {e}", exc_info=True)
 
 
+def _reload_emby_monitor_after_save(defer: bool = False):
+    """保存 Emby 设备后仅重载 Emby 监控，避免阻塞 HTTP"""
+
+    def _run():
+        if not emby_monitor:
+            return
+        try:
+            emby_monitor.reload_config()
+            emby_monitor.wake_all()
+        except Exception as e:
+            logger.error(f'Emby 配置重载失败: {e}', exc_info=True)
+
+    if defer:
+        threading.Thread(
+            target=_run, name='reload-emby-after-save', daemon=True,
+        ).start()
+    else:
+        _run()
+
+
 @app.route('/login')
 def login_page():
     from flask import redirect
@@ -508,7 +528,8 @@ def _apply_rename_data_policy(old_name: str, new_name: str,
                               data_policy: str, active_names: list):
     if old_name == new_name:
         return
-    if not traffic_db.is_orphaned_instance(new_name, active_names):
+    if not traffic_db.is_orphaned_instance(
+            new_name, active_names, renaming_from=old_name):
         traffic_db.rename_instance_data(old_name, new_name)
         return
     _require_orphan_data_policy(True, data_policy, add_mode=False)
@@ -531,7 +552,8 @@ def _apply_emby_rename_data_policy(old_name: str, new_name: str,
                                    data_policy: str, active_names: list):
     if old_name == new_name:
         return
-    if not emby_traffic_db.is_orphaned_instance(new_name, active_names):
+    if not emby_traffic_db.is_orphaned_instance(
+            new_name, active_names, renaming_from=old_name):
         emby_traffic_db.rename_instance_data(old_name, new_name)
         playback_record_store.rename_instance_records(old_name, new_name)
         return
@@ -552,8 +574,10 @@ def api_config_instance_orphan_check():
         name = str(request.args.get('name', '')).strip()
         if not name:
             return jsonify({'success': False, 'error': '参数缺失'}), 400
+        renaming_from = str(request.args.get('renaming_from', '')).strip() or None
         active_names = _fresh_active_instance_names()
-        has_orphan = traffic_db.is_orphaned_instance(name, active_names)
+        has_orphan = traffic_db.is_orphaned_instance(
+            name, active_names, renaming_from=renaming_from)
         return _no_cache_json({
             'success': True,
             'has_orphaned_data': has_orphan,
@@ -1426,8 +1450,10 @@ def api_emby_config_instance_orphan_check():
         name = str(request.args.get('name', '')).strip()
         if not name:
             return jsonify({'success': False, 'error': '参数缺失'}), 400
+        renaming_from = str(request.args.get('renaming_from', '')).strip() or None
         active_names = _fresh_active_emby_instance_names()
-        has_orphan = emby_traffic_db.is_orphaned_instance(name, active_names)
+        has_orphan = emby_traffic_db.is_orphaned_instance(
+            name, active_names, renaming_from=renaming_from)
         return _no_cache_json({
             'success': True,
             'has_orphaned_data': has_orphan,
@@ -1547,17 +1573,26 @@ def api_emby_config_instances_update(name):
     if err:
         return err
     try:
-        data = request.get_json()
-        if not data:
+        raw = request.get_json()
+        if not raw:
             return jsonify({'success': False, 'error': '请求无效'}), 400
-        attempt_sync, reachable, data_policy = config_manager.pop_instance_save_flags(data)
+        attempt_sync, reachable, data_policy = config_manager.pop_instance_save_flags(raw)
+        api_key_in_request = str(raw.get('api_key', '') or '').strip()
+        existing = config_manager.get_emby_instance(
+            name, config_manager.load_config())
+        data = config_manager.resolve_emby_credentials(raw, existing)
         new_name = str(data.get('name', '')).strip() or name
         active_names = _fresh_active_emby_instance_names()
         _apply_emby_rename_data_policy(name, new_name, data_policy, active_names)
         validated = config_manager.update_emby_instance(name, data)
-        _reload_all_config()
-        if emby_monitor:
-            emby_monitor.wake_all()
+        basics_only = config_manager.emby_instance_only_basics_changed(
+            existing, validated, api_key_in_request=api_key_in_request)
+        if basics_only:
+            _reload_emby_monitor_after_save(defer=True)
+        else:
+            _reload_all_config()
+            if emby_monitor:
+                emby_monitor.wake_all()
         policy_note = ''
         if name != validated['name'] and data_policy == 'restore_orphan':
             policy_note = '（改名并恢复历史数据）'

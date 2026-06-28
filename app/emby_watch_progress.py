@@ -9,7 +9,11 @@ from emby_client import EmbyClient
 
 WATCH_LOCK_SECONDS = 30
 WATCH_EFFECTIVE_SECONDS = 300
-SEEK_TOLERANCE_SECONDS = 5
+SEEK_BACKWARD_TOLERANCE = 8
+SEEK_FORWARD_MIN_DELTA = 9
+SEEK_FORWARD_GAP_TOLERANCE = 12
+SEEK_GAP_ELAPSED_MIN = 3.0
+SEEK_COOLDOWN_SECONDS = 2.5
 STALL_GRACE_SECONDS = 8
 MAX_POLL_GAP_SECONDS = 15
 WATCH_COMPLETE_RATIO = 0.85
@@ -37,7 +41,7 @@ class SessionWatchState:
         'last_position', 'last_monotonic', 'stall_seconds', 'start_locked',
         'first_position_seconds', 'start_position_seconds', 'end_position_seconds',
         'played_seconds', 'seek_count', 'seek_forward_count', 'seek_backward_count',
-        'last_seek_at', 'user_id', 'client', 'item_id', 'series_name',
+        'last_seek_at', 'last_seek_mono', 'user_id', 'client', 'item_id', 'series_name',
         'item_title', 'episode_label', '_bound_media_id',
     )
 
@@ -57,6 +61,7 @@ class SessionWatchState:
         self.seek_forward_count = 0
         self.seek_backward_count = 0
         self.last_seek_at = ''
+        self.last_seek_mono = None
         self.user_id = ''
         self.client = ''
         self.item_id = ''
@@ -92,6 +97,7 @@ class SessionWatchState:
         self.seek_forward_count = 0
         self.seek_backward_count = 0
         self.last_seek_at = ''
+        self.last_seek_mono = None
 
     def bind_session(self, record: dict) -> None:
         self.user_id = str(record.get('user_id') or record.get('UserId') or '').strip()
@@ -192,18 +198,23 @@ class SessionWatchState:
         else:
             self.seek_forward_count += 1
         self.last_seek_at = self._utc_now_iso()
+        self.last_seek_mono = time.monotonic()
 
     def _reset_segment(self, position: int) -> None:
         self.segment_start_position = position
         self.continuous_seconds = 0.0
         self.stall_seconds = 0.0
 
-    @staticmethod
-    def _is_seek(last_pos: int, pos: int, elapsed: float) -> bool:
+    def _is_seek(self, last_pos: int, pos: int, elapsed: float, now_mono: float) -> bool:
+        if self.last_seek_mono is not None:
+            if (now_mono - self.last_seek_mono) < SEEK_COOLDOWN_SECONDS:
+                return False
         delta = pos - last_pos
-        if delta < -SEEK_TOLERANCE_SECONDS:
+        if delta <= -SEEK_BACKWARD_TOLERANCE:
             return True
-        if delta > elapsed + SEEK_TOLERANCE_SECONDS:
+        if delta >= SEEK_FORWARD_MIN_DELTA:
+            return True
+        if elapsed >= SEEK_GAP_ELAPSED_MIN and delta > elapsed + SEEK_FORWARD_GAP_TOLERANCE:
             return True
         return False
 
@@ -236,7 +247,7 @@ class SessionWatchState:
             self.last_position = position
             return
 
-        if self._is_seek(last_pos, position, elapsed):
+        if self._is_seek(last_pos, position, elapsed, now):
             self._record_seek(last_pos, position)
             self._reset_segment(position)
             self.last_position = position

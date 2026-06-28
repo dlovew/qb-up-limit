@@ -1505,7 +1505,7 @@ def api_emby_config_instance_orphan_data_delete(name):
 def api_emby_config_instances_test():
     try:
         data = request.get_json() or {}
-        test_type = data.get('test_type', 'connect')
+        test_type = data.get('test_type', 'connectivity')
         validated = config_manager.validate_emby_instance_for_test(
             data, test_type=test_type)
 
@@ -1518,7 +1518,10 @@ def api_emby_config_instances_test():
                             'error': result.get('error')})
 
         client = EmbyClient(validated)
-        result = client.test_connection()
+        if test_type == 'api':
+            result = client.test_api()
+        else:
+            result = client.test_connectivity()
         return jsonify({
             'success': result.get('ok', False),
             'data': result,

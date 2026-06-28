@@ -18,6 +18,8 @@ from emby_docker import DockerStatsClient
 from emby_traffic_filter import (
     apply_wan_traffic_filter,
     is_wan_playback_session,
+    m3_allocate_wan_pool,
+    m3_session_docker_share_bps,
     scale_m3_wan_pool_bytes,
     session_stream_bps,
 )
@@ -73,12 +75,69 @@ def _estimate_lan_tick_upload_bytes(sessions: list, tick_seconds: float) -> int:
     return max(0, int(lan_bps * elapsed / 8))
 
 
+def _estimate_m3_lan_tick_upload_bytes(sessions: list, tick_seconds: float) -> int:
+    elapsed = max(0.5, min(120.0, float(tick_seconds or 1.0)))
+    lan_bps = sum(
+        m3_session_docker_share_bps(session)
+        for session in _active_playback_sessions(sessions)
+        if not is_wan_playback_session(session)
+    )
+    if lan_bps <= 0:
+        return 0
+    return max(0, int(lan_bps * elapsed / 8))
+
+
 def _wan_filter_surplus_bytes(live_raw_up: int, live_delta_up: int) -> int:
     return max(0, int(live_raw_up or 0) - max(0, int(live_delta_up or 0)))
 
 
 _M1_WAN_EMA_WARMUP_TICKS = 3
 _M1_WAN_ELEVATED_RATIO = 1.12
+_BACKLOG_DRAIN_MIN_BYTES = 512 * 1024
+
+
+def _backlog_drain_cap_bytes(live_raw_up: int, live_wan_pool_up: int) -> int:
+    """单 tick 从 backlog 补录时，WAN 池口径的上限（避免一次性灌入造成中段突刺）。"""
+    wan = max(0, int(live_wan_pool_up or 0))
+    raw = max(0, int(live_raw_up or 0))
+    base = wan if wan > 0 else raw
+    return max(base, _BACKLOG_DRAIN_MIN_BYTES)
+
+
+def _filter_wan_pool_bytes(
+    client: EmbyClient,
+    raw_bytes: int,
+    sessions: list,
+    *,
+    mode_code: str,
+    m3_scale: float,
+    wan_only_enabled: bool,
+    burst_window_seconds: float = 8.0,
+    now_epoch: float = None,
+    tick_seconds: float = 1.0,
+    ratio_only: bool = False,
+) -> int:
+    """将 Docker 原始增量按当前会话切出 WAN 池（M3 含 scale 与新外网突发）。"""
+    raw = max(0, int(raw_bytes or 0))
+    if raw <= 0:
+        return 0
+    if not wan_only_enabled:
+        return raw
+    if mode_code == 'M3':
+        return m3_allocate_wan_pool(
+            raw,
+            sessions or [],
+            scale=m3_scale,
+            burst_window_seconds=burst_window_seconds,
+            now_epoch=now_epoch,
+            tick_seconds=tick_seconds,
+            ratio_only=ratio_only,
+        )
+    filtered, _ = apply_wan_traffic_filter(
+        raw, 0, sessions or [],
+        enabled=getattr(client, 'wan_traffic_only', True),
+    )
+    return max(0, int(filtered or 0))
 
 
 def _debug_mode_from_sessions(sessions: list) -> tuple:
@@ -203,6 +262,9 @@ class EmbyInstanceWorker:
         self._mode_switch_replay_total_bytes = 0
         self._mode_switch_replay_alloc_total_bytes = 0
         self._wan_alloc_backlog_bytes = 0
+        self._wan_assign_budget_ledger = 0
+        self._wan_assign_assigned_ledger = 0
+        self._wan_ledger_session_id = ''
         self._prev_mode_code = 'M0'
         self._m1_wan_surplus_ema = 0.0
         self._m1_wan_capture_bytes = 0
@@ -305,6 +367,11 @@ class EmbyInstanceWorker:
         self._mode_switch_replay_total_bytes = 0
         self._mode_switch_replay_alloc_total_bytes = 0
 
+    def _reset_wan_assign_ledger(self):
+        self._wan_assign_budget_ledger = 0
+        self._wan_assign_assigned_ledger = 0
+        self._wan_ledger_session_id = ''
+
     def _reset_m1_wan_capture(self):
         self._m1_wan_surplus_ema = 0.0
         self._m1_wan_capture_bytes = 0
@@ -335,6 +402,99 @@ class EmbyInstanceWorker:
         if fallback > 0:
             self._wan_alloc_backlog_bytes += fallback
         return fallback
+
+    def _sync_wan_ledger_session(self, sessions: list) -> None:
+        sid = ''
+        for session in _active_playback_sessions(sessions or []):
+            if not is_wan_playback_session(session):
+                continue
+            sid = str(
+                session.get('emby_session_id')
+                or session.get('session_id')
+                or session.get('id')
+                or '',
+            ).strip()
+            if sid:
+                break
+        if sid and sid != self._wan_ledger_session_id:
+            self._reset_wan_assign_ledger()
+            self._wan_ledger_session_id = sid
+
+    def _plan_m3_wan_alloc_budget(
+        self,
+        client: EmbyClient,
+        *,
+        live_raw_up: int,
+        mode_code: str,
+        sessions: list,
+        wan_only_enabled: bool,
+        burst_window_seconds: float,
+        now_epoch: float,
+        tick_seconds: float,
+    ) -> tuple:
+        """单 tick WAN 分摊预算：live 可含突发；backlog 仅按比例切分避免补录放大。"""
+        live_raw = max(0, int(live_raw_up or 0))
+        raw_before = max(0, int(self._wan_alloc_backlog_bytes or 0))
+        m3_scale = getattr(self.monitor, 'm3_wan_pool_scale', 1.0)
+        filt_kw = dict(
+            mode_code=mode_code,
+            m3_scale=m3_scale,
+            wan_only_enabled=wan_only_enabled,
+            burst_window_seconds=burst_window_seconds,
+            now_epoch=now_epoch,
+            tick_seconds=tick_seconds,
+        )
+
+        raw_drain = 0
+        if raw_before > 0:
+            if live_raw > 0:
+                soft_cap = min(_BACKLOG_DRAIN_MIN_BYTES, raw_before)
+                raw_drain = min(raw_before, max(live_raw, soft_cap))
+            else:
+                raw_drain = min(raw_before, _BACKLOG_DRAIN_MIN_BYTES)
+
+        wan_live = _filter_wan_pool_bytes(
+            client,
+            live_raw,
+            sessions,
+            **filt_kw,
+        ) if live_raw > 0 else 0
+        wan_drain = 0
+        if raw_drain > 0:
+            wan_drain = _filter_wan_pool_bytes(
+                client,
+                raw_drain,
+                sessions,
+                ratio_only=True,
+                **filt_kw,
+            )
+        wan_from_docker = min(
+            live_raw + raw_drain,
+            max(0, int(wan_live or 0)) + max(0, int(wan_drain or 0)),
+        )
+        wan_backlog_part = max(0, int(wan_drain or 0))
+        raw_after = raw_before - raw_drain
+        return wan_from_docker, raw_drain, wan_live, wan_backlog_part, raw_after
+
+    def _cap_wan_assign_by_ledger(
+        self,
+        wan_from_docker: int,
+        *,
+        wan_live: int,
+        wan_backlog_part: int,
+    ) -> int:
+        """分摊账本：预算 += 本 tick filter 结果；实际灌入 ≤ 预算 − 已灌入。"""
+        wan_from_docker = max(0, int(wan_from_docker or 0))
+        wan_live = max(0, int(wan_live or 0))
+        wan_backlog_part = max(0, int(wan_backlog_part or 0))
+        if wan_from_docker <= 0:
+            return 0
+        self._wan_assign_budget_ledger += wan_live + wan_backlog_part
+        allowed = max(
+            0,
+            int(self._wan_assign_budget_ledger or 0) - int(self._wan_assign_assigned_ledger or 0),
+        )
+        return min(wan_from_docker, allowed)
 
     def _accumulate_wan_filter_surplus_backlog(self, *, live_raw_up: int, live_delta_up: int,
                                                mode_code: str, prev_mode_code: str,
@@ -386,9 +546,16 @@ class EmbyInstanceWorker:
         if mode_code in ('M2', 'M3') and _has_confirmed_wan_playback(sessions):
             if int(self._m1_wan_capture_bytes or 0) > 0:
                 self._flush_m1_wan_capture_to_backlog()
-            elif prev_mode_code in ('M0', 'M1'):
+            elif prev_mode_code == 'M1':
                 self._flush_m1_wan_peak_fallback_to_backlog()
             self._m1_wan_surplus_peak = 0
+            if mode_code == 'M3' and surplus > 0:
+                lan_expected = _estimate_m3_lan_tick_upload_bytes(
+                    sessions, tick_seconds,
+                )
+                spill = max(0, int(surplus) - lan_expected)
+                if spill > 0:
+                    self._wan_alloc_backlog_bytes += spill
             return
 
         if mode_code == 'M0' and surplus > 0 and grace_seconds <= 0:
@@ -452,6 +619,12 @@ class EmbyInstanceWorker:
                 self._mode_switch_pending_upload_bytes = 0
                 self._mode_switch_pending_since_mono = None
                 self._mode_switch_replay_total_bytes += replay
+                if (
+                    replay > 0
+                    and wan_only_enabled
+                    and mode_code in ('M2', 'M3')
+                ):
+                    self._wan_alloc_backlog_bytes += replay
                 return merged, replay
             if elapsed <= float(grace_seconds):
                 return 0, 0
@@ -471,6 +644,7 @@ class EmbyInstanceWorker:
                 self._reset_mode_switch_observation()
                 if int(self._mode_switch_pending_upload_bytes or 0) <= 0:
                     self._wan_alloc_backlog_bytes = 0
+                    self._reset_wan_assign_ledger()
                     self._reset_m1_wan_capture()
         self._mode_switch_pending_upload_bytes = 0
         self._mode_switch_pending_since_mono = None
@@ -545,6 +719,7 @@ class EmbyInstanceWorker:
                     f'[Emby:{self.name}] 无会话时分摊状态清理失败: {e}',
                 )
             self._wan_alloc_backlog_bytes = 0
+            self._reset_wan_assign_ledger()
             self._reset_m1_wan_capture()
             self._verify_cumulative = {}
             self._last_tick_audit = {}
@@ -657,20 +832,27 @@ class EmbyInstanceWorker:
         )
 
         now_mono = time.monotonic()
+        now_epoch = time.time()
         mode_code, _, _, _ = _debug_mode_from_sessions(mode_sessions)
         wan_only_enabled = bool(getattr(client, 'wan_traffic_only', True))
+        burst_window_seconds = float(
+            getattr(self.monitor, 'burst_new_session_window_seconds', 8) or 8,
+        )
+        allocation_tick_seconds = max(1, int(self.monitor.refresh_interval or 1))
+        if full and raw_up > 0 and live_raw_up == raw_up:
+            allocation_tick_seconds = max(1, int(self.monitor.collect_interval or 1))
         if mode_code == 'M3' and wan_only_enabled:
-            live_delta_up = scale_m3_wan_pool_bytes(
-                live_delta_up,
+            live_delta_up = m3_allocate_wan_pool(
                 live_raw_up,
-                getattr(self.monitor, 'm3_wan_pool_scale', 1.0),
+                mode_sessions,
+                scale=getattr(self.monitor, 'm3_wan_pool_scale', 1.0),
+                burst_window_seconds=burst_window_seconds,
+                now_epoch=now_epoch,
+                tick_seconds=allocation_tick_seconds,
             )
         grace_seconds = max(0, int(getattr(
             self.monitor, 'mode_switch_grace_seconds', 0,
         ) or 0))
-        allocation_tick_seconds = max(1, int(self.monitor.refresh_interval or 1))
-        if full and raw_up > 0 and live_raw_up == raw_up:
-            allocation_tick_seconds = max(1, int(self.monitor.collect_interval or 1))
         self._accumulate_wan_filter_surplus_backlog(
             live_raw_up=live_raw_up,
             live_delta_up=live_delta_up,
@@ -695,7 +877,10 @@ class EmbyInstanceWorker:
 
         replay_alloc_up = 0
         if replay_upload_up > 0 and mode_code != 'M0':
-            if wan_only_enabled:
+            if wan_only_enabled and mode_code in ('M2', 'M3'):
+                # 待判定回放已写入 backlog，由限幅补录路径统一分摊，避免与 backlog 双通道叠加。
+                pass
+            elif wan_only_enabled:
                 replay_alloc_up, _ = self._apply_traffic_filter(
                     client, replay_upload_up, 0, mode_sessions,
                 )
@@ -726,18 +911,45 @@ class EmbyInstanceWorker:
                 or _has_confirmed_wan_playback(alloc_sessions)
             )
             backlog_contrib = 0
+            backlog_raw_before = max(0, int(self._wan_alloc_backlog_bytes or 0))
+            backlog_raw_after = backlog_raw_before
             if mode_code == 'M0' and int(replay_alloc_up or 0) <= 0:
                 effective_alloc_up = 0
+            elif (
+                wan_only_enabled
+                and mode_code in ('M2', 'M3')
+                and wan_ready
+            ):
+                self._sync_wan_ledger_session(alloc_sessions)
+                (
+                    wan_from_docker,
+                    _raw_drain,
+                    wan_live,
+                    wan_backlog_part,
+                    backlog_raw_after,
+                ) = self._plan_m3_wan_alloc_budget(
+                    client,
+                    live_raw_up=live_raw_up,
+                    mode_code=mode_code,
+                    sessions=alloc_sessions,
+                    wan_only_enabled=wan_only_enabled,
+                    burst_window_seconds=burst_window_seconds,
+                    now_epoch=now_epoch,
+                    tick_seconds=allocation_tick_seconds,
+                )
+                effective_alloc_up = self._cap_wan_assign_by_ledger(
+                    wan_from_docker,
+                    wan_live=wan_live,
+                    wan_backlog_part=wan_backlog_part,
+                )
+                backlog_contrib = max(
+                    0, int(effective_alloc_up or 0) - int(filter_wan_pool_up or 0),
+                )
             else:
                 effective_alloc_up = max(0, int(alloc_input_up or 0))
-                backlog_contrib = max(0, int(self._wan_alloc_backlog_bytes or 0))
-                if backlog_contrib > 0 and wan_ready:
-                    effective_alloc_up += backlog_contrib
-                elif backlog_contrib > 0:
-                    backlog_contrib = 0
 
             if effective_alloc_up > 0 and not can_alloc:
-                self._wan_alloc_backlog_bytes = effective_alloc_up
+                self._wan_alloc_backlog_bytes = backlog_raw_before
             elif effective_alloc_up > 0:
                 wan_backlog_applied_bytes = backlog_contrib if backlog_contrib > 0 else 0
                 try:
@@ -753,14 +965,33 @@ class EmbyInstanceWorker:
                     )
                     if isinstance(alloc_debug, dict):
                         allocation_debug.update(alloc_debug)
-                        remainder = alloc_debug.get('program_remainder_bytes')
-                        if remainder is None:
-                            remainder = alloc_debug.get('remainder_bytes')
-                        self._wan_alloc_backlog_bytes = max(0, int(remainder or 0))
+                        assigned_up = int(
+                            alloc_debug.get('wan_upload_bytes')
+                            or alloc_debug.get('assigned_bytes')
+                            or effective_alloc_up
+                            or 0,
+                        )
+                        if (
+                            wan_only_enabled
+                            and mode_code in ('M2', 'M3')
+                            and wan_ready
+                        ):
+                            self._wan_assign_assigned_ledger += max(0, assigned_up)
+                            self._wan_alloc_backlog_bytes = max(
+                                0, int(backlog_raw_after or 0),
+                            )
+                        else:
+                            remainder = alloc_debug.get('program_remainder_bytes')
+                            if remainder is None:
+                                remainder = alloc_debug.get('remainder_bytes')
+                            self._wan_alloc_backlog_bytes = max(
+                                0, int(remainder or 0),
+                            )
                 except Exception as e:
                     logger.debug(
                         f'[Emby:{self.name}] 外网播放上行累计失败: {e}',
                     )
+                    self._wan_alloc_backlog_bytes = backlog_raw_before
             elif (
                 not is_backfill
                 and mode_code != 'M0'
@@ -856,6 +1087,7 @@ class EmbyInstanceWorker:
             sessions=sessions,
             wan_only_enabled=wan_only_enabled,
             m3_wan_pool_scale=getattr(self.monitor, 'm3_wan_pool_scale', 1.0),
+            tick_seconds=allocation_tick_seconds,
         )
         if mode_code in ('M2', 'M3') and _has_confirmed_wan_playback(mode_sessions):
             self._verify_cumulative = emby_traffic_tick_audit.merge_cumulative(
@@ -866,6 +1098,7 @@ class EmbyInstanceWorker:
             )
         elif mode_code == 'M0' and not _active_playback_sessions(mode_sessions):
             self._verify_cumulative = {}
+            self._reset_wan_assign_ledger()
         self.monitor.update_live_cache(
             self.name,
             is_online=is_online,

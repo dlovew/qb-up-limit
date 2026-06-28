@@ -708,6 +708,52 @@ body::after {
     box-shadow: 0 1px 3px rgba(37, 99, 235, 0.12), 0 1px 2px rgba(37, 99, 235, 0.06);
 }
 
+.device-view-segments--triple .device-view-segment-indicator {
+    width: calc((100% - 6px) / 3);
+}
+
+#syslogTypeSwitch .device-view-segments--triple:has(.device-view-btn[data-syslog-type="qb"].active) .device-view-segment-indicator {
+    transform: translateX(0);
+    background: #eff6ff;
+    box-shadow: 0 1px 3px rgba(37, 99, 235, 0.12), 0 1px 2px rgba(37, 99, 235, 0.06);
+}
+
+#syslogTypeSwitch .device-view-segments--triple:has(.device-view-btn[data-syslog-type="emby"].active) .device-view-segment-indicator {
+    transform: translateX(100%);
+    background: #ecfdf5;
+    box-shadow: 0 1px 3px rgba(16, 185, 129, 0.12), 0 1px 2px rgba(16, 185, 129, 0.06);
+}
+
+#syslogTypeSwitch .device-view-segments--triple:has(.device-view-btn[data-syslog-type="system"].active) .device-view-segment-indicator {
+    transform: translateX(200%);
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08), 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.device-view-segments--triple .device-view-btn[data-syslog-type="system"].active {
+    color: var(--text-primary);
+}
+
+.device-view-segments--dual .device-view-segment-indicator {
+    width: calc(50% - 3px);
+}
+
+#syslogTypeSwitch .device-view-segments--dual:has(.device-view-btn[data-syslog-type="qb"].active) .device-view-segment-indicator {
+    transform: translateX(0);
+    background: #eff6ff;
+    box-shadow: 0 1px 3px rgba(37, 99, 235, 0.12), 0 1px 2px rgba(37, 99, 235, 0.06);
+}
+
+#syslogTypeSwitch .device-view-segments--dual:has(.device-view-btn[data-syslog-type="system"].active) .device-view-segment-indicator {
+    transform: translateX(100%);
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08), 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.device-view-segments--dual .device-view-btn[data-syslog-type="system"].active {
+    color: var(--text-primary);
+}
+
 .device-view-switch[data-view-mode="merge"] .device-view-segment-indicator {
     opacity: 0;
 }
@@ -1553,6 +1599,45 @@ html:not(.emby-feature-enabled) .chart-control--device-type {
     color: var(--text-secondary);
     font-size: 12px;
     margin-top: 4px;
+}
+
+.emby-session-meta-row {
+    margin-top: 4px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.45;
+    word-break: break-word;
+}
+
+.emby-session-meta-row::after {
+    content: '';
+    display: table;
+    clear: both;
+}
+
+.emby-session-meta-row .emby-session-traffic-stats {
+    float: right;
+    margin-left: 10px;
+    margin-top: 0;
+    padding-top: 1px;
+}
+
+.emby-session-traffic-stats {
+    display: inline-flex;
+    justify-content: flex-end;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    font-size: 11px;
+    color: #065f46;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    white-space: nowrap;
+}
+
+.emby-session-traffic-sep {
+    color: #94a3b8;
+    user-select: none;
 }
 
 .emby-session-debug {
@@ -5574,6 +5659,17 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
     background: rgba(59, 130, 246, 0.08);
 }
 
+.log-filter-head-refresh-btn.refreshing,
+.log-filter-head-refresh-btn:disabled {
+    color: var(--primary-color);
+    cursor: default;
+    pointer-events: none;
+}
+
+.log-filter-head-refresh-btn.refreshing .log-filter-head-refresh-icon {
+    animation: refresh-ring-spin 0.8s linear infinite;
+}
+
 .log-filter-head-refresh-icon {
     width: 16px;
     height: 16px;
@@ -6024,8 +6120,15 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
 }
 
 .emby-log-card--playing {
-    --log-accent: #10b981;
-    background: linear-gradient(90deg, color-mix(in srgb, var(--log-accent) 6%, #fff) 0%, #fff 56%);
+    --log-accent: #059669;
+    --emby-log-play-progress: 0%;
+    background: linear-gradient(
+        90deg,
+        color-mix(in srgb, var(--log-accent) 13%, #fff) 0%,
+        color-mix(in srgb, var(--log-accent) 8%, #fff) max(0%, calc(var(--emby-log-play-progress) - 7%)),
+        color-mix(in srgb, var(--log-accent) 3%, #fff) var(--emby-log-play-progress),
+        #fff min(100%, calc(var(--emby-log-play-progress) + 3%))
+    );
 }
 
 .emby-log-card--paused {
@@ -6108,10 +6211,26 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
 }
 
 .emby-log-card-time {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
     font-size: 12px;
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
+}
+
+.emby-log-card-time-text {
+    min-width: 0;
     white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex-shrink: 0;
+}
+
+.emby-log-card-time .emby-session-badge {
+    flex-shrink: 0;
 }
 
 .emby-log-card-title {
@@ -6174,6 +6293,11 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
 
 .emby-log-card-stats {
     font-size: 12px;
+}
+
+.emby-log-card-stats .event-watch-meta {
+    width: 100%;
+    text-align: left;
 }
 
 .emby-log-card .event-watch-meta {
@@ -9581,6 +9705,17 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
         width: 100%;
     }
 
+    .modal-form--instance .form-row--name-priority > .form-field--grow {
+        width: 100%;
+        flex: 1 1 100%;
+        min-width: 0;
+    }
+
+    .modal-form--instance .form-row--name-priority > .form-field--grow input[type="text"] {
+        width: 100%;
+        box-sizing: border-box;
+    }
+
     .modal-form--global .form-hint,
     .modal-form--global .form-hint--field,
     .modal-form--instance .form-hint,
@@ -10238,7 +10373,8 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    padding: 5px;
+    gap: 4px;
+    padding: 5px 7px;
     border: none;
     background: transparent;
     color: #64748b;
@@ -10262,9 +10398,18 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
 
 .rules-header-action-icon,
 .rules-event-log-icon {
-    width: 18px;
-    height: 18px;
+    width: 20px;
+    height: 20px;
     display: block;
+    flex-shrink: 0;
+}
+
+.rules-header-action-label {
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
 }
 
 .rules-empty {

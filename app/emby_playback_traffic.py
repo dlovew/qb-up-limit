@@ -663,17 +663,17 @@ def annotate_live_sessions_upload(instance_name: str, sessions: list) -> List[di
         else:
             continue
 
-        if name and session.get('is_remote') and bool(session.get('is_playing')) and not bool(
-            session.get('is_paused'),
-        ):
+        if name and session.get('is_remote') and bool(session.get('is_playing')):
             live_key, upload_live = _resolve_bucket_upload(upload_bucket, session)
             if upload_live is None:
                 upload_live = 0
-            _, upload_1s = _resolve_bucket_upload(
-                tick_bucket, session, preferred_key=live_key or '',
-            )
-            if upload_1s is None:
-                upload_1s = 0
+            upload_1s = 0
+            if not bool(session.get('is_paused')):
+                _, upload_1s = _resolve_bucket_upload(
+                    tick_bucket, session, preferred_key=live_key or '',
+                )
+                if upload_1s is None:
+                    upload_1s = 0
 
             session['estimated_upload_bytes_live'] = upload_live
             session['estimated_upload_bytes_1s_live'] = upload_1s

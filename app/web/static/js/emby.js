@@ -441,18 +441,54 @@ function resolveEmbySessionDebugWindowSeconds(session, instanceName = '') {
     return 1;
 }
 
-function buildEmbySessionUploadDebugHtml(session, instanceName = '') {
-    if (!EMBY_DEBUG_MODE_ENABLED || !session?.is_remote) return '';
-    const liveTotalBytes = Math.max(0, parseInt(session.estimated_upload_bytes_live, 10) || 0);
-    const liveWindowBytes = Math.max(0, parseInt(session.estimated_upload_bytes_1s_live, 10) || 0);
+function resolveEmbySessionTrafficBytes(session, instanceName = '') {
+    const liveTotalBytes = Math.max(0, parseInt(session?.estimated_upload_bytes_live, 10) || 0);
+    const liveWindowBytes = Math.max(0, parseInt(session?.estimated_upload_bytes_1s_live, 10) || 0);
     const windowSeconds = resolveEmbySessionDebugWindowSeconds(session, instanceName);
-    const windowText = formatEmbyLiveUploadDebugText(liveWindowBytes);
+    return { liveTotalBytes, liveWindowBytes, windowSeconds };
+}
+
+function shouldShowEmbySessionTrafficStats(session, instanceName = '') {
+    if (!session?.is_remote) return false;
+    const name = String(instanceName || session.instance_name || '').trim();
+    return isEmbyEstimateUploadEnabled(name);
+}
+
+function buildEmbySessionTrafficStatsHtml(session, instanceName = '', options = {}) {
+    const { extraClass = '' } = options;
+    const includeWindow = options.includeWindow != null
+        ? options.includeWindow
+        : isEmbyDebugModeEnabled();
+    if (!shouldShowEmbySessionTrafficStats(session, instanceName)) return '';
+    const { liveTotalBytes, liveWindowBytes, windowSeconds } = resolveEmbySessionTrafficBytes(
+        session,
+        instanceName,
+    );
     const totalText = formatEmbyLiveUploadDebugText(liveTotalBytes);
-    const windowLabel = `近${windowSeconds}秒新增`;
-    return `<div class="emby-session-debug">
-        <div class="emby-session-debug-row">${escapeHtml(windowLabel)} ${escapeHtml(windowText)}</div>
-        <div class="emby-session-debug-row">流量累积 ${escapeHtml(totalText)}</div>
-    </div>`;
+    const parts = [];
+    if (includeWindow) {
+        const windowText = formatEmbyLiveUploadDebugText(liveWindowBytes);
+        parts.push(
+            `<span class="emby-session-traffic-item">近${windowSeconds}秒新增 ${escapeHtml(windowText)}</span>`,
+        );
+    }
+    parts.push(`<span class="emby-session-traffic-item">流量累积 ${escapeHtml(totalText)}</span>`);
+    const sep = '<span class="emby-session-traffic-sep" aria-hidden="true">·</span>';
+    const classNames = ['emby-session-traffic-stats', extraClass].filter(Boolean).join(' ');
+    return `<span class="${classNames}">${parts.join(sep)}</span>`;
+}
+
+function buildEmbyPlaybackRecordTrafficHtml(rec) {
+    if (rec?.status !== 'playing') return '';
+    if (!shouldShowEmbySessionTrafficStats(rec, rec.instance_name)) return '';
+    const { liveTotalBytes } = resolveEmbySessionTrafficBytes(rec, rec.instance_name);
+    const totalText = formatEmbyLiveUploadDebugText(liveTotalBytes);
+    return `<span class="emby-session-badge emby-event-badge--upload">流量累积 ${escapeHtml(totalText)}</span>`;
+}
+
+/** @deprecated 保留别名，内部已改为常规展示 */
+function buildEmbySessionUploadDebugHtml(session, instanceName = '') {
+    return buildEmbySessionTrafficStatsHtml(session, instanceName);
 }
 
 const EMBY_SESSION_MESSAGE_TIMEOUT_MS = 8000;
@@ -506,22 +542,28 @@ function buildEmbySessionControlsHtml(session) {
     </div>`;
 }
 
-function buildEmbySessionCompactFooterHtml(session) {
+function buildEmbySessionCompactFooterHtml(session, instanceName = '') {
     const runtime = parseInt(session.runtime_seconds, 10) || 0;
     if (runtime <= 0) return '';
-    const pos = parseInt(session.position_seconds, 10) || 0;
-    const pct = getEmbySessionProgressPercent(pos, runtime, session.progress_percent);
-    const timeText = getEmbySessionTimeText(pos, runtime, pct);
-    return `<div class="emby-session-footer">
-        <div class="emby-session-progress">
+    let progressBlock = '';
+    let footerRow = '';
+    if (runtime > 0) {
+        const pos = parseInt(session.position_seconds, 10) || 0;
+        const pct = getEmbySessionProgressPercent(pos, runtime, session.progress_percent);
+        const timeText = getEmbySessionTimeText(pos, runtime, pct);
+        progressBlock = `<div class="emby-session-progress">
             <div class="emby-session-progress-bar">
                 <div class="emby-session-progress-fill" style="width:${pct}%"></div>
             </div>
-        </div>
-        <div class="emby-session-footer-row">
+        </div>`;
+        footerRow = `<div class="emby-session-footer-row">
             ${buildEmbySessionControlsHtml(session)}
             <div class="emby-session-time" data-position="${pos}" data-runtime="${runtime}" data-pct="${pct}" data-paused="${session.is_paused ? '1' : '0'}" data-synced="${Date.now()}">${escapeHtml(timeText)}</div>
-        </div>
+        </div>`;
+    }
+    return `<div class="emby-session-footer">
+        ${progressBlock}
+        ${footerRow}
     </div>`;
 }
 
@@ -557,8 +599,9 @@ function applyEmbySessionTimeEl(el, session) {
     }
 }
 
-function applyEmbySessionFooterEl(el, session) {
+function applyEmbySessionFooterEl(el, session, instanceName = '') {
     if (!el) return;
+    el.querySelector('.emby-session-traffic-stats')?.remove();
     applyEmbySessionTimeEl(el.querySelector('.emby-session-time'), session);
 }
 
@@ -589,6 +632,90 @@ function ensureEmbySessionTimeTicker() {
     embySessionTimeTicker = setInterval(tickEmbySessionTimes, 1000);
 }
 
+let embyLogPlayingTicker = null;
+
+function getEmbyPlayingWatchMetaText(runtime, startPos, position) {
+    const runtimeSec = parseInt(runtime, 10) || 0;
+    if (runtimeSec <= 0) return '';
+    const start = Math.max(0, parseInt(startPos, 10) || 0);
+    const pos = Math.max(0, Math.min(parseInt(position, 10) || 0, runtimeSec));
+    const remaining = Math.max(0, runtimeSec - pos);
+    const estimatedEnd = new Date(Date.now() + remaining * 1000);
+    const estimatedText = formatEmbyWallClockTime(estimatedEnd);
+    if (!estimatedText) return '';
+    return `影片时长${formatEmbyDuration(runtimeSec)} | ${formatEmbyDuration(start)} - ${formatEmbyDuration(pos)} | 预计${estimatedText}结束`;
+}
+
+function applyEmbyLogPlayingWatchEl(watchEl, event) {
+    if (!watchEl) return;
+    const runtime = parseInt(event.runtime_seconds, 10) || 0;
+    if (runtime <= 0) {
+        watchEl.hidden = true;
+        return;
+    }
+    const startPosRaw = parseInt(event.start_position_seconds, 10);
+    const startPos = Number.isNaN(startPosRaw) ? 0 : Math.max(0, startPosRaw);
+    const currentPos = resolveEmbyContentPosition(event);
+    if (currentPos == null || currentPos < 0) {
+        watchEl.hidden = true;
+        return;
+    }
+    watchEl.hidden = false;
+    watchEl.dataset.runtime = String(runtime);
+    watchEl.dataset.startPos = String(startPos);
+    watchEl.dataset.position = String(currentPos);
+    watchEl.dataset.paused = event.is_paused ? '1' : '0';
+    watchEl.dataset.synced = String(Date.now());
+    watchEl.textContent = getEmbyPlayingWatchMetaText(runtime, startPos, currentPos);
+
+    const card = watchEl.closest('.emby-log-card');
+    if (!card) return;
+    const pct = Math.min(100, parseFloat(formatEmbySessionPercent((currentPos / runtime) * 100)));
+    card.style.setProperty('--emby-log-play-progress', `${pct.toFixed(2)}%`);
+}
+
+function tickEmbyLogPlayingCards() {
+    const cards = document.querySelectorAll('.emby-log-card--playing');
+    if (!cards.length) {
+        if (embyLogPlayingTicker) {
+            clearInterval(embyLogPlayingTicker);
+            embyLogPlayingTicker = null;
+        }
+        return;
+    }
+    const now = Date.now();
+    cards.forEach((card) => {
+        const watchEl = card.querySelector('.emby-log-play-watch');
+        if (!watchEl || watchEl.hidden) return;
+        const runtime = parseInt(watchEl.dataset.runtime, 10) || 0;
+        if (runtime <= 0) return;
+        let position = parseInt(watchEl.dataset.position, 10) || 0;
+        if (watchEl.dataset.paused !== '1') {
+            const synced = parseInt(watchEl.dataset.synced, 10) || now;
+            const elapsed = Math.floor((now - synced) / 1000);
+            position = Math.min(runtime, position + elapsed);
+        }
+        const startPos = parseInt(watchEl.dataset.startPos, 10) || 0;
+        const pct = Math.min(100, parseFloat(formatEmbySessionPercent((position / runtime) * 100)));
+        card.style.setProperty('--emby-log-play-progress', `${pct.toFixed(2)}%`);
+        watchEl.textContent = getEmbyPlayingWatchMetaText(runtime, startPos, position);
+    });
+}
+
+function ensureEmbyLogPlayingTicker() {
+    const hasPlaying = document.querySelector('.emby-log-card--playing');
+    if (!hasPlaying) {
+        if (embyLogPlayingTicker) {
+            clearInterval(embyLogPlayingTicker);
+            embyLogPlayingTicker = null;
+        }
+        return;
+    }
+    if (embyLogPlayingTicker) return;
+    embyLogPlayingTicker = setInterval(tickEmbyLogPlayingCards, 1000);
+    tickEmbyLogPlayingCards();
+}
+
 function patchEmbySessionItemElement(el, session, instanceName) {
     const titleEl = el.querySelector('.emby-session-head strong');
     if (titleEl) {
@@ -600,30 +727,23 @@ function patchEmbySessionItemElement(el, session, instanceName) {
         const badgesHtml = buildEmbySessionBadgesHtml(session);
         if (badgesEl.innerHTML !== badgesHtml) badgesEl.innerHTML = badgesHtml;
     }
-    const metaEl = el.querySelector('.emby-session-meta');
-    if (metaEl) {
-        const metaHtml = buildEmbySessionMetaLine(session);
-        if (metaEl.innerHTML !== metaHtml) metaEl.innerHTML = metaHtml;
-    }
-    const debugHtml = buildEmbySessionUploadDebugHtml(session, instanceName);
-    const debugEl = el.querySelector('.emby-session-debug');
-    if (debugHtml) {
-        if (debugEl) {
-            if (debugEl.outerHTML !== debugHtml) debugEl.outerHTML = debugHtml;
-        } else if (metaEl) {
-            metaEl.insertAdjacentHTML('afterend', debugHtml);
-        } else {
-            el.insertAdjacentHTML('beforeend', debugHtml);
+    const metaRowHtml = buildEmbySessionMetaRowHtml(session, instanceName);
+    let metaRowEl = el.querySelector('.emby-session-meta-row');
+    if (metaRowEl) {
+        if (metaRowEl.outerHTML !== metaRowHtml) metaRowEl.outerHTML = metaRowHtml;
+    } else {
+        const legacyMetaEl = el.querySelector(':scope > .emby-session-meta');
+        if (legacyMetaEl) {
+            legacyMetaEl.outerHTML = metaRowHtml;
         }
-    } else if (debugEl) {
-        debugEl.remove();
     }
+    el.querySelector('.emby-session-debug')?.remove();
     const oldStandaloneTime = el.querySelector(':scope > .emby-session-time');
     if (oldStandaloneTime) oldStandaloneTime.remove();
     const footerEl = el.querySelector('.emby-session-footer');
-    const footerHtml = buildEmbySessionCompactFooterHtml(session);
+    const footerHtml = buildEmbySessionCompactFooterHtml(session, instanceName);
     if (footerEl) {
-        applyEmbySessionFooterEl(footerEl, session);
+        applyEmbySessionFooterEl(footerEl, session, instanceName);
     } else if (footerHtml) {
         el.insertAdjacentHTML('beforeend', footerHtml);
     }
@@ -716,6 +836,12 @@ function buildEmbySessionMetaLine(session) {
     return parts.map(p => escapeHtml(String(p))).join(' · ');
 }
 
+function buildEmbySessionMetaRowHtml(session, instanceName = '') {
+    const trafficHtml = buildEmbySessionTrafficStatsHtml(session, instanceName);
+    const metaText = buildEmbySessionMetaLine(session);
+    return `<div class="emby-session-meta-row">${metaText}${trafficHtml}</div>`;
+}
+
 function buildEmbySessionItemHtml(session, instanceName, compact = false) {
     const sessionId = escapeHtml(session.id || '');
     const instName = escapeHtml(instanceName || '');
@@ -726,9 +852,8 @@ function buildEmbySessionItemHtml(session, instanceName, compact = false) {
                 <div><strong>${buildEmbyMediaTitle(session)}</strong></div>
                 <div class="emby-session-badges">${buildEmbySessionBadgesHtml(session)}</div>
             </div>
-            <div class="emby-session-meta">${buildEmbySessionMetaLine(session)}</div>
-            ${buildEmbySessionUploadDebugHtml(session, instanceName)}
-            ${compact ? buildEmbySessionCompactFooterHtml(session) : buildEmbySessionProgressHtml(session)}
+            ${buildEmbySessionMetaRowHtml(session, instanceName)}
+            ${compact ? buildEmbySessionCompactFooterHtml(session, instanceName) : buildEmbySessionProgressHtml(session)}
         </div>`;
 }
 
@@ -1119,7 +1244,7 @@ function switchEmbyTab(tab) {
 
 async function refreshEmbyAll(forceRender = false, silent = false) {
     await refreshEmbyStatus(forceRender, silent);
-    if (embyCurrentTab === 'events') await loadEmbyEvents(silent);
+    if (isEmbyEventsTabActive()) await loadEmbyEvents(silent);
     if (typeof currentTab !== 'undefined' && currentTab === 'syslogs'
         && typeof getSyslogTypeFilter === 'function' && getSyslogTypeFilter() === 'emby') {
         await loadEmbySystemLogs(silent);
@@ -1155,13 +1280,13 @@ async function refreshEmbyLiveMetrics(silent = false) {
             return;
         }
         updateEmbyHeaderStats(cachedEmbyInstances);
-        if (typeof embyCurrentTab !== 'undefined' && embyCurrentTab === 'events'
-            && getEmbyEventLogType() === 'playback') {
-            if (_lastPlaybackRecords.some(r => r.status === 'playing')) {
-                renderPlaybackRecords(_lastPlaybackRecords);
-            }
-            if (typeof loadEmbyPlaybackRecords === 'function') {
-                await loadEmbyPlaybackRecords(true);
+        if (isEmbyPlaybackLogViewActive()) {
+            if (shouldReloadPlaybackRecordsFromStore()) {
+                if (typeof loadEmbyPlaybackRecords === 'function') {
+                    await loadEmbyPlaybackRecords(true);
+                }
+            } else {
+                syncEmbyPlaybackLogCardsFromLive();
             }
         }
     } catch (e) {
@@ -1251,25 +1376,27 @@ function updateEmbyInstanceSelects(instances) {
             || sessionStorage.getItem('qb-up-limit-syslog-instance-emby')
             || '';
         syslogSel.innerHTML = '';
-        syslogSel.add(new Option('全部设备', ''));
         names.forEach(name => {
             syslogSel.add(new Option(name, name));
         });
-        let syslogChanged = false;
-        if (prevSyslog === '' || names.includes(prevSyslog)) {
-            syslogSel.value = prevSyslog;
-        } else {
-            if (prevSyslog !== '') syslogChanged = true;
-            syslogSel.value = '';
+        let nextSyslog = '';
+        if (prevSyslog && names.includes(prevSyslog)) {
+            nextSyslog = prevSyslog;
+        } else if (names.length) {
+            nextSyslog = names[0];
         }
+        const syslogChanged = prevSyslog !== nextSyslog;
+        syslogSel.value = nextSyslog;
         if (syslogChanged && typeof currentTab !== 'undefined' && currentTab === 'syslogs'
             && typeof getSyslogTypeFilter === 'function' && getSyslogTypeFilter() === 'emby'
             && typeof loadSyslogsForCurrentType === 'function') {
             loadSyslogsForCurrentType(true);
         }
-        sessionStorage.setItem('qb-up-limit-syslog-instance-emby', syslogSel.value || '');
+        if (syslogSel.value) {
+            sessionStorage.setItem('qb-up-limit-syslog-instance-emby', syslogSel.value);
+        }
     }
-    if (eventInstanceChanged && embyCurrentTab === 'events') {
+    if (eventInstanceChanged && isEmbyEventsTabActive()) {
         loadEmbyEvents(true);
     }
 
@@ -1818,7 +1945,7 @@ function buildEmbySessionsBlockHTML(inst) {
     const sessions = getEmbyActivePlaybackSessions(inst);
     const count = sessions.length;
     const headerActions = typeof buildRulesHeaderActionsHtml === 'function'
-        ? buildRulesHeaderActionsHtml('emby', inst.name)
+        ? buildRulesHeaderActionsHtml('emby', inst.name, { showLabel: true })
         : '';
     if (!sessions.length) {
         return `
@@ -2156,7 +2283,7 @@ function buildEmbyInstanceForm(inst, mode) {
                         <input type="text" id="${prefix}EmbyHostPort" value="${escapeHtml(hostPort)}"
                                placeholder="192.168.1.10:8096" />
                     </label>
-                    <p class="form-hint form-hint--field">如 192.168.1.1:8096，不要写协议；HTTPS 由下方勾选控制</p>
+                    <p class="form-hint form-hint--field">如 192.168.1.10:8096，不要写协议；HTTPS 由下方勾选控制</p>
                 </div>
                 <div class="form-field">
                     <label>API Key
@@ -2178,7 +2305,8 @@ function buildEmbyInstanceForm(inst, mode) {
                 </div>
                 <div class="connection-test-panel">
                     <div class="test-actions">
-                        <button type="button" class="btn-secondary btn-sm" id="${prefix}EmbyConnectTestBtn">🔍 API 连通性测试</button>
+                        <button type="button" class="btn-secondary btn-sm" id="${prefix}EmbyConnectivityTestBtn">🔍 连通性测试</button>
+                        <button type="button" class="btn-secondary btn-sm" id="${prefix}EmbyApiTestBtn">🔑 API 测试</button>
                     </div>
                     <div id="${prefix}EmbyConnectTestResult" class="test-result"></div>
                 </div>
@@ -2204,7 +2332,7 @@ function buildEmbyInstanceForm(inst, mode) {
                     <div class="form-row form-row--checkboxes">
                         <label class="checkbox-label">
                             <input type="checkbox" id="${prefix}EmbyEstimateUploadEnabled" ${estimateUploadEnabled ? 'checked' : ''} />
-                            上传估算
+                            估算上传
                         </label>
                     </div>
                     <p class="form-hint form-hint--field">用于播放日志卡片的上传估算展示，建议保持开启，地址栏加 ?emby_debug=1 进入调试模式</p>
@@ -2240,10 +2368,14 @@ function bindEmbyHttpsSslToggle(prefix) {
 }
 
 function bindEmbyTestBtns(mode, originalName) {
-    const connectBtn = document.getElementById(`${mode}EmbyConnectTestBtn`);
+    const connectBtn = document.getElementById(`${mode}EmbyConnectivityTestBtn`);
+    const apiBtn = document.getElementById(`${mode}EmbyApiTestBtn`);
     const dockerBtn = document.getElementById(`${mode}EmbyDockerTestBtn`);
     if (connectBtn) {
-        connectBtn.onclick = () => runEmbyInstanceTest(mode, originalName, 'connect');
+        connectBtn.onclick = () => runEmbyInstanceTest(mode, originalName, 'connectivity');
+    }
+    if (apiBtn) {
+        apiBtn.onclick = () => runEmbyInstanceTest(mode, originalName, 'api');
     }
     if (dockerBtn) {
         dockerBtn.onclick = () => runEmbyInstanceTest(mode, originalName, 'docker');
@@ -2260,16 +2392,34 @@ function bindSaveEmbyInstanceBtn(mode, originalName) {
 
 function setEmbyTestButtonsState(prefix, activeType, running) {
     const meta = {
-        connect: { btn: `${prefix}EmbyConnectTestBtn`, running: '⏳ API 测试中…', label: '🔍 API 连通性测试' },
+        connectivity: { btn: `${prefix}EmbyConnectivityTestBtn`, running: '⏳ 连通性测试中…', label: '🔍 连通性测试' },
+        api: { btn: `${prefix}EmbyApiTestBtn`, running: '⏳ API 测试中…', label: '🔑 API 测试' },
         docker: { btn: `${prefix}EmbyDockerTestBtn`, running: '⏳ Docker 测试中…', label: '🐳 Docker 容器测试' },
     };
-    ['connect', 'docker'].forEach(type => {
+    const connectionBusy = running && (activeType === 'connectivity' || activeType === 'api');
+    ['connectivity', 'api'].forEach((type) => {
         const info = meta[type];
         const btn = document.getElementById(info.btn);
         if (!btn) return;
-        btn.disabled = running;
-        btn.textContent = running && type === activeType ? info.running : info.label;
+        btn.disabled = connectionBusy;
+        btn.textContent = connectionBusy && activeType === type ? info.running : info.label;
     });
+    const dockerInfo = meta.docker;
+    const dockerBtn = document.getElementById(dockerInfo.btn);
+    if (dockerBtn) {
+        dockerBtn.disabled = running && activeType === 'docker';
+        dockerBtn.textContent = running && activeType === 'docker'
+            ? dockerInfo.running
+            : dockerInfo.label;
+    }
+}
+
+function buildEmbyTestStepHtml(ok, label, message) {
+    return `<div class="test-step ${ok ? 'ok' : 'fail'}">
+        <span class="test-step-icon">${ok ? '✔' : '✗'}</span>
+        <span class="test-step-label">${escapeHtml(label)}</span>
+        <span class="test-step-msg">${message}</span>
+    </div>`;
 }
 
 function showEmbyTestResult(data, prefix, testType) {
@@ -2277,33 +2427,53 @@ function showEmbyTestResult(data, prefix, testType) {
         ? `${prefix}EmbyDockerTestResult`
         : `${prefix}EmbyConnectTestResult`;
     const resultDiv = document.getElementById(resultId);
-    const passText = testType === 'docker' ? 'Docker 测试通过' : 'API 测试通过';
-    const failText = testType === 'docker' ? 'Docker 测试失败' : 'API 测试失败';
+    const passText = '测试通过';
+    const failText = '测试失败';
 
     let detailHtml = '';
-    if (testType === 'connect' && data.data) {
+    if (data.success && testType === 'connectivity' && data.data) {
         const d = data.data;
-        const lines = [
+        let msg = escapeHtml(d.message || '连接成功');
+        const ping = String(d.ping || '').trim();
+        if (ping && ping.toLowerCase() !== 'ok') {
+            msg += `（${escapeHtml(ping)}）`;
+        }
+        detailHtml = buildEmbyTestStepHtml(true, '连通性', msg);
+    } else if (data.success && testType === 'api' && data.data) {
+        const d = data.data;
+        const parts = [
             d.server_name ? `服务器：${escapeHtml(d.server_name)}` : '',
             d.version ? `版本：${escapeHtml(d.version)}` : '',
         ].filter(Boolean);
-        if (lines.length) {
-            detailHtml = `<div class="test-step ok"><span class="test-step-msg">${lines.join(' · ')}</span></div>`;
-        }
-    } else if (testType === 'docker' && data.data) {
+        const msg = parts.length ? parts.join(' · ') : escapeHtml(d.message || 'API 验证成功');
+        detailHtml = buildEmbyTestStepHtml(true, 'API', msg);
+    } else if (data.success && testType === 'docker' && data.data) {
         const d = data.data;
         const label = d.container_name || d.container_id || '容器';
-        detailHtml = `<div class="test-step ok"><span class="test-step-msg">${escapeHtml(label)}（${escapeHtml(d.state || 'running')}）</span></div>`;
+        detailHtml = buildEmbyTestStepHtml(
+            true,
+            'Docker',
+            `${escapeHtml(label)}（${escapeHtml(d.state || 'running')}）`,
+        );
+    } else if (!data.success) {
+        const failLabels = {
+            connectivity: '连通性',
+            api: 'API',
+            docker: 'Docker',
+        };
+        const label = failLabels[testType] || '测试';
+        detailHtml = buildEmbyTestStepHtml(
+            false,
+            label,
+            escapeHtml(data.error || failText),
+        );
     }
 
     if (resultDiv) {
         const summary = data.success
             ? `<div class="test-summary ok">${passText}</div>`
             : `<div class="test-summary fail">${failText}</div>`;
-        const errHtml = !data.success
-            ? `<div class="test-step fail"><span class="test-step-msg">${escapeHtml(data.error || failText)}</span></div>`
-            : '';
-        resultDiv.innerHTML = summary + detailHtml + errHtml;
+        resultDiv.innerHTML = summary + detailHtml;
     }
 
     if (typeof showToast === 'function') {
@@ -2318,6 +2488,14 @@ function validateEmbyTestForm(data) {
     }
     if (isNaN(data.port) || data.port < 1 || data.port > 65535) {
         if (typeof showToast === 'function') showToast('请填写有效的地址与端口，格式如 192.168.1.10:8096', 'error');
+        return false;
+    }
+    return true;
+}
+
+function validateEmbyApiTestForm(data, mode) {
+    if (!data.api_key && mode === 'add') {
+        if (typeof showToast === 'function') showToast('请填写 API Key', 'error');
         return false;
     }
     return true;
@@ -2362,7 +2540,8 @@ async function runEmbyInstanceTest(mode, originalName, testType) {
     if (embyRunningTests.has(prefix)) return;
 
     const data = collectEmbyFormData(mode);
-    if (testType === 'connect' && !validateEmbyTestForm(data)) return;
+    if ((testType === 'connectivity' || testType === 'api') && !validateEmbyTestForm(data)) return;
+    if (testType === 'api' && !validateEmbyApiTestForm(data, mode)) return;
     if (testType === 'docker' && !data.container_name && !data.container_id) {
         if (typeof showToast === 'function') showToast('请填写 Docker 容器名或容器 ID', 'error');
         return;
@@ -2373,7 +2552,12 @@ async function runEmbyInstanceTest(mode, originalName, testType) {
         ? `${prefix}EmbyDockerTestResult`
         : `${prefix}EmbyConnectTestResult`;
     const resultDiv = document.getElementById(resultId);
-    const runningHint = testType === 'docker' ? '正在测试 Docker 容器，请稍候…' : '正在测试 API 连通性，请稍候…';
+    const runningHints = {
+        connectivity: '正在测试连通性，请稍候…',
+        api: '正在测试 API Key，请稍候…',
+        docker: '正在测试 Docker 容器，请稍候…',
+    };
+    const runningHint = runningHints[testType] || '正在测试，请稍候…';
     setEmbyTestButtonsState(prefix, testType, true);
     if (resultDiv) resultDiv.innerHTML = `<div class="test-running">${runningHint}</div>`;
 
@@ -2707,6 +2891,24 @@ function getEmbyEventLogType() {
     return document.getElementById('embyEventLogType')?.value || 'playback';
 }
 
+function resolveEmbyUiPlatform() {
+    if (typeof resolveContentPlatform === 'function') {
+        const tab = typeof currentTab !== 'undefined' ? currentTab : 'devices';
+        return resolveContentPlatform(tab);
+    }
+    if (typeof getDeviceTypeFilter === 'function') return getDeviceTypeFilter();
+    return 'qb';
+}
+
+function isEmbyEventsTabActive() {
+    return typeof currentTab !== 'undefined' && currentTab === 'events'
+        && resolveEmbyUiPlatform() === 'emby';
+}
+
+function isEmbyPlaybackLogViewActive() {
+    return isEmbyEventsTabActive() && getEmbyEventLogType() === 'playback';
+}
+
 function getEmbyEventPlaybackUser() {
     return document.getElementById('embyEventPlaybackUser')?.value || '';
 }
@@ -2774,6 +2976,7 @@ async function loadEmbyEvents(silent = false) {
 
 let _lastPlaybackRecords = [];
 let _lastEmbyEventPlaybackInstance = '';
+const _embyPlaybackLogTrafficPeak = new Map();
 
 async function loadEmbyPlaybackRecords(silent = false) {
     const list = document.getElementById('embyEventsList');
@@ -3099,7 +3302,6 @@ function formatEmbyWallClockTime(date) {
     return date.toLocaleTimeString('zh-CN', {
         hour: '2-digit',
         minute: '2-digit',
-        second: '2-digit',
         hour12: false,
     });
 }
@@ -3134,6 +3336,27 @@ function findLiveSessionForPlaybackRecord(rec) {
     return null;
 }
 
+function applyEmbyPlaybackLogTrafficPeak(merged) {
+    const id = String(merged?.id || '').trim();
+    if (!id || merged?.status !== 'playing') {
+        if (id) _embyPlaybackLogTrafficPeak.delete(id);
+        return merged;
+    }
+    const liveTotal = Math.max(0, parseInt(merged?.estimated_upload_bytes_live, 10) || 0);
+    const peak = _embyPlaybackLogTrafficPeak.get(id) || 0;
+    if (liveTotal > 0) {
+        const nextPeak = Math.max(peak, liveTotal);
+        _embyPlaybackLogTrafficPeak.set(id, nextPeak);
+        merged.estimated_upload_bytes_live = nextPeak;
+    } else if (peak > 0) {
+        merged.estimated_upload_bytes_live = peak;
+        if (merged.is_paused) {
+            merged.estimated_upload_bytes_1s_live = 0;
+        }
+    }
+    return merged;
+}
+
 function mergeLiveSessionIntoPlaybackRecord(rec) {
     if (rec?.status !== 'playing') return rec;
     const live = findLiveSessionForPlaybackRecord(rec);
@@ -3152,10 +3375,30 @@ function mergeLiveSessionIntoPlaybackRecord(rec) {
         if (val === '' && typeof val !== 'boolean') return;
         merged[key] = val;
     });
+    if (live.progress_percent != null) {
+        merged.progress_percent = live.progress_percent;
+    }
+    if (live.estimated_upload_bytes_live != null) {
+        merged.estimated_upload_bytes_live = live.estimated_upload_bytes_live;
+    }
+    if (live.estimated_upload_bytes_1s_live != null) {
+        merged.estimated_upload_bytes_1s_live = live.estimated_upload_bytes_1s_live;
+    }
+    if (live.estimated_upload_window_seconds_live != null) {
+        merged.estimated_upload_window_seconds_live = live.estimated_upload_window_seconds_live;
+    }
     if (live.position_seconds != null) {
         merged.end_position_seconds = Math.max(0, parseInt(live.position_seconds, 10) || 0);
     }
-    return merged;
+    ['seek_count', 'seek_forward_count', 'seek_backward_count', 'played_seconds'].forEach((key) => {
+        if (live[key] == null) return;
+        const val = parseInt(live[key], 10);
+        if (!Number.isNaN(val) && val >= 0) merged[key] = val;
+    });
+    if (live.playback_started_at) {
+        merged.playback_started_at = live.playback_started_at;
+    }
+    return applyEmbyPlaybackLogTrafficPeak(merged);
 }
 
 function buildEmbyEventWatchMetaBadge(label) {
@@ -3173,18 +3416,13 @@ function buildEmbyEventPlayingWatchTextLine(event) {
     const currentPos = resolveEmbyContentPosition(event);
     if (currentPos == null || currentPos < 0) return '';
 
-    const remaining = Math.max(0, runtime - currentPos);
-    const estimatedEnd = new Date(Date.now() + remaining * 1000);
-    const estimatedText = formatEmbyWallClockTime(estimatedEnd);
-    if (!estimatedText) return '';
+    const text = getEmbyPlayingWatchMetaText(runtime, startPos, currentPos);
+    if (!text) return '';
 
-    const pipe = '<span class="event-watch-meta-sep event-watch-meta-sep--pipe">&nbsp;|&nbsp;</span>';
-    const line = [
-        escapeHtml(`影片时长${formatEmbyDuration(runtime)}`),
-        escapeHtml(`${formatEmbyDuration(startPos)} - ${formatEmbyDuration(currentPos)}`),
-        escapeHtml(`预计结束${estimatedText}`),
-    ].join(pipe);
-    return `<div class="event-watch-meta">${line}</div>`;
+    return `<div class="event-watch-meta emby-log-play-watch" data-runtime="${runtime}"`
+        + ` data-position="${currentPos}" data-start-pos="${startPos}"`
+        + ` data-paused="${event.is_paused ? '1' : '0'}" data-synced="${Date.now()}">`
+        + `${escapeHtml(text)}</div>`;
 }
 
 function buildEmbyEventTagsLine(event, options = {}) {
@@ -3373,6 +3611,25 @@ function resolvePlaybackRecordState(rec) {
     return 'stopped';
 }
 
+function getPlaybackRecordProgressPercent(rec, options = {}) {
+    const { allowPaused = false } = options;
+    if (!rec || rec.status !== 'playing') return null;
+    if (rec.is_paused && !allowPaused) return null;
+    const runtime = parseInt(rec.runtime_seconds, 10) || 0;
+    if (runtime <= 0) return null;
+    const pos = resolveEmbyContentPosition(rec);
+    if (pos != null && pos >= 0) {
+        return Math.min(100, parseFloat(formatEmbySessionPercent((pos / runtime) * 100)));
+    }
+    const pct = getEmbySessionProgressPercent(
+        rec.position_seconds,
+        rec.runtime_seconds,
+        rec.progress_percent,
+    );
+    if (pct == null || pct < 0) return null;
+    return Math.min(100, pct);
+}
+
 function buildPlaybackRecordTimeRangeText(rec) {
     if (rec.status === 'playing') return formatEmbyEventDateTime(rec.started_at);
     const startMs = new Date(rec.started_at).getTime();
@@ -3444,6 +3701,7 @@ function renderPlaybackRecordCard(rec) {
     const statsText = isPlaying
         ? buildEmbyEventPlayingWatchTextLine(event)
         : buildEmbyEventWatchTextLine(event);
+    const trafficHtml = isPlaying ? buildEmbyPlaybackRecordTrafficHtml(viewRec) : '';
     const statsHtml = statsText ? `<div class="emby-log-card-stats">${statsText}</div>` : '';
 
     const badges = [];
@@ -3458,8 +3716,17 @@ function renderPlaybackRecordCard(rec) {
     const tagHtml = badges.filter(Boolean).join('');
     const tagsHtml = tagHtml ? `<div class="emby-log-card-tags">${tagHtml}</div>` : '';
 
+    const progressPct = (state === 'playing' || state === 'paused')
+        ? getPlaybackRecordProgressPercent(viewRec, { allowPaused: true })
+        : null;
+    const progressAttr = progressPct != null
+        ? ` style="--emby-log-play-progress: ${progressPct.toFixed(2)}%"`
+        : '';
+
+    const recordId = escapeHtml(String(viewRec.id || ''));
+
     return `
-        <div class="emby-log-card emby-log-card--${state}">
+        <div class="emby-log-card emby-log-card--${state}" data-record-id="${recordId}"${progressAttr}>
             <span class="emby-log-card-rail" aria-hidden="true"></span>
             <div class="emby-log-card-body">
                 <div class="emby-log-card-head">
@@ -3470,12 +3737,97 @@ function renderPlaybackRecordCard(rec) {
                     ${tagsHtml}
                 </div>
                 <div class="emby-log-card-divider" aria-hidden="true"></div>
-                <div class="emby-log-card-time">${escapeHtml(timeText)}</div>
+                <div class="emby-log-card-time">
+                    <span class="emby-log-card-time-text">${escapeHtml(timeText)}</span>
+                    ${trafficHtml}
+                </div>
                 <div class="emby-log-card-title">${titleHtml}</div>
                 ${metaHtml}
                 ${statsHtml}
             </div>
         </div>`;
+}
+
+function captureEmbyLogCardIpRevealState(el) {
+    const btn = el?.querySelector('.emby-event-ip-toggle[aria-pressed="true"]');
+    if (!btn) return '';
+    return btn.dataset.ip || '';
+}
+
+function restoreEmbyLogCardIpRevealState(el, revealedIp) {
+    if (!el || !revealedIp) return;
+    const btn = el.querySelector('.emby-event-ip-toggle');
+    const ipEl = el.querySelector('.emby-event-ip');
+    if (!btn || !ipEl || btn.dataset.ip !== revealedIp) return;
+    ipEl.textContent = revealedIp;
+    btn.setAttribute('aria-pressed', 'true');
+    btn.setAttribute('aria-label', '隐藏 IP');
+    btn.innerHTML = buildEmbyEventIpEyeIcon(true);
+}
+
+function replacePlaybackRecordCardElement(el, rec) {
+    const revealedIp = captureEmbyLogCardIpRevealState(el);
+    const wrap = document.createElement('div');
+    wrap.innerHTML = renderPlaybackRecordCard(rec);
+    const nextEl = wrap.firstElementChild;
+    el.replaceWith(nextEl);
+    restoreEmbyLogCardIpRevealState(nextEl, revealedIp);
+    return nextEl;
+}
+
+function countLivePlayingSessionsForInstance(instanceName) {
+    const inst = (cachedEmbyInstances || []).find(i => i.name === instanceName);
+    if (!inst) return 0;
+    return (inst.sessions || []).filter(s => s.is_playing).length;
+}
+
+function countStorePlayingRecordsForInstance(instanceName) {
+    return _lastPlaybackRecords.filter(
+        (rec) => rec.status === 'playing' && (rec.instance_name || '') === instanceName,
+    ).length;
+}
+
+function patchPlaybackRecordCard(el, rec) {
+    const viewRec = mergeLiveSessionIntoPlaybackRecord(rec);
+    const state = resolvePlaybackRecordState(viewRec);
+    const prevState = ['playing', 'paused', 'stopped', 'interrupt'].find(
+        (s) => el.classList.contains(`emby-log-card--${s}`),
+    ) || 'stopped';
+    if (String(el.dataset.recordId || '') !== String(rec.id || '')) {
+        replacePlaybackRecordCardElement(el, rec);
+        return;
+    }
+    if (state === 'playing' || state === 'paused') {
+        replacePlaybackRecordCardElement(el, rec);
+        return;
+    }
+    if (prevState !== state) {
+        replacePlaybackRecordCardElement(el, rec);
+    }
+}
+
+function shouldReloadPlaybackRecordsFromStore() {
+    const instance = document.getElementById('embyEventInstance')?.value || '';
+    if (!instance) return false;
+    if (!_lastPlaybackRecords.length) {
+        return countLivePlayingSessionsForInstance(instance) > 0;
+    }
+    if (_lastPlaybackRecords.some((rec) => {
+        if (rec.status !== 'playing') return false;
+        if ((rec.instance_name || '') !== instance) return false;
+        return !findLiveSessionForPlaybackRecord(rec);
+    })) {
+        return true;
+    }
+    return countLivePlayingSessionsForInstance(instance) > countStorePlayingRecordsForInstance(instance);
+}
+
+function syncEmbyPlaybackLogCardsFromLive() {
+    if (!isEmbyPlaybackLogViewActive()) return;
+    const list = document.getElementById('embyEventsList');
+    if (!list || !_lastPlaybackRecords.length) return;
+    if (!list.querySelector('.emby-log-card')) return;
+    renderPlaybackRecords();
 }
 
 function renderPlaybackRecords(records) {
@@ -3491,8 +3843,21 @@ function renderPlaybackRecords(records) {
             ? '该用户暂无播放记录'
             : '暂无播放记录';
         list.innerHTML = `<div class="empty-tip">${tip}</div>`;
+        ensureEmbyLogPlayingTicker();
         return;
     }
-    list.innerHTML = filtered.map(renderPlaybackRecordCard).join('');
-    ensureEmbyEventIpToggle();
+
+    const existingCards = [...list.querySelectorAll('.emby-log-card')];
+    const canPatch = existingCards.length === filtered.length
+        && existingCards.every((el, index) => (
+            String(el.dataset.recordId || '') === String(filtered[index].id || '')
+        ));
+
+    if (canPatch) {
+        filtered.forEach((rec, index) => patchPlaybackRecordCard(existingCards[index], rec));
+    } else {
+        list.innerHTML = filtered.map(renderPlaybackRecordCard).join('');
+        ensureEmbyEventIpToggle();
+    }
+    ensureEmbyLogPlayingTicker();
 }

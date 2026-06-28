@@ -687,7 +687,7 @@ function syncViewportDeviceViewMode(isMobile = isMobileViewport()) {
     }
 
     lastKnownMobileViewport = isMobile;
-    syncDeviceViewSwitchUi();
+    syncNavbarContextSwitchUi();
     syncDevicesPanelModeClass();
 }
 
@@ -728,6 +728,7 @@ function syncSyslogFilterUi() {
         select.value = getSyslogTypeFilter();
         select.disabled = false;
     }
+    syncSyslogTypeSwitchUi();
     if (typeof syncPlatformPanelUi === 'function') {
         syncPlatformPanelUi('syslogs');
     }
@@ -951,7 +952,7 @@ function applyEmbyFeatureUi() {
         embyStatsRow.setAttribute('aria-hidden', embyFeatureEnabled ? 'false' : 'true');
     }
     document.documentElement.classList.toggle('emby-feature-enabled', embyFeatureEnabled);
-    syncDeviceViewSwitchUi();
+    syncNavbarContextSwitchUi();
     syncDeviceTypeFilterControls();
     if (typeof syncSyslogFilterUi === 'function') {
         syncSyslogFilterUi();
@@ -994,16 +995,38 @@ function buildEmbyDevicesEmptyHtml() {
     return '<div class="empty-tip empty-tip--emby">暂无 Emby 设备，点击导航栏「添加设备」进行配置</div>';
 }
 
+function syncNavbarContextSwitchUi() {
+    const tab = typeof currentTab !== 'undefined' ? currentTab : 'devices';
+    const deviceSwitch = document.getElementById('deviceViewSwitch');
+    const platformSwitch = document.getElementById('platformTypeSwitch');
+    const syslogSwitch = document.getElementById('syslogTypeSwitch');
+
+    const showDevice = embyFeatureEnabled && tab === 'devices';
+    const showPlatform = embyFeatureEnabled && (tab === 'stats' || tab === 'events');
+    const showSyslog = tab === 'syslogs';
+
+    if (deviceSwitch) {
+        deviceSwitch.hidden = !showDevice;
+        deviceSwitch.setAttribute('aria-hidden', showDevice ? 'false' : 'true');
+        if (!showDevice) closeMergeDevicesPopover();
+    }
+    if (platformSwitch) {
+        platformSwitch.hidden = !showPlatform;
+        platformSwitch.setAttribute('aria-hidden', showPlatform ? 'false' : 'true');
+    }
+    if (syslogSwitch) {
+        syslogSwitch.hidden = !showSyslog;
+        syslogSwitch.setAttribute('aria-hidden', showSyslog ? 'false' : 'true');
+    }
+
+    syncDeviceViewSwitchUi();
+    syncPlatformTypeSwitchUi(getDeviceTypeFilter() || 'qb');
+    syncSyslogTypeSwitchUi();
+}
+
 function syncDeviceViewSwitchUi() {
     const wrap = document.getElementById('deviceViewSwitch');
-    if (!wrap) return;
-    const show = embyFeatureEnabled && typeof currentTab !== 'undefined' && currentTab === 'devices';
-    wrap.hidden = !show;
-    wrap.setAttribute('aria-hidden', show ? 'false' : 'true');
-    if (!show) {
-        closeMergeDevicesPopover();
-        return;
-    }
+    if (!wrap || wrap.hidden) return;
 
     const mode = getDeviceViewMode();
     wrap.dataset.viewMode = mode;
@@ -1030,17 +1053,41 @@ function syncDeviceViewSwitchUi() {
     }
 }
 
-function syncDeviceTypeToggle(filter) {
-    const toggle = document.getElementById('eventDeviceTypeSwitch');
-    if (!toggle) return;
+function syncPlatformTypeSwitchUi(filter) {
+    const wrap = document.getElementById('platformTypeSwitch');
+    if (!wrap || wrap.hidden) return;
     const effective = filter === 'emby' ? 'emby' : 'qb';
-    toggle.hidden = !embyFeatureEnabled;
-    toggle.setAttribute('aria-hidden', embyFeatureEnabled ? 'false' : 'true');
-    toggle.querySelectorAll('.log-device-btn').forEach((btn) => {
-        const active = btn.dataset.deviceType === effective;
+    wrap.querySelectorAll('[data-platform-type]').forEach((btn) => {
+        const active = btn.dataset.platformType === effective;
         btn.classList.toggle('active', active);
         btn.setAttribute('aria-pressed', active ? 'true' : 'false');
     });
+}
+
+function syncSyslogTypeSwitchUi() {
+    const wrap = document.getElementById('syslogTypeSwitch');
+    if (!wrap || wrap.hidden) return;
+    const syslogType = getSyslogTypeFilter();
+    const segments = wrap.querySelector('.device-view-segments');
+    const embyBtn = wrap.querySelector('[data-syslog-type="emby"]');
+    if (embyBtn) {
+        embyBtn.hidden = !embyFeatureEnabled;
+        embyBtn.setAttribute('aria-hidden', embyFeatureEnabled ? 'false' : 'true');
+    }
+    if (segments) {
+        segments.classList.toggle('device-view-segments--triple', embyFeatureEnabled);
+        segments.classList.toggle('device-view-segments--dual', !embyFeatureEnabled);
+    }
+    wrap.querySelectorAll('[data-syslog-type]').forEach((btn) => {
+        if (btn.hidden) return;
+        const active = btn.dataset.syslogType === syslogType;
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+}
+
+function syncDeviceTypeToggle(filter) {
+    syncPlatformTypeSwitchUi(filter);
 }
 
 function syncDeviceTypeFilterControls() {
@@ -1050,12 +1097,11 @@ function syncDeviceTypeFilterControls() {
         if (!embyFeatureEnabled) {
             syncDeviceTypeSelectValue(select, 'qb');
             select.disabled = true;
-            if (wrap) wrap.hidden = true;
-            return;
+        } else {
+            select.disabled = false;
+            syncDeviceTypeSelectValue(select, filter);
         }
-        if (wrap) wrap.hidden = false;
-        select.disabled = false;
-        syncDeviceTypeSelectValue(select, filter);
+        if (wrap) wrap.hidden = true;
     });
     syncDeviceTypeToggle(filter);
 }
@@ -1175,6 +1221,26 @@ function syncPlatformPanelUi(tab) {
 function onEventDeviceTypeToggle(value) {
     if (!embyFeatureEnabled) return;
     applyDeviceTypeFilter(value);
+}
+
+function onNavbarPlatformTypeSwitch(value) {
+    onEventDeviceTypeToggle(value);
+}
+
+function onNavbarSyslogTypeSwitch(value) {
+    const next = typeof setSyslogTypeFilter === 'function'
+        ? setSyslogTypeFilter(value)
+        : value;
+    const select = document.getElementById('syslogDeviceType');
+    if (select && select.value !== next) {
+        select.value = next;
+    }
+    if (typeof syncSyslogFilterUi === 'function') {
+        syncSyslogFilterUi();
+    }
+    if (typeof loadSyslogsForCurrentType === 'function') {
+        loadSyslogsForCurrentType();
+    }
 }
 
 function onDeviceTypeFilterChange(selectEl) {
@@ -1364,28 +1430,47 @@ function applyUnifiedTabPanels(tab) {
     return platform;
 }
 
+async function runFilterHeadRefresh(tabKey, loader) {
+    const btn = document.querySelector(`#tab-${tabKey} .log-filter-head-refresh-btn`);
+    if (!btn || btn.classList.contains('refreshing')) return;
+    btn.classList.add('refreshing');
+    btn.disabled = true;
+    try {
+        await loader();
+    } finally {
+        btn.classList.remove('refreshing');
+        btn.disabled = false;
+    }
+}
+
 async function refreshEventsLog() {
-    const platform = (typeof getDeviceTypeFilter === 'function' ? getDeviceTypeFilter() : 'qb')
-        || 'qb';
-    if (platform === 'emby' && typeof loadEmbyEvents === 'function') {
-        await loadEmbyEvents();
-        return;
-    }
-    if (typeof loadEvents === 'function') {
-        await loadEvents();
-    }
+    await runFilterHeadRefresh('events', async () => {
+        const platform = (typeof getDeviceTypeFilter === 'function' ? getDeviceTypeFilter() : 'qb')
+            || 'qb';
+        if (platform === 'emby' && typeof loadEmbyEvents === 'function') {
+            await loadEmbyEvents();
+            return;
+        }
+        if (typeof loadEvents === 'function') {
+            await loadEvents();
+        }
+    });
 }
 
 async function refreshSystemLogs() {
-    if (typeof loadSyslogsForCurrentType === 'function') {
-        await loadSyslogsForCurrentType();
-    }
+    await runFilterHeadRefresh('syslogs', async () => {
+        if (typeof loadSyslogsForCurrentType === 'function') {
+            await loadSyslogsForCurrentType();
+        }
+    });
 }
 
 async function refreshTrafficChart() {
-    if (typeof updateChart === 'function') {
-        await updateChart();
-    }
+    await runFilterHeadRefresh('stats', async () => {
+        if (typeof updateChart === 'function') {
+            await updateChart();
+        }
+    });
 }
 
 function loadUnifiedTabContent(tab, platform) {

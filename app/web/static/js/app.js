@@ -680,7 +680,7 @@ function switchTab(tab) {
     const platform = typeof applyUnifiedTabPanels === 'function'
         ? applyUnifiedTabPanels(tab)
         : 'qb';
-    if (typeof syncDeviceViewSwitchUi === 'function') syncDeviceViewSwitchUi();
+    if (typeof syncNavbarContextSwitchUi === 'function') syncNavbarContextSwitchUi();
     if (typeof syncDeviceTypeFilterControls === 'function') syncDeviceTypeFilterControls();
     if (typeof syncPlatformPanelUi === 'function' && tab !== 'devices') {
         syncPlatformPanelUi(tab);
@@ -1915,22 +1915,26 @@ function buildStatsNavIconSvg() {
     </svg>`;
 }
 
-function buildInstanceChartButtonHtml(service, instanceName) {
+function buildInstanceChartButtonHtml(service, instanceName, options = {}) {
+    const { showLabel = false } = options;
     const safeName = escapeHtml(instanceName || '');
     const title = safeName ? `查看 ${safeName} 流量图表` : '查看流量图表';
-    return `<button type="button" class="rules-header-action-btn" data-action="open-chart" data-chart-service="${service}" data-chart-instance="${safeName}" title="${title}" aria-label="${title}">${buildStatsNavIconSvg()}</button>`;
+    const labelHtml = showLabel ? '<span class="rules-header-action-label">图表</span>' : '';
+    return `<button type="button" class="rules-header-action-btn" data-action="open-chart" data-chart-service="${service}" data-chart-instance="${safeName}" title="${title}" aria-label="${title}">${buildStatsNavIconSvg()}${labelHtml}</button>`;
 }
 
-function buildInstanceEventLogButtonHtml(service, instanceName) {
+function buildInstanceEventLogButtonHtml(service, instanceName, options = {}) {
+    const { showLabel = false } = options;
     const safeName = escapeHtml(instanceName || '');
     const title = safeName ? `查看 ${safeName} 事件日志` : '查看事件日志';
-    return `<button type="button" class="rules-header-action-btn" data-action="open-events" data-event-service="${service}" data-event-instance="${safeName}" title="${title}" aria-label="${title}">${buildEventLogNavIconSvg()}</button>`;
+    const labelHtml = showLabel ? '<span class="rules-header-action-label">事件</span>' : '';
+    return `<button type="button" class="rules-header-action-btn" data-action="open-events" data-event-service="${service}" data-event-instance="${safeName}" title="${title}" aria-label="${title}">${buildEventLogNavIconSvg()}${labelHtml}</button>`;
 }
 
-function buildRulesHeaderActionsHtml(service, instanceName) {
+function buildRulesHeaderActionsHtml(service, instanceName, options = {}) {
     return `<div class="rules-header-actions">`
-        + buildInstanceChartButtonHtml(service, instanceName)
-        + buildInstanceEventLogButtonHtml(service, instanceName)
+        + buildInstanceChartButtonHtml(service, instanceName, options)
+        + buildInstanceEventLogButtonHtml(service, instanceName, options)
         + `</div>`;
 }
 
@@ -1945,7 +1949,7 @@ function buildRulesBlockHTML(
     altLimitKbps = null,
     instanceName = '',
 ) {
-    const headerActions = buildRulesHeaderActionsHtml('qb', instanceName);
+    const headerActions = buildRulesHeaderActionsHtml('qb', instanceName, { showLabel: true });
     if (!rules.length) {
         return `<div class="rules-header">
             <span class="rules-title">达量限速规则</span>
@@ -3201,27 +3205,21 @@ function populateChartInstanceSelect(instances, platform = getChartPlatform()) {
         ? sortEmbyInstances(instances)
         : sortInstancesByPriority(instances);
     const hasInstances = sorted.length > 0;
+    const firstName = hasInstances ? sorted[0].name : '';
 
     const resolveSelection = (value) => {
-        if (!value) return '';
-        if (value === CHART_ALL_DEVICES_VALUE) return hasInstances ? value : '';
+        if (!value || value === CHART_ALL_DEVICES_VALUE) return '';
         return instanceNames.has(value) ? value : '';
     };
 
     let saved = resolveSelection(prev) || resolveSelection(persisted);
-    if (!saved && !hasInstances && persisted) {
-        saved = persisted;
-    }
     if (!saved && hasInstances) {
-        saved = CHART_ALL_DEVICES_VALUE;
+        saved = firstName;
     }
 
     chartSel.innerHTML = '';
-    if (hasInstances) {
-        chartSel.add(new Option(CHART_ALL_DEVICES_LABEL, CHART_ALL_DEVICES_VALUE));
-    }
     sorted.forEach(inst => chartSel.add(new Option(inst.name, inst.name)));
-    if (saved && saved !== CHART_ALL_DEVICES_VALUE && !instanceNames.has(saved)) {
+    if (saved && !instanceNames.has(saved)) {
         chartSel.add(new Option(saved, saved));
     }
     chartSel.value = saved;
@@ -3423,21 +3421,22 @@ function updateInstanceSelects(instances) {
 
     if (syslogSel) {
         syslogSel.innerHTML = '';
-        syslogSel.add(new Option('全部设备', ''));
         names.forEach(name => {
             syslogSel.add(new Option(name, name));
         });
-        let syslogChanged = false;
-        if (savedSyslog === '' || names.includes(savedSyslog)) {
-            syslogSel.value = savedSyslog;
-        } else {
-            if (savedSyslog !== '') syslogChanged = true;
-            syslogSel.value = '';
+        const prevSyslog = syslogSel.value || savedSyslog;
+        let nextSyslog = '';
+        if (savedSyslog && names.includes(savedSyslog)) {
+            nextSyslog = savedSyslog;
+        } else if (names.length) {
+            nextSyslog = names[0];
         }
+        const syslogChanged = prevSyslog !== nextSyslog;
+        syslogSel.value = nextSyslog;
         if (syslogChanged && currentTab === 'syslogs' && typeof loadSyslogsForCurrentType === 'function') {
             loadSyslogsForCurrentType(true);
         }
-        if (syslogSel.value != null) {
+        if (syslogSel.value) {
             sessionStorage.setItem(SYSLOG_QB_INSTANCE_KEY, syslogSel.value);
         }
     }
@@ -4369,15 +4368,17 @@ function restoreChartControls() {
         setDeviceTypeFilter(state.chartPlatform);
     }
     if (state.chartInstance && state.chartPlatform) {
-        sessionStorage.setItem(
-            getChartInstanceStorageKey(state.chartPlatform),
-            state.chartInstance,
-        );
-    } else if (state.chartPlatform) {
-        sessionStorage.setItem(
-            getChartInstanceStorageKey(state.chartPlatform),
-            CHART_ALL_DEVICES_VALUE,
-        );
+        const migrated = state.chartInstance === CHART_ALL_DEVICES_VALUE
+            ? ''
+            : state.chartInstance;
+        if (migrated) {
+            sessionStorage.setItem(
+                getChartInstanceStorageKey(state.chartPlatform),
+                migrated,
+            );
+        } else {
+            sessionStorage.removeItem(getChartInstanceStorageKey(state.chartPlatform));
+        }
     }
     if (state.eventInstanceQb != null) {
         sessionStorage.setItem(EVENT_QB_INSTANCE_KEY, state.eventInstanceQb);
@@ -6894,6 +6895,11 @@ async function fetchServiceSystemLogs(service, instanceSelectId, containerId, si
     const instance = instanceSelectId
         ? (document.getElementById(instanceSelectId)?.value || '')
         : '';
+    if (instanceSelectId && !instance) {
+        const container = document.getElementById(containerId);
+        if (container) container.innerHTML = '<div class="empty-tip">暂无设备</div>';
+        return;
+    }
     const level = document.getElementById('syslogLevel')?.value || '';
     try {
         const params = new URLSearchParams({ limit: '1000', service });

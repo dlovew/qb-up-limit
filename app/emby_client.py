@@ -176,10 +176,33 @@ class EmbyClient:
         resp = self._request('GET', '/System/Ping', timeout=2)
         return resp is not None and resp.status_code < 400
 
-    def test_connection(self) -> dict:
+    def test_connectivity(self) -> dict:
+        """检测地址/端口/HTTPS 是否可达，不校验 API Key"""
         if not self.host:
             return {'ok': False, 'error': '请填写主机地址'}
-        resp = self._request('GET', '/System/Info/Public')
+        url = f'{self._base_url()}/System/Ping'
+        try:
+            resp = requests.get(
+                url,
+                timeout=self.connection_timeout,
+                verify=self.verify_ssl,
+            )
+        except requests.RequestException:
+            return {'ok': False, 'error': '无法连接 Emby 服务器'}
+        if resp.status_code >= 400:
+            return {'ok': False, 'error': f'HTTP {resp.status_code}'}
+        ping = (resp.text or '').strip()
+        return {
+            'ok': True,
+            'ping': ping or 'OK',
+            'message': '连接成功',
+        }
+
+    def test_api(self) -> dict:
+        """校验 API Key 是否有效"""
+        if not self.api_key:
+            return {'ok': False, 'error': '请填写 API Key'}
+        resp = self._request('GET', '/System/Info')
         if resp is None:
             return {'ok': False, 'error': '无法连接 Emby 服务器'}
         if resp.status_code == 401:
@@ -194,7 +217,12 @@ class EmbyClient:
             'ok': True,
             'server_name': info.get('ServerName') or '',
             'version': info.get('Version') or '',
+            'message': 'API 验证成功',
         }
+
+    def test_connection(self) -> dict:
+        """兼容旧调用：等同 API 测试"""
+        return self.test_api()
 
     def get_sessions(self) -> List[dict]:
         resp = self._request('GET', '/Sessions')

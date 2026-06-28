@@ -7,7 +7,7 @@ from typing import Iterable, List
 from emby_traffic_filter import (
     allocate_wan_deltas,
     is_wan_playback_session,
-    scale_m3_wan_pool_bytes,
+    m3_allocate_wan_pool,
     session_docker_share_bps,
 )
 
@@ -77,6 +77,7 @@ def build_tick_audit(
     sessions: list,
     wan_only_enabled: bool = True,
     m3_wan_pool_scale: float = 1.0,
+    tick_seconds: float = 1.0,
 ) -> dict:
     """对单 tick 做内部一致性验算，供在线观测与 CLI 轮询。"""
     raw = max(0, int(live_raw_up or 0))
@@ -99,8 +100,9 @@ def build_tick_audit(
 
     recomputed_wan, _ = allocate_wan_deltas(raw, 0, sessions)
     if mode_code == 'M3' and wan_only_enabled:
-        recomputed_wan = scale_m3_wan_pool_bytes(
-            recomputed_wan, raw, m3_wan_pool_scale,
+        recomputed_wan = m3_allocate_wan_pool(
+            raw, sessions, scale=m3_wan_pool_scale,
+            tick_seconds=max(1, int(tick_seconds or 1)),
         )
     ratio = _wan_ratio(sessions)
     wan_session_live = sum_wan_session_live_bytes(sessions)
@@ -133,10 +135,10 @@ def build_tick_audit(
             expect=raw,
         ))
     elif mode_code == 'M3' and raw > 0:
-        expect_m3 = int(raw * ratio)
+        expect_m3 = int(recomputed_wan or 0) or int(raw * ratio)
         checks.append(_check(
             'm3_wan_pool_ratio',
-            'M3 WAN 池≈Docker×WAN 权重比',
+            'M3 WAN 池与 m3_allocate 一致',
             abs(wan_pool - expect_m3) <= max(1024, raw // 50),
             got=wan_pool,
             expect=expect_m3,

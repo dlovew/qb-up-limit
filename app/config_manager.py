@@ -1172,9 +1172,9 @@ def _validate_emby_instance(inst: dict, existing_names: list = None,
     return result
 
 
-def validate_emby_instance_for_test(inst: dict, test_type: str = 'connect') -> dict:
-    require_api = test_type != 'docker'
-    require_container = test_type != 'connect'
+def validate_emby_instance_for_test(inst: dict, test_type: str = 'connectivity') -> dict:
+    require_api = test_type == 'api'
+    require_container = test_type == 'docker'
     result = _validate_emby_instance(
         inst,
         require_name=False,

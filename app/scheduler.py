@@ -6,6 +6,7 @@ from typing import Dict
 from zoneinfo import ZoneInfo
 
 import traffic_db
+import emby_traffic_db
 import speed_limiter
 import config_manager
 from cycle import get_cycle_start, cycle_info, cycle_start_key, format_next_cycle_switch_label
@@ -33,6 +34,17 @@ def _online_since_from_prev(prev: dict) -> str:
         if cached:
             return cached
     return traffic_db._format_datetime_seconds(traffic_db.now_local())
+
+
+def _normal_global_limit_from_status(status: dict):
+    raw = (status or {}).get('normal_global_upload_limit_kbps')
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return None if value < 0 else value
 
 
 class InstanceWorker:
@@ -237,6 +249,10 @@ class TrafficMonitor:
         self._collect_generation: Dict[str, int] = {}
         self._state_generation: Dict[str, int] = {}
         self._collect_log_state: Dict[str, dict] = {}
+        self._status_traffic_cache: Dict[str, dict] = {}
+        self._status_traffic_cache_at = 0.0
+        self._status_traffic_cache_lock = threading.Lock()
+        self._status_traffic_cache_ttl = 1.0
 
     def _apply_global_config(self):
         self.global_cfg = config_manager.get_global_config(self.config)
@@ -257,9 +273,11 @@ class TrafficMonitor:
             logger.warning(f"无效时区 {tz_name}，使用 Asia/Shanghai")
             self.timezone = ZoneInfo('Asia/Shanghai')
         traffic_db.set_timezone(self.timezone)
-        if traffic_db.set_retention_years(
-                self.global_cfg.get('data_retention_years', 5)):
+        retention = self.global_cfg.get('data_retention_years', 5)
+        if traffic_db.set_retention_years(retention):
             traffic_db.cleanup_old_data()
+        if emby_traffic_db.set_retention_years(retention):
+            emby_traffic_db.cleanup_old_data()
 
     def _now(self) -> datetime:
         return datetime.now(self.timezone)
@@ -295,11 +313,16 @@ class TrafficMonitor:
             )
             return False
 
+        if not traffic_db.try_begin_cycle_transition(
+                client.name, prev_key, key):
+            return False
+
         if prev_key is not None:
             try:
                 traffic_db.clear_limit_trigger_records(client.name)
                 promoted = self._promote_next_cycle_plan_if_any(client.name)
                 if not speed_limiter.apply_cycle_reset_limit(client):
+                    traffic_db.set_last_applied_cycle_start(client.name, prev_key)
                     logger.error(f"[{client.name}] 周期限速恢复失败，将在下轮重试")
                     return False
                 if promoted:
@@ -318,10 +341,10 @@ class TrafficMonitor:
                     f"→ {limit_desc})"
                 )
             except Exception as e:
+                traffic_db.set_last_applied_cycle_start(client.name, prev_key)
                 logger.error(f"[{client.name}] 周期限速恢复失败: {e}")
                 return False
 
-        traffic_db.set_last_applied_cycle_start(client.name, key)
         return True
 
     def _sync_cycle_tracking(self, skip_qb_ops: bool = False):
@@ -861,6 +884,7 @@ class TrafficMonitor:
         today = now.date()
         if self._last_cleanup_day != today:
             traffic_db.cleanup_old_data()
+            emby_traffic_db.cleanup_old_data()
             self._last_cleanup_day = today
 
     def _check_cycle_reset(self):
@@ -873,6 +897,31 @@ class TrafficMonitor:
                 log_prefix='新周期限速恢复完成',
             )
 
+    def _get_status_traffic_batch(self, clients: dict) -> dict:
+        now_mono = time.monotonic()
+        names = list(clients.keys())
+        with self._status_traffic_cache_lock:
+            if (
+                names
+                and self._status_traffic_cache
+                and (now_mono - self._status_traffic_cache_at)
+                < self._status_traffic_cache_ttl
+                and set(self._status_traffic_cache.keys()) >= set(names)
+            ):
+                return {
+                    name: dict(self._status_traffic_cache.get(name) or {})
+                    for name in names
+                }
+
+        cycle_starts = {}
+        for name, client in clients.items():
+            cycle_starts[name] = get_cycle_start(self._now(), client.cycle)
+        batch = traffic_db.get_status_traffic_batch(names, cycle_starts)
+        with self._status_traffic_cache_lock:
+            self._status_traffic_cache = batch
+            self._status_traffic_cache_at = now_mono
+        return batch
+
     def get_status_summary(self) -> list:
         with self._config_lock:
             clients = dict(self.clients)
@@ -882,20 +931,24 @@ class TrafficMonitor:
         status_map = {s['instance_name']: s for s in all_status}
         offline_times = traffic_db.get_last_offline_times()
         online_times = traffic_db.get_last_online_times()
+        traffic_batch = self._get_status_traffic_batch(clients)
         live_map = {}
         with self._live_cache_lock:
             live_map = dict(self._live_cache)
 
         for name, client in clients.items():
             status = status_map.get(name, {})
-            cycle_upload, cycle_download, _, cyc = self._get_cycle_traffic(name, client)
-            device_upload = traffic_db.get_total_bytes(name, 'upload')
-            device_download = traffic_db.get_total_bytes(name, 'download')
-            yesterday_upload = traffic_db.get_yesterday_bytes(name, 'upload')
-            yesterday_download = traffic_db.get_yesterday_bytes(name, 'download')
-            today_upload = traffic_db.get_today_bytes(name, 'upload')
-            today_download = traffic_db.get_today_bytes(name, 'download')
-            raw_data_start = traffic_db.get_data_start_time(name)
+            traffic = traffic_batch.get(name, {})
+            cycle_upload = int(traffic.get('cycle_upload') or 0)
+            cycle_download = int(traffic.get('cycle_download') or 0)
+            cyc = cycle_info(self._now(), client.cycle)
+            device_upload = int(traffic.get('device_upload') or 0)
+            device_download = int(traffic.get('device_download') or 0)
+            yesterday_upload = int(traffic.get('yesterday_upload') or 0)
+            yesterday_download = int(traffic.get('yesterday_download') or 0)
+            today_upload = int(traffic.get('today_upload') or 0)
+            today_download = int(traffic.get('today_download') or 0)
+            raw_data_start = traffic.get('data_start_time')
             data_start_time = (
                 traffic_db._format_datetime_seconds(raw_data_start)
                 if raw_data_start else None
@@ -1044,7 +1097,7 @@ class TrafficMonitor:
                 'last_limit_trigger_label': trigger_summary['last_limit_trigger_label'],
                 'manual_limit_trigger_at': trigger_summary['manual_limit_trigger_at'],
                 'manual_limit_trigger_kbps': trigger_summary['manual_limit_trigger_kbps'],
-                'normal_global_upload_limit_kbps': traffic_db.get_normal_global_upload_limit_kbps(name),
+                'normal_global_upload_limit_kbps': _normal_global_limit_from_status(status),
                 'has_next_cycle_plan': has_next_cycle_plan,
                 'next_cycle_switch_at': next_cycle_switch_at,
                 'next_cycle_plan': next_cycle_plan_payload,
@@ -1057,23 +1110,32 @@ class TrafficMonitor:
 
         return result
 
-    def manual_reset(self, instance_name: str = None):
+    def manual_reset(self, instance_name: str = None) -> bool:
         with self._config_lock:
             if instance_name and instance_name in self.clients:
                 targets = [self.clients[instance_name]]
             else:
                 targets = list(self.clients.values())
 
+        all_ok = True
         for client in targets:
             cycle_upload, _, _, _ = self._get_cycle_traffic(client.name, client)
-            speed_limiter.restore_speed_limit(
+            ok = speed_limiter.restore_speed_limit(
                 client,
                 reason='手动解除限速',
                 cycle_uploaded_bytes=cycle_upload,
             )
+            if not ok:
+                all_ok = False
 
         self.refresh_instance_status(instance_name)
-        logger.info(f"限速解除完成: {instance_name or '所有实例'}")
+        if all_ok:
+            logger.info(f"限速解除完成: {instance_name or '所有实例'}")
+        else:
+            logger.warning(
+                f"限速解除部分失败: {instance_name or '所有实例'}",
+            )
+        return all_ok
 
     def reset_traffic_stats(self, instance_name: str):
         if not instance_name:

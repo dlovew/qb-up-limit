@@ -65,7 +65,7 @@ def get_browse_upload_period_bytes(instance_name: str, start_dt: datetime) -> in
     start_s = start_dt.strftime('%Y-%m-%d %H:%M:%S')
     db._ensure_emby_schema()
     with db._lock:
-        conn = db.traffic_db.get_conn()
+        conn = db.get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -79,13 +79,40 @@ def get_browse_upload_period_bytes(instance_name: str, start_dt: datetime) -> in
             conn.close()
 
 
+def get_browse_upload_period_bytes_batch(instance_names: list,
+                                         start_dt: datetime) -> dict:
+    names = [n for n in (instance_names or []) if n]
+    if not names:
+        return {}
+    start_s = start_dt.strftime('%Y-%m-%d %H:%M:%S')
+    placeholders = ','.join('?' * len(names))
+    result = {n: 0 for n in names}
+    db._ensure_emby_schema()
+    with db._lock:
+        conn = db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute(f'''
+                SELECT instance_name, COALESCE(SUM(estimated_upload_bytes), 0) AS total
+                FROM emby_browse_upload_facts
+                WHERE instance_name IN ({placeholders})
+                  AND stopped_at >= ?
+                GROUP BY instance_name
+            ''', (*names, start_s))
+            for row in c.fetchall():
+                result[row['instance_name']] = int(row['total'])
+        finally:
+            conn.close()
+    return result
+
+
 def get_browse_upload_total_bytes(instance_name: str) -> int:
     name = (instance_name or '').strip()
     if not name:
         return 0
     db._ensure_emby_schema()
     with db._lock:
-        conn = db.traffic_db.get_conn()
+        conn = db.get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -97,6 +124,88 @@ def get_browse_upload_total_bytes(instance_name: str) -> int:
             return int(row['total']) if row else 0
         finally:
             conn.close()
+
+
+def get_browse_upload_total_bytes_batch(instance_names: list) -> dict:
+    names = [n for n in (instance_names or []) if n]
+    if not names:
+        return {}
+    placeholders = ','.join('?' * len(names))
+    result = {n: 0 for n in names}
+    db._ensure_emby_schema()
+    with db._lock:
+        conn = db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute(f'''
+                SELECT instance_name, COALESCE(SUM(estimated_upload_bytes), 0) AS total
+                FROM emby_browse_upload_facts
+                WHERE instance_name IN ({placeholders})
+                GROUP BY instance_name
+            ''', names)
+            for row in c.fetchall():
+                result[row['instance_name']] = int(row['total'])
+        finally:
+            conn.close()
+    return result
+
+
+def get_live_status_upload_batch(
+    instance_names: list,
+    credit_browse_map: dict,
+    today_start: datetime,
+    yesterday_start: datetime,
+    month_start: datetime,
+) -> dict:
+    """批量读取 Emby 状态 API 所需上传统计（播放 + 可选选片）。"""
+    names = [n for n in (instance_names or []) if n]
+    if not names:
+        return {}
+    playback_today = db.get_playback_upload_period_bytes_batch(names, today_start)
+    playback_yesterday = db.get_playback_upload_period_bytes_batch(
+        names, yesterday_start,
+    )
+    playback_month = db.get_playback_upload_period_bytes_batch(names, month_start)
+    playback_total = db.get_playback_upload_total_bytes_batch(names)
+    browse_names = [n for n in names if credit_browse_map.get(n)]
+    browse_today = (
+        get_browse_upload_period_bytes_batch(browse_names, today_start)
+        if browse_names else {}
+    )
+    browse_yesterday = (
+        get_browse_upload_period_bytes_batch(browse_names, yesterday_start)
+        if browse_names else {}
+    )
+    browse_month = (
+        get_browse_upload_period_bytes_batch(browse_names, month_start)
+        if browse_names else {}
+    )
+    browse_total = (
+        get_browse_upload_total_bytes_batch(browse_names)
+        if browse_names else {}
+    )
+    result = {}
+    for name in names:
+        credit = bool(credit_browse_map.get(name))
+        today_up = playback_today.get(name, 0) + (
+            browse_today.get(name, 0) if credit else 0
+        )
+        yesterday_base = playback_yesterday.get(name, 0) + (
+            browse_yesterday.get(name, 0) if credit else 0
+        )
+        month_up = playback_month.get(name, 0) + (
+            browse_month.get(name, 0) if credit else 0
+        )
+        device_up = playback_total.get(name, 0) + (
+            browse_total.get(name, 0) if credit else 0
+        )
+        result[name] = {
+            'today_upload': today_up,
+            'yesterday_upload': max(0, yesterday_base - today_up),
+            'month_upload': month_up,
+            'device_upload': device_up,
+        }
+    return result
 
 
 def get_upload_period_bytes(
@@ -130,7 +239,7 @@ def get_combined_upload_total_bytes(
 def _browse_facts_daily(name, user, days, start, end):
     db._ensure_emby_schema()
     with db._lock:
-        conn = db.traffic_db.get_conn()
+        conn = db.get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -161,7 +270,7 @@ def _browse_facts_daily(name, user, days, start, end):
 def _browse_facts_daily_all(name, days, start, end):
     db._ensure_emby_schema()
     with db._lock:
-        conn = db.traffic_db.get_conn()
+        conn = db.get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -192,7 +301,7 @@ def _browse_facts_daily_all(name, days, start, end):
 def _browse_hourly(name, user, hours, start, end):
     db._ensure_emby_schema()
     with db._lock:
-        conn = db.traffic_db.get_conn()
+        conn = db.get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -221,7 +330,7 @@ def _browse_hourly(name, user, hours, start, end):
 def _browse_hourly_all(name, hours, start, end):
     db._ensure_emby_schema()
     with db._lock:
-        conn = db.traffic_db.get_conn()
+        conn = db.get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -251,7 +360,7 @@ def _browse_facts_grouped(name, user, label_sql, label_key, cutoff_kw, limit_kw,
                           start=None, end=None, all_users=False):
     db._ensure_emby_schema()
     with db._lock:
-        conn = db.traffic_db.get_conn()
+        conn = db.get_conn()
         try:
             c = conn.cursor()
             user_clause = '' if all_users else 'AND user_name = ?'
@@ -484,7 +593,7 @@ def _browse_cycle_stats(instance_name, user_name, periods, *, all_users=False):
     result = []
     db._ensure_emby_schema()
     with db._lock:
-        conn = db.traffic_db.get_conn()
+        conn = db.get_conn()
         try:
             c = conn.cursor()
             for p in periods:

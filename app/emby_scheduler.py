@@ -376,12 +376,13 @@ class EmbyInstanceWorker:
             return None, False
         return data, True
 
-    def _fetch_sessions(self, client: EmbyClient) -> list:
+    def _fetch_sessions(self, client: EmbyClient) -> tuple:
+        """返回 (sessions, ok)；拉取失败时 ok=False，调用方应保留分摊状态。"""
         try:
-            return client.get_all_client_sessions()
+            return client.get_all_client_sessions() or [], True
         except Exception as e:
             logger.debug(f'[Emby:{self.name}] 获取会话失败: {e}')
-            return []
+            return None, False
 
     def _probe_api_online(self, client: EmbyClient) -> bool:
         return client.is_reachable()
@@ -732,7 +733,13 @@ class EmbyInstanceWorker:
         """拉取并同步播放会话；API 返回空列表表示无播放（如 Web 返回键退出）。"""
         if not api_online:
             return []
-        fetched_sessions = self._fetch_sessions(client) or []
+        fetched_sessions, sessions_fetch_ok = self._fetch_sessions(client)
+        if not sessions_fetch_ok:
+            logger.debug(
+                f'[Emby:{self.name}] 会话拉取失败，保留 WAN 分摊状态',
+            )
+            return list(self._last_sessions or [])
+        fetched_sessions = fetched_sessions or []
         estimate_upload_enabled = bool(
             getattr(client, 'upload_tracking_enabled', False),
         )
@@ -1418,6 +1425,10 @@ class EmbyMonitor:
         self._live_cache_lock = threading.Lock()
         self._collect_generation: Dict[str, int] = {}
         self._state_generation: Dict[str, int] = {}
+        self._live_status_traffic_cache: Dict[str, dict] = {}
+        self._live_status_traffic_cache_at = 0.0
+        self._live_status_traffic_cache_lock = threading.Lock()
+        self._live_status_traffic_cache_ttl = 1.0
         self._apply_global_config()
         self._init_clients()
 
@@ -1632,51 +1643,116 @@ class EmbyMonitor:
             self._bump_collect_generation(name)
         self._bump_state_generation(name)
 
+    def _get_live_status_traffic_batch(self, clients: dict) -> tuple:
+        now_mono = time.monotonic()
+        names = list(clients.keys())
+        now = self._now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday_start = today_start - timedelta(days=1)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        period_key = (
+            today_start.isoformat(),
+            yesterday_start.isoformat(),
+            month_start.isoformat(),
+        )
+        with self._live_status_traffic_cache_lock:
+            if (
+                names
+                and self._live_status_traffic_cache
+                and (now_mono - self._live_status_traffic_cache_at)
+                < self._live_status_traffic_cache_ttl
+                and self._live_status_traffic_cache.get('_period_key') == period_key
+                and set(
+                    n for n in self._live_status_traffic_cache.keys()
+                    if not str(n).startswith('_')
+                ) >= set(names)
+            ):
+                return (
+                    {
+                        name: dict(self._live_status_traffic_cache.get(name) or {})
+                        for name in names
+                    },
+                    dict(self._live_status_traffic_cache.get('_status_map') or {}),
+                    dict(self._live_status_traffic_cache.get('_data_starts') or {}),
+                )
+
+        credit_browse_map = {
+            name: (
+                client.traffic_collect_mode == 'lucky'
+                and bool(client.lucky_credit_browse_traffic)
+            )
+            for name, client in clients.items()
+        }
+        upload_batch = emby_browse_upload_stats.get_live_status_upload_batch(
+            names, credit_browse_map, today_start, yesterday_start, month_start,
+        )
+        download_today = emby_traffic_db.get_period_bytes_batch(
+            names, today_start, 'download',
+        )
+        download_yesterday_base = emby_traffic_db.get_period_bytes_batch(
+            names, yesterday_start, 'download',
+        )
+        download_month = emby_traffic_db.get_period_bytes_batch(
+            names, month_start, 'download',
+        )
+        download_total = emby_traffic_db.get_total_bytes_batch(names, 'download')
+        data_starts = emby_traffic_db.get_data_start_times_batch(names)
+        status_map = {
+            row['instance_name']: row
+            for row in emby_traffic_db.get_all_instance_status()
+        }
+        traffic_batch = {}
+        for name in names:
+            upload = upload_batch.get(name, {})
+            today_dl = download_today.get(name, 0)
+            yesterday_base_dl = download_yesterday_base.get(name, 0)
+            traffic_batch[name] = {
+                'today_upload': int(upload.get('today_upload') or 0),
+                'today_download': today_dl,
+                'yesterday_upload': int(upload.get('yesterday_upload') or 0),
+                'yesterday_download': max(0, yesterday_base_dl - today_dl),
+                'month_upload': int(upload.get('month_upload') or 0),
+                'month_download': download_month.get(name, 0),
+                'device_upload': int(upload.get('device_upload') or 0),
+                'device_download': download_total.get(name, 0),
+            }
+        cached = dict(traffic_batch)
+        cached['_period_key'] = period_key
+        cached['_status_map'] = status_map
+        cached['_data_starts'] = data_starts
+        with self._live_status_traffic_cache_lock:
+            self._live_status_traffic_cache = cached
+            self._live_status_traffic_cache_at = now_mono
+        return traffic_batch, status_map, data_starts
+
     def get_live_status_summary(self) -> list:
         with self._live_cache_lock:
             cache = {k: dict(v) for k, v in self._live_cache.items()}
         result = []
         with self._config_lock:
             clients = dict(self.clients)
+        traffic_batch, status_map, data_starts = self._get_live_status_traffic_batch(
+            clients,
+        )
         for name, client in clients.items():
             live = cache.get(name, {})
-            status = emby_traffic_db.get_instance_status(name)
-            now = self._now()
-            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            yesterday_start = today_start - timedelta(days=1)
-            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
+            status = status_map.get(name, {})
+            traffic = traffic_batch.get(name, {})
             credit_browse = (
                 client.traffic_collect_mode == 'lucky'
                 and bool(client.lucky_credit_browse_traffic)
             )
-            today_up = emby_browse_upload_stats.get_upload_period_bytes(
-                name, today_start, credit_browse=credit_browse,
-            )
-            today_dl = emby_traffic_db.get_period_bytes(
-                name, today_start, 'download')
-            yesterday_up = emby_browse_upload_stats.get_upload_period_bytes(
-                name, yesterday_start, credit_browse=credit_browse,
-            )
-            yesterday_dl = emby_traffic_db.get_period_bytes(
-                name, yesterday_start, 'download')
-            yesterday_up -= today_up
-            yesterday_dl -= today_dl
-            yesterday_up = max(0, yesterday_up)
-            yesterday_dl = max(0, yesterday_dl)
-            month_up = emby_browse_upload_stats.get_upload_period_bytes(
-                name, month_start, credit_browse=credit_browse,
-            )
-            month_dl = emby_traffic_db.get_period_bytes(
-                name, month_start, 'download')
-
-            device_up = emby_browse_upload_stats.get_upload_total_bytes(
-                name, credit_browse=credit_browse,
-            )
-            device_dl = emby_traffic_db.get_total_bytes(name, 'download')
+            today_up = int(traffic.get('today_upload') or 0)
+            today_dl = int(traffic.get('today_download') or 0)
+            yesterday_up = int(traffic.get('yesterday_upload') or 0)
+            yesterday_dl = int(traffic.get('yesterday_download') or 0)
+            month_up = int(traffic.get('month_upload') or 0)
+            month_dl = int(traffic.get('month_download') or 0)
+            device_up = int(traffic.get('device_upload') or 0)
+            device_dl = int(traffic.get('device_download') or 0)
 
             api_online = live.get('api_online', status.get('api_online', 0) == 1)
-            raw_data_start = emby_traffic_db.get_data_start_time(name)
+            raw_data_start = data_starts.get(name)
             data_start_time = (
                 traffic_db._format_datetime_seconds(raw_data_start)
                 if raw_data_start else None

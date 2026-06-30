@@ -8,6 +8,7 @@ _LOG_LINE_RE = re.compile(
     r'\[(DEBUG|INFO|WARNING|ERROR|CRITICAL)\] '
     r'(\S+): (.*)$'
 )
+_TAIL_CHUNK_SIZE = 8192
 
 
 def _log_files() -> list:
@@ -27,6 +28,28 @@ def _log_files() -> list:
         if rotated.exists():
             files.append(rotated)
     return files
+
+
+def _iter_lines_reversed(path: Path):
+    """从文件末尾向前逐行读取，避免整文件载入内存。"""
+    try:
+        with open(path, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            buffer = b''
+            while position > 0:
+                read_size = min(_TAIL_CHUNK_SIZE, position)
+                position -= read_size
+                handle.seek(position)
+                buffer = handle.read(read_size) + buffer
+                while b'\n' in buffer:
+                    line, buffer = buffer.rsplit(b'\n', 1)
+                    if line:
+                        yield line.decode('utf-8', errors='replace').rstrip('\r\n')
+            if buffer:
+                yield buffer.decode('utf-8', errors='replace').rstrip('\r\n')
+    except OSError:
+        return
 
 
 def _entry_matches_instance(entry: dict, instance: str) -> bool:
@@ -115,11 +138,7 @@ def get_system_logs(limit: int = 1000, level: str = None, instance: str = None,
     entries = []
 
     for path in _log_files():
-        try:
-            lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
-        except OSError:
-            continue
-        for line in reversed(lines):
+        for line in _iter_lines_reversed(path):
             match = _LOG_LINE_RE.match(line)
             if not match:
                 continue

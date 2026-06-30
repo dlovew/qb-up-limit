@@ -1678,6 +1678,8 @@ function bindGlobalEmbySettingsSection() {
     syncEmbySettingsFields();
 }
 
+let _devicesResizeTimer = null;
+
 window.addEventListener('resize', () => {
     if (typeof syncNavbarContextSwitchUi === 'function') {
         syncNavbarContextSwitchUi();
@@ -1691,7 +1693,8 @@ window.addEventListener('resize', () => {
                 scheduleSyncMergeViewCardHeightsDebounced(150);
             }
         } else if (typeof renderDevicesPanel === 'function') {
-            renderDevicesPanel(true);
+            clearTimeout(_devicesResizeTimer);
+            _devicesResizeTimer = setTimeout(() => renderDevicesPanel(true), 150);
         }
     }
 });

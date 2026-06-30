@@ -287,7 +287,7 @@ class SessionWatchState:
             self.start_locked = True
             self.start_position_seconds = int(self.segment_start_position or position)
 
-        self.played_seconds += int(elapsed)
+        self.played_seconds += int(elapsed * playback_rate)
         self.last_position = position
 
 

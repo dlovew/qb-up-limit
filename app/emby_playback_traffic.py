@@ -4,10 +4,11 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from emby_client import EmbyClient
 from emby_traffic_filter import (
+    filter_superseded_wan_sessions,
     is_wan_playback_session,
     is_wan_remote_session,
     legacy_playback_accumulator_key,
@@ -21,12 +22,18 @@ try:
     from emby_lucky_verdict import (
         analyze_lucky_connections,
         binding_targets_from_analysis,
+        browse_persist_key_variants_for_session,
         is_wan_browse_session,
+        legacy_browse_persist_key_for_session,
         match_hints_from_analysis,
+        sid_from_browse_persist_key,
     )
 except ImportError:
     def analyze_lucky_connections(*args, **kwargs):
-        return {'version': 2, 'groups': [], 'rows': [], 'emby_without_lucky': []}
+        return {
+            'version': 2, 'groups': [], 'rows': [],
+            'emby_without_lucky': [],
+        }
 
     def binding_targets_from_analysis(analysis):
         return {}
@@ -116,6 +123,12 @@ def collect_online_persist_keys(
                 keys.add(key)
     except Exception:
         pass
+    if credit_browse:
+        with _lock:
+            browse_bucket = dict(_browse_upload_accumulators.get(name) or {})
+        for bkey, amount in browse_bucket.items():
+            if str(bkey or '').startswith('browse:') and int(amount or 0) > 0:
+                keys.add(str(bkey).strip())
     return keys
 
 
@@ -915,6 +928,68 @@ def _persist_key_for_session(session: dict) -> str:
     return ''
 
 
+def _prune_lucky_conn_bindings(
+    bindings: Dict[str, str],
+    match_hints: Dict[str, str],
+    active_keys: set,
+    active_remote: list,
+) -> None:
+    valid_pkeys = {
+        _persist_key_for_session(s)
+        for s in (active_remote or [])
+        if _persist_key_for_session(s)
+    }
+    for addr in list((bindings or {}).keys()):
+        pkey = str(bindings.get(addr) or '').strip()
+        if not pkey or pkey not in active_keys or pkey not in valid_pkeys:
+            bindings.pop(addr, None)
+    for addr in list((match_hints or {}).keys()):
+        pkey = str(match_hints.get(addr) or '').strip()
+        if not pkey or pkey not in active_keys:
+            match_hints.pop(addr, None)
+
+
+def _lucky_active_keys(
+    active_remote: list,
+    *,
+    credit_browse: bool,
+    browse_bucket: Optional[Dict[str, int]] = None,
+) -> set:
+    active_keys = {
+        _persist_key_for_session(s)
+        for s in (active_remote or [])
+        if _persist_key_for_session(s)
+    }
+    if credit_browse:
+        for session in active_remote or []:
+            if is_wan_browse_session(session, credit_browse=True):
+                for bkey in browse_persist_key_variants_for_session(session):
+                    if bkey:
+                        active_keys.add(bkey)
+    for bkey, amount in (browse_bucket or {}).items():
+        if str(bkey or '').startswith('browse:') and int(amount or 0) > 0:
+            active_keys.add(str(bkey).strip())
+    return active_keys
+
+
+def clear_lucky_bindings_for_persist_key(instance_name: str, persist_key: str) -> None:
+    """账户切换等场景：清除指向指定 persist_key 的连接绑定。"""
+    name = (instance_name or '').strip()
+    target = str(persist_key or '').strip()
+    if not name or not target:
+        return
+    with _lock:
+        runtime = _lucky_runtime(name)
+        bindings: Dict[str, str] = runtime['bindings']
+        hints: Dict[str, str] = runtime['match_hints']
+        for addr in list(bindings.keys()):
+            if str(bindings.get(addr) or '').strip() == target:
+                bindings.pop(addr, None)
+        for addr in list(hints.keys()):
+            if str(hints.get(addr) or '').strip() == target:
+                hints.pop(addr, None)
+
+
 def _lucky_runtime(instance_name: str) -> dict:
     state = _conn_bindings.setdefault(instance_name, {})
     hints = _conn_match_hints.setdefault(instance_name, {})
@@ -937,19 +1012,20 @@ def _sync_lucky_match_hints(
     name = (instance_name or '').strip()
     if not name:
         return
-    active_keys = {
-        _persist_key_for_session(s)
-        for s in (sessions or [])
+    active_remote = [
+        s for s in (sessions or [])
         if isinstance(s, dict) and is_wan_remote_session(s)
-        and _persist_key_for_session(s)
-    }
+    ]
+    active_remote, _ = filter_superseded_wan_sessions(active_remote)
+    active_keys = _lucky_active_keys(active_remote, credit_browse=False)
     runtime = _lucky_runtime(name)
     hints: Dict[str, str] = runtime['match_hints']
     for addr, pkey in match_hints_from_analysis(analysis).items():
         if pkey in active_keys:
             hints[addr] = pkey
     for addr in list(hints.keys()):
-        if hints.get(addr) not in active_keys:
+        pkey = str(hints.get(addr) or '').strip()
+        if not pkey or pkey not in active_keys:
             hints.pop(addr, None)
 
 
@@ -1036,19 +1112,37 @@ def peek_browse_upload_bucket(name: str) -> Dict[str, int]:
     return _snapshot_browse_upload_buckets((name or '').strip())
 
 
-def peek_browse_upload_bytes_for_sid(instance_name: str, sid: str) -> int:
+def peek_browse_upload_bytes_for_sid(
+    instance_name: str,
+    sid: str,
+    meta: Optional[dict] = None,
+) -> int:
     """读取指定会话 sid 在选片累计桶中的字节（不清除）。"""
-    from emby_lucky_verdict import browse_persist_key_for_session
-
     name = (instance_name or '').strip()
     sid = str(sid or '').strip()
     if not name or not sid:
         return 0
-    key = browse_persist_key_for_session({'id': sid})
-    if not key:
-        return 0
+    subject = dict(meta or {})
+    subject.setdefault('id', sid)
+    subject.setdefault('session_id', sid)
+    subject.setdefault('emby_session_id', sid)
+    keys = browse_persist_key_variants_for_session(subject)
+    if not keys:
+        legacy = legacy_browse_persist_key_for_session(subject)
+        if legacy:
+            keys = [legacy]
     bucket = peek_browse_upload_bucket(name)
-    return max(0, int(bucket.get(key) or 0))
+    total = 0
+    seen: Set[str] = set()
+    for key in keys:
+        seen.add(key)
+        total += max(0, int(bucket.get(key) or 0))
+    for key, amount in bucket.items():
+        if key in seen:
+            continue
+        if sid_from_browse_persist_key(key) == sid:
+            total += max(0, int(amount or 0))
+    return total
 
 
 def remember_browse_session_meta(instance_name: str, sid: str, meta: dict) -> None:
@@ -1116,11 +1210,7 @@ def pop_browse_session_meta(instance_name: str, sid: str) -> None:
 
 
 def _browse_sid_from_key(key: str) -> str:
-    text = str(key or '').strip()
-    prefix = 'browse:sid:'
-    if text.startswith(prefix):
-        return text[len(prefix):]
-    return ''
+    return sid_from_browse_persist_key(key)
 
 
 def _session_for_sid(sessions: list, sid: str) -> Optional[dict]:
@@ -1148,9 +1238,15 @@ def _session_for_sid(sessions: list, sid: str) -> Optional[dict]:
 def _meta_from_lucky_row(row: dict) -> dict:
     emby_user = str(row.get('emby_user') or '').strip()
     user_name = emby_user.split('·', 1)[0].strip() if emby_user else ''
+    user_id = ''
+    key = str(row.get('browse_persist_key') or '').strip()
+    if key.startswith('browse:') and not key.startswith('browse:sid:'):
+        parts = key.split(':')
+        if len(parts) >= 3:
+            user_id = str(parts[1] or '').strip()
     return {
         'user_name': user_name,
-        'user_id': '',
+        'user_id': user_id,
         'viewing_title': str(row.get('media_label') or '').strip(),
     }
 
@@ -1238,6 +1334,7 @@ def accumulate_wan_upload_by_conn(
         return _allocation_debug_payload()
 
     active_remote = _wan_pool_sessions(sessions, credit_browse=credit_browse)
+    active_remote, _ = filter_superseded_wan_sessions(active_remote)
     if not active_remote:
         return _allocation_debug_payload(
             total_upload_bytes=sum(deltas.values()),
@@ -1262,21 +1359,14 @@ def accumulate_wan_upload_by_conn(
             if addr:
                 runtime['conn_info'][addr] = dict(conn)
 
-        active_keys = {
-            _persist_key_for_session(s)
-            for s in active_remote
-            if _persist_key_for_session(s)
-        }
-        if credit_browse:
-            from emby_lucky_verdict import browse_persist_key_for_session
-            for s in active_remote:
-                if is_wan_browse_session(s, credit_browse=True):
-                    bkey = browse_persist_key_for_session(s)
-                    if bkey:
-                        active_keys.add(bkey)
-        for addr in list(bindings.keys()):
-            if bindings.get(addr) not in active_keys:
-                bindings.pop(addr, None)
+        active_keys = _lucky_active_keys(
+            active_remote,
+            credit_browse=credit_browse,
+            browse_bucket=browse_bucket,
+        )
+        _prune_lucky_conn_bindings(
+            bindings, match_hints, active_keys, active_remote,
+        )
 
         analysis = analyze_lucky_connections(
             sessions,
@@ -1393,7 +1483,7 @@ def get_lucky_conn_debug_snapshot(
         match_hints = dict(_conn_match_hints.get(name) or {})
         upload_bucket = dict(_upload_accumulators.get(name) or {})
         browse_bucket = dict(_browse_upload_accumulators.get(name) or {})
-    return analyze_lucky_connections(
+    analysis = analyze_lucky_connections(
         sessions,
         conn_rows,
         deltas,
@@ -1403,6 +1493,7 @@ def get_lucky_conn_debug_snapshot(
         browse_upload_bucket=browse_bucket,
         credit_browse=credit_browse,
     )
+    return analysis
 
 
 def peek_accumulated_upload(instance_name: str, event: dict) -> Optional[int]:

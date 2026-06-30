@@ -422,8 +422,9 @@ def restore_speed_limit(qb_client, reason: str = '手动解除限速',
         )
         logger.info(f"[{qb_client.name}] 限速已解除: {reason}")
     else:
-        _record_limit_source(qb_client, LIMIT_SOURCE_NONE)
-        set_manual_baseline_threshold_gb(qb_client.name, 0)
+        logger.warning(
+            f"[{qb_client.name}] 解除限速 API 调用失败，保持手动覆盖状态",
+        )
     return success
 
 

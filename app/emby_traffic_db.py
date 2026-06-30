@@ -1,4 +1,4 @@
-"""Emby 容器流量 SQLite 存储（与 qB 数据隔离）"""
+"""Emby 容器流量 SQLite 存储（独立 emby_traffic.db，与 qB traffic.db 分离）"""
 
 import logging
 import os
@@ -11,10 +11,34 @@ import traffic_db
 
 logger = logging.getLogger(__name__)
 
+DB_PATH = '/data/emby_traffic.db'
+_LEGACY_DB_PATH = traffic_db.DB_PATH
+_SPLIT_DB_MIGRATION = 'split_emby_traffic_db_v1'
+
+_EMBY_DB_TABLES = (
+    'emby_schema_migrations',
+    'emby_traffic_hourly',
+    'emby_traffic_monthly',
+    'emby_instance_status',
+    'emby_playback_upload_facts',
+    'emby_playback_upload_hourly',
+    'emby_browse_upload_facts',
+    'emby_browse_upload_hourly',
+    'emby_lucky_ip_baselines',
+    'emby_lucky_conn_baselines',
+    'emby_session_upload_accumulators',
+    'emby_browse_upload_accumulators',
+    'emby_lucky_conn_bindings',
+)
+
 _lock = threading.Lock()
 _emby_schema_ensured = False
 _migrations_started = False
 _migrations_running = False
+_retention_years = 5
+_last_vacuum_day = None
+_vacuum_running = False
+_VACUUM_INTERVAL_DAYS = 30
 
 _EMBY_SCHEMA_COLUMNS = (
     ('emby_traffic_hourly', 'backfilled_uploaded_bytes', 'BIGINT NOT NULL DEFAULT 0'),
@@ -41,10 +65,159 @@ def _calc_delta(current: int, last: int) -> int:
     return current - last
 
 
+def get_conn():
+    conn = sqlite3.connect(
+        DB_PATH, check_same_thread=False, timeout=30.0,
+    )
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _table_exists(conn, table: str, schema: str = 'main') -> bool:
+    c = conn.cursor()
+    if schema == 'main':
+        c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        )
+    else:
+        c.execute(
+            f"SELECT 1 FROM {schema}.sqlite_master WHERE type='table' AND name=?",
+            (table,),
+        )
+    return c.fetchone() is not None
+
+
+def _get_common_columns(cursor, table: str, dest_schema: str, legacy_schema: str) -> list:
+    cursor.execute(f'PRAGMA {dest_schema}.table_info({table})')
+    dest_cols = {row[1] for row in cursor.fetchall()}
+    cursor.execute(f'PRAGMA {legacy_schema}.table_info({table})')
+    return [row[1] for row in cursor.fetchall() if row[1] in dest_cols]
+
+
+def _split_migration_applied_unlocked(conn) -> bool:
+    if not _table_exists(conn, 'emby_schema_migrations'):
+        return False
+    c = conn.cursor()
+    c.execute(
+        'SELECT 1 FROM emby_schema_migrations WHERE name = ?',
+        (_SPLIT_DB_MIGRATION,),
+    )
+    return c.fetchone() is not None
+
+
+def _legacy_has_emby_data(legacy_conn) -> bool:
+    for table in _EMBY_DB_TABLES:
+        if table == 'emby_schema_migrations':
+            continue
+        if not _table_exists(legacy_conn, table):
+            continue
+        try:
+            c = legacy_conn.cursor()
+            c.execute(f'SELECT 1 FROM {table} LIMIT 1')
+            if c.fetchone():
+                return True
+        except sqlite3.OperationalError:
+            continue
+    return False
+
+
+def _migrate_from_legacy_traffic_db_unlocked() -> None:
+    """启动时将旧版 traffic.db 内 Emby 表迁移至独立 emby_traffic.db。"""
+    if not os.path.exists(_LEGACY_DB_PATH):
+        return
+
+    dest_conn = get_conn()
+    try:
+        dest_c = dest_conn.cursor()
+        if _split_migration_applied_unlocked(dest_conn):
+            return
+    finally:
+        dest_conn.close()
+
+    legacy_conn = sqlite3.connect(_LEGACY_DB_PATH, timeout=30.0)
+    try:
+        if not _legacy_has_emby_data(legacy_conn):
+            return
+    finally:
+        legacy_conn.close()
+
+    logger.info(
+        '检测到旧版 traffic.db 中的 Emby 数据，开始迁移至 emby_traffic.db ...',
+    )
+    dest_conn = get_conn()
+    try:
+        dest_conn.execute('BEGIN IMMEDIATE')
+        dest_conn.execute('ATTACH DATABASE ? AS legacy', (_LEGACY_DB_PATH,))
+        dest_c = dest_conn.cursor()
+        migrated_tables = 0
+        for table in _EMBY_DB_TABLES:
+            if not _table_exists(dest_conn, table, 'legacy'):
+                continue
+            cols = _get_common_columns(dest_c, table, 'main', 'legacy')
+            if not cols:
+                continue
+            col_list = ', '.join(cols)
+            dest_c.execute(f'DELETE FROM main.{table}')
+            dest_c.execute(
+                f'INSERT OR REPLACE INTO main.{table} ({col_list}) '
+                f'SELECT {col_list} FROM legacy.{table}',
+            )
+            migrated_tables += 1
+        if not _table_exists(dest_conn, 'emby_schema_migrations'):
+            dest_c.execute('''
+                CREATE TABLE IF NOT EXISTS emby_schema_migrations (
+                    name TEXT PRIMARY KEY,
+                    applied_at DATETIME NOT NULL
+                )
+            ''')
+        dest_c.execute('''
+            INSERT OR REPLACE INTO emby_schema_migrations (name, applied_at)
+            VALUES (?, ?)
+        ''', (
+            _SPLIT_DB_MIGRATION,
+            _now().strftime('%Y-%m-%d %H:%M:%S'),
+        ))
+        dest_conn.commit()
+        dest_conn.execute('DETACH DATABASE legacy')
+        logger.info(
+            'Emby 数据已迁移至 emby_traffic.db（%d 张表）',
+            migrated_tables,
+        )
+    except Exception:
+        try:
+            dest_conn.rollback()
+        except Exception:
+            pass
+        logger.error('Emby 数据库迁移失败', exc_info=True)
+        raise
+    finally:
+        try:
+            dest_conn.execute('DETACH DATABASE legacy')
+        except Exception:
+            pass
+        dest_conn.close()
+
+    legacy_write = sqlite3.connect(_LEGACY_DB_PATH, timeout=30.0)
+    try:
+        legacy_write.execute('BEGIN IMMEDIATE')
+        lc = legacy_write.cursor()
+        for table in reversed(_EMBY_DB_TABLES):
+            if _table_exists(legacy_write, table):
+                lc.execute(f'DROP TABLE IF EXISTS {table}')
+        legacy_write.commit()
+        logger.info('已从 traffic.db 移除 Emby 表')
+    except Exception as e:
+        legacy_write.rollback()
+        logger.warning('从 traffic.db 清理 Emby 表失败（数据已在 emby_traffic.db）: %s', e)
+    finally:
+        legacy_write.close()
+
+
 def init_db():
     global _emby_schema_ensured
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -186,11 +359,39 @@ def init_db():
                     )
                 except sqlite3.OperationalError:
                     pass
+            c.execute('''
+                CREATE INDEX IF NOT EXISTS idx_emby_hourly_instance_time
+                ON emby_traffic_hourly(instance_name, hour_start)
+            ''')
+            c.execute('''
+                CREATE INDEX IF NOT EXISTS idx_emby_monthly_instance_period
+                ON emby_traffic_monthly(instance_name, year, month)
+            ''')
+            c.execute('''
+                CREATE INDEX IF NOT EXISTS idx_emby_playback_hourly_lookup
+                ON emby_playback_upload_hourly(instance_name, user_name, hour_start)
+            ''')
+            c.execute('''
+                CREATE INDEX IF NOT EXISTS idx_emby_browse_hourly_lookup
+                ON emby_browse_upload_hourly(instance_name, user_name, hour_start)
+            ''')
+            c.execute('''
+                CREATE INDEX IF NOT EXISTS idx_emby_playback_facts_stopped
+                ON emby_playback_upload_facts(instance_name, stopped_at DESC)
+            ''')
+            c.execute('''
+                CREATE INDEX IF NOT EXISTS idx_emby_browse_facts_stopped
+                ON emby_browse_upload_facts(instance_name, stopped_at DESC)
+            ''')
             conn.commit()
+            c.execute('PRAGMA journal_mode=WAL')
+            conn.commit()
+            _migrate_from_legacy_traffic_db_unlocked()
             _emby_schema_ensured = True
         finally:
             conn.close()
     _start_background_migrations()
+    cleanup_old_data()
 
 
 def _start_background_migrations():
@@ -249,7 +450,7 @@ def _get_last_total(c, instance_name: str, column: str) -> int:
 def peek_snapshot_deltas(instance_name: str, tx_bytes: int, rx_bytes: int):
     """读取 Docker 累计值相对库内基线的增量（不写库）。"""
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             last_tx = _get_last_total(c, instance_name, 'last_total_uploaded')
@@ -266,7 +467,7 @@ def peek_snapshot_deltas(instance_name: str, tx_bytes: int, rx_bytes: int):
 def has_docker_baseline(instance_name: str) -> bool:
     """库内是否已有 Docker 计数基线（用于离线恢复补录）。"""
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             last_tx = _get_last_total(c, instance_name, 'last_total_uploaded')
@@ -279,7 +480,7 @@ def get_instance_last_totals(instance_name: str) -> tuple:
     """读取实例上次落库的累计上传/下载基线（用于 Lucky 单调递增写入）。"""
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             return (
@@ -297,7 +498,7 @@ def load_lucky_ip_baselines(instance_name: str) -> dict:
     if not name:
         return {}
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -327,7 +528,7 @@ def save_lucky_ip_baselines(instance_name: str, baselines: dict) -> None:
         return
     now = _now()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             for ip, values in baselines.items():
@@ -361,7 +562,7 @@ def clear_lucky_ip_baselines(instance_name: str) -> None:
     if not name:
         return
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute(
@@ -385,7 +586,7 @@ def load_lucky_conn_baselines(instance_name: str) -> dict:
     if not name:
         return {}
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -414,7 +615,7 @@ def save_lucky_conn_baselines(instance_name: str, baselines: dict) -> None:
         return
     now = _now()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             for addr, values in baselines.items():
@@ -449,7 +650,7 @@ def load_session_upload_accumulators(instance_name: str) -> dict:
     if not name:
         return {}
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -483,7 +684,7 @@ def replace_session_upload_accumulators(instance_name: str, bucket: dict) -> Non
     }
     now = _now()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute(
@@ -513,7 +714,7 @@ def delete_session_upload_accumulator_keys(
     if not uniq:
         return
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             for key in uniq:
@@ -533,7 +734,7 @@ def load_browse_upload_accumulators(instance_name: str) -> dict:
     if not name:
         return {}
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -567,7 +768,7 @@ def replace_browse_upload_accumulators(instance_name: str, bucket: dict) -> None
     }
     now = _now()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute(
@@ -597,7 +798,7 @@ def delete_browse_upload_accumulator_keys(
     if not uniq:
         return
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             for key in uniq:
@@ -617,7 +818,7 @@ def load_lucky_conn_bindings(instance_name: str) -> dict:
     if not name:
         return {}
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -649,7 +850,7 @@ def replace_lucky_conn_bindings(instance_name: str, bindings: dict) -> None:
     }
     now = _now()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute(
@@ -693,7 +894,7 @@ def clear_live_upload_persistence(instance_name: str) -> None:
     if not name:
         return
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             _clear_live_upload_persistence_unlocked(c, name)
@@ -707,7 +908,7 @@ def save_snapshot(instance_name: str, tx_bytes: int, rx_bytes: int,
                   is_backfill: bool = False):
     """Docker 容器累计 tx/rx → 增量写入小时/月表；record_* 可覆盖实际落库增量（外网过滤）。"""
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             now = _now()
             c = conn.cursor()
@@ -797,7 +998,7 @@ def update_instance_status(instance_name: str, is_online: bool = None,
                            api_online: bool = None,
                            docker_available: bool = None):
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute(
@@ -845,7 +1046,7 @@ def update_instance_status(instance_name: str, is_online: bool = None,
 def get_data_start_time(instance_name: str):
     """获取该 Emby 设备流量数据的最早记录时间"""
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -861,7 +1062,7 @@ def get_data_start_time(instance_name: str):
 
 def get_instance_status(instance_name: str) -> dict:
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute(
@@ -876,7 +1077,7 @@ def get_instance_status(instance_name: str) -> dict:
 
 def get_all_instance_status() -> list:
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute(
@@ -912,7 +1113,7 @@ def get_period_bytes(instance_name: str, start_dt: datetime,
     column = _bytes_column(direction)
     start_s = start_dt.strftime('%Y-%m-%d %H:%M:%S')
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute(f'''
@@ -930,7 +1131,7 @@ def get_total_bytes(instance_name: str, direction: str = 'upload') -> int:
     """自纳入监控以来累计流量（与 qB 设备总上传语义一致）"""
     column = _bytes_column(direction)
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute(f'''
@@ -944,6 +1145,135 @@ def get_total_bytes(instance_name: str, direction: str = 'upload') -> int:
             conn.close()
 
 
+def get_period_bytes_batch(instance_names: list, start_dt: datetime,
+                           direction: str = 'upload') -> dict:
+    """批量读取自 start_dt 起的周期流量。"""
+    names = [n for n in (instance_names or []) if n]
+    if not names:
+        return {}
+    column = _bytes_column(direction)
+    start_s = start_dt.strftime('%Y-%m-%d %H:%M:%S')
+    placeholders = ','.join('?' * len(names))
+    result = {n: 0 for n in names}
+    with _lock:
+        conn = get_conn()
+        try:
+            c = conn.cursor()
+            c.execute(f'''
+                SELECT instance_name, COALESCE(SUM({column}), 0) AS total
+                FROM emby_traffic_hourly
+                WHERE instance_name IN ({placeholders})
+                  AND hour_start >= ?
+                GROUP BY instance_name
+            ''', (*names, start_s))
+            for row in c.fetchall():
+                result[row['instance_name']] = int(row['total'])
+        finally:
+            conn.close()
+    return result
+
+
+def get_total_bytes_batch(instance_names: list,
+                          direction: str = 'upload') -> dict:
+    names = [n for n in (instance_names or []) if n]
+    if not names:
+        return {}
+    column = _bytes_column(direction)
+    placeholders = ','.join('?' * len(names))
+    result = {n: 0 for n in names}
+    with _lock:
+        conn = get_conn()
+        try:
+            c = conn.cursor()
+            c.execute(f'''
+                SELECT instance_name, COALESCE(SUM({column}), 0) AS total
+                FROM emby_traffic_hourly
+                WHERE instance_name IN ({placeholders})
+                GROUP BY instance_name
+            ''', names)
+            for row in c.fetchall():
+                result[row['instance_name']] = int(row['total'])
+        finally:
+            conn.close()
+    return result
+
+
+def get_data_start_times_batch(instance_names: list) -> dict:
+    names = [n for n in (instance_names or []) if n]
+    if not names:
+        return {}
+    placeholders = ','.join('?' * len(names))
+    result = {n: None for n in names}
+    with _lock:
+        conn = get_conn()
+        try:
+            c = conn.cursor()
+            c.execute(f'''
+                SELECT instance_name, MIN(hour_start) AS start_time
+                FROM emby_traffic_hourly
+                WHERE instance_name IN ({placeholders})
+                GROUP BY instance_name
+            ''', names)
+            for row in c.fetchall():
+                result[row['instance_name']] = row['start_time']
+        finally:
+            conn.close()
+    return result
+
+
+def get_playback_upload_period_bytes_batch(instance_names: list,
+                                           start_dt: datetime) -> dict:
+    names = [n for n in (instance_names or []) if n]
+    if not names:
+        return {}
+    start_s = start_dt.strftime('%Y-%m-%d %H:%M:%S')
+    placeholders = ','.join('?' * len(names))
+    result = {n: 0 for n in names}
+    _ensure_emby_schema()
+    with _lock:
+        conn = get_conn()
+        try:
+            c = conn.cursor()
+            c.execute(f'''
+                SELECT instance_name,
+                       COALESCE(SUM(estimated_upload_bytes), 0) AS total
+                FROM emby_playback_upload_facts
+                WHERE instance_name IN ({placeholders})
+                  AND stopped_at >= ?
+                GROUP BY instance_name
+            ''', (*names, start_s))
+            for row in c.fetchall():
+                result[row['instance_name']] = int(row['total'])
+        finally:
+            conn.close()
+    return result
+
+
+def get_playback_upload_total_bytes_batch(instance_names: list) -> dict:
+    names = [n for n in (instance_names or []) if n]
+    if not names:
+        return {}
+    placeholders = ','.join('?' * len(names))
+    result = {n: 0 for n in names}
+    _ensure_emby_schema()
+    with _lock:
+        conn = get_conn()
+        try:
+            c = conn.cursor()
+            c.execute(f'''
+                SELECT instance_name,
+                       COALESCE(SUM(estimated_upload_bytes), 0) AS total
+                FROM emby_playback_upload_facts
+                WHERE instance_name IN ({placeholders})
+                GROUP BY instance_name
+            ''', names)
+            for row in c.fetchall():
+                result[row['instance_name']] = int(row['total'])
+        finally:
+            conn.close()
+    return result
+
+
 def get_playback_upload_period_bytes(instance_name: str,
                                      start_dt: datetime) -> int:
     """外网播放会话上传：自 start_dt 起 ended 段 estimated_upload_bytes 之和。"""
@@ -953,7 +1283,7 @@ def get_playback_upload_period_bytes(instance_name: str,
     start_s = start_dt.strftime('%Y-%m-%d %H:%M:%S')
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -974,7 +1304,7 @@ def get_playback_upload_total_bytes(instance_name: str) -> int:
         return 0
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -994,7 +1324,7 @@ def get_hourly_stats(instance_name: str, hours: int = 24,
     column = _bytes_column(direction)
     backfill_col = _backfill_column(direction)
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -1032,7 +1362,7 @@ def get_daily_stats(instance_name: str, days: int = 30,
     column = _bytes_column(direction)
     backfill_col = _backfill_column(direction)
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -1066,7 +1396,7 @@ def get_weekly_stats(instance_name: str, weeks: int = 12,
     column = _bytes_column(direction)
     backfill_col = _backfill_column(direction)
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -1102,7 +1432,7 @@ def get_monthly_stats(instance_name: str, months: int = 12,
     column = _bytes_column(direction)
     backfill_col = _backfill_column(direction)
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -1144,7 +1474,7 @@ def get_yearly_stats(instance_name: str, years: int = 5,
     column = _bytes_column(direction)
     backfill_col = _backfill_column(direction)
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start_year is not None and end_year is not None:
@@ -1192,7 +1522,7 @@ def get_yearly_stats(instance_name: str, years: int = 5,
 
 def delete_instance_data(instance_name: str):
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             for table in (
@@ -1213,7 +1543,7 @@ def reset_instance_traffic(instance_name: str):
     """清空流量统计；保留容器计数基线"""
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             now = _now()
             c = conn.cursor()
@@ -1306,7 +1636,7 @@ def _has_meaningful_emby_instance_data_unlocked(cursor, instance_name: str) -> b
 def has_instance_data(instance_name: str) -> bool:
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             for table in _EMBY_DATA_INSTANCE_TABLES:
@@ -1324,7 +1654,7 @@ def has_instance_data(instance_name: str) -> bool:
 def has_meaningful_instance_data(instance_name: str) -> bool:
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             return _has_meaningful_emby_instance_data_unlocked(c, instance_name)
@@ -1354,7 +1684,7 @@ def mark_instance_orphan_deleted(instance_name: str):
     _ensure_emby_schema()
     now_str = traffic_db._format_datetime_seconds(traffic_db.now_local())
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute(
@@ -1399,7 +1729,7 @@ def get_orphaned_instances(active_names: list) -> list:
     _ensure_emby_schema()
     active = set(active_names or [])
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             orphan_names = _collect_emby_db_instance_names_unlocked(c) - active
@@ -1421,7 +1751,7 @@ def rename_instance_data(old_name: str, new_name: str):
         return
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute(
@@ -1523,7 +1853,7 @@ def rebuild_playback_upload_stats(instance_name: str = None) -> dict:
     """从播放记录 JSON 重建外网用户上行事实表与小时聚合。"""
     _ensure_traffic_timezone_from_config()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if instance_name:
@@ -1577,7 +1907,7 @@ def rebuild_playback_upload_stats(instance_name: str = None) -> dict:
 
 def _migration_applied(name: str) -> bool:
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute(
@@ -1593,7 +1923,7 @@ def _migration_applied(name: str) -> bool:
 
 def _mark_migration_applied(name: str) -> None:
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -1611,7 +1941,7 @@ def _mark_migration_applied(name: str) -> None:
 def _run_pending_migrations():
     _ensure_traffic_timezone_from_config()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -1672,7 +2002,7 @@ def save_playback_upload_fact(instance_name: str, segment_id: int,
     hour_start = _hour_start_from_stopped(stopped_s)
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -1707,7 +2037,7 @@ def list_playback_upload_users(instance_name: str) -> list:
         return []
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -1740,7 +2070,7 @@ def list_browse_upload_records(
     limit = max(1, min(int(limit or 200), 500))
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -1773,7 +2103,7 @@ def get_playback_upload_hourly_stats(instance_name: str, user_name: str,
         return []
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -1808,7 +2138,7 @@ def get_playback_upload_daily_stats(instance_name: str, user_name: str,
         return []
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -1850,7 +2180,7 @@ def get_playback_upload_monthly_stats(instance_name: str, user_name: str,
         return []
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -1890,7 +2220,7 @@ def get_playback_upload_weekly_stats(instance_name: str, user_name: str,
         return []
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -1928,7 +2258,7 @@ def get_playback_upload_yearly_stats(instance_name: str, user_name: str,
         return []
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start_year is not None and end_year is not None:
@@ -1979,7 +2309,7 @@ def get_playback_upload_cycle_stats(instance_name: str, user_name: str,
     _ensure_emby_schema()
     result = []
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             for p in periods:
@@ -2027,7 +2357,7 @@ def get_playback_upload_hourly_stats_all_users(instance_name: str,
         return []
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -2063,7 +2393,7 @@ def get_playback_upload_daily_stats_all_users(instance_name: str,
         return []
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -2102,7 +2432,7 @@ def get_playback_upload_monthly_stats_all_users(instance_name: str,
         return []
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -2141,7 +2471,7 @@ def get_playback_upload_weekly_stats_all_users(instance_name: str,
         return []
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start and end:
@@ -2178,7 +2508,7 @@ def get_playback_upload_yearly_stats_all_users(instance_name: str,
         return []
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             if start_year is not None and end_year is not None:
@@ -2228,7 +2558,7 @@ def get_playback_upload_cycle_stats_all_users(instance_name: str,
     _ensure_emby_schema()
     result = []
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             for p in periods:
@@ -2299,7 +2629,7 @@ def save_browse_upload_fact(instance_name: str, segment_id: int,
             year_val = None
     _ensure_emby_schema()
     with _lock:
-        conn = traffic_db.get_conn()
+        conn = get_conn()
         try:
             c = conn.cursor()
             c.execute('''
@@ -2331,4 +2661,117 @@ def save_browse_upload_fact(instance_name: str, segment_id: int,
             return True
         finally:
             conn.close()
+
+
+def set_retention_years(years: int) -> bool:
+    """设置数据保留年数（1-20），返回是否缩小了保留年限"""
+    global _retention_years
+    years = max(
+        traffic_db.RETENTION_YEARS_MIN,
+        min(traffic_db.RETENTION_YEARS_MAX, int(years)),
+    )
+    decreased = years < _retention_years
+    _retention_years = years
+    return decreased
+
+
+def get_retention_years() -> int:
+    return _retention_years
+
+
+def _month_cutoff_ym() -> int:
+    now = _now()
+    return (now.year - _retention_years) * 100 + now.month
+
+
+def _run_vacuum_background():
+    """后台执行 incremental_vacuum，避免阻塞采集与 API。"""
+    global _vacuum_running
+    with _lock:
+        if _vacuum_running:
+            return
+        _vacuum_running = True
+
+    def _worker():
+        global _vacuum_running
+        try:
+            conn = get_conn()
+            try:
+                conn.execute('PRAGMA incremental_vacuum')
+                conn.commit()
+                logger.info('Emby 数据库 incremental_vacuum 完成')
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning('Emby 数据库 incremental_vacuum 失败: %s', e)
+        finally:
+            with _lock:
+                _vacuum_running = False
+
+    threading.Thread(
+        target=_worker, name='emby-db-vacuum', daemon=True,
+    ).start()
+
+
+def cleanup_old_data():
+    """清理过期 Emby 流量数据并定期 VACUUM"""
+    global _last_vacuum_day
+    schedule_vacuum = False
+    hourly_deleted = 0
+    facts_deleted = 0
+    with _lock:
+        conn = get_conn()
+        try:
+            c = conn.cursor()
+            hourly_cutoff = _cutoff_str(days=_retention_years * 365)
+            for table in (
+                'emby_traffic_hourly',
+                'emby_playback_upload_hourly',
+                'emby_browse_upload_hourly',
+            ):
+                c.execute(
+                    f'DELETE FROM {table} WHERE hour_start < ?',
+                    (hourly_cutoff,),
+                )
+                hourly_deleted += c.rowcount
+
+            month_cutoff_ym = _month_cutoff_ym()
+            c.execute('''
+                DELETE FROM emby_traffic_monthly
+                WHERE (year * 100 + month) < ?
+            ''', (month_cutoff_ym,))
+
+            for table in (
+                'emby_playback_upload_facts',
+                'emby_browse_upload_facts',
+            ):
+                c.execute(
+                    f'DELETE FROM {table} WHERE stopped_at < ?',
+                    (hourly_cutoff,),
+                )
+                facts_deleted += c.rowcount
+
+            conn.commit()
+
+            today = _now().date()
+            if (
+                _last_vacuum_day != today
+                and today.day % _VACUUM_INTERVAL_DAYS == 1
+            ):
+                _last_vacuum_day = today
+                schedule_vacuum = True
+
+            if hourly_deleted > 0 or facts_deleted > 0:
+                logger.info(
+                    'Emby 数据清理完成: 删除 %d 条过期小时统计, %d 条过期记录',
+                    hourly_deleted,
+                    facts_deleted,
+                )
+        except Exception as e:
+            logger.warning('Emby 数据清理失败: %s', e)
+        finally:
+            conn.close()
+
+    if schedule_vacuum:
+        _run_vacuum_background()
 

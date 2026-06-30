@@ -30,6 +30,8 @@ def init_auth(app):
     app.secret_key = get_secret_key()
     app.config['SESSION_COOKIE_HTTPONLY'] = True
     app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+    if os.environ.get('SESSION_COOKIE_SECURE', '').lower() in ('1', 'true', 'yes'):
+        app.config['SESSION_COOKIE_SECURE'] = True
     app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=30)
 
     @app.before_request

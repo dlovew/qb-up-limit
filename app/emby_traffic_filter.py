@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 from datetime import datetime, timezone
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,118 @@ def is_wan_remote_session(session: dict) -> bool:
     if not isinstance(session, dict):
         return False
     return is_wan_endpoint(session.get('remote_endpoint') or '')
+
+
+_SUPERSEDE_STALE_GAP_SECONDS = 120.0
+_SUPERSEDE_PROTECTED_MODES = frozenset({'playing', 'paused', 'viewing'})
+
+
+def _session_last_activity_epoch(session: dict) -> Optional[float]:
+    raw = str((session or {}).get('last_activity_date') or '').strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith('Z'):
+            raw = raw[:-1] + '+00:00'
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def _session_device_group_key(session: dict) -> Tuple[str, str, str]:
+    ip = parse_endpoint_ip(session.get('remote_endpoint') or '')
+    client = str(session.get('client') or '').strip().casefold()
+    device = str(session.get('device_name') or '').strip().casefold()
+    return ip, client, device
+
+
+def filter_superseded_wan_sessions(
+    sessions: list,
+    *,
+    stale_gap_seconds: float = _SUPERSEDE_STALE_GAP_SECONDS,
+) -> Tuple[List[dict], List[dict]]:
+    """同 IP+Client+DeviceName 下账户切换后，剔除活动明显落后的旧用户会话。
+
+    返回 (保留列表, 被剔除列表)；后者含 reason 字段供调试展示。
+    """
+    wan = [
+        s for s in (sessions or [])
+        if isinstance(s, dict) and is_wan_remote_session(s)
+    ]
+    if not wan:
+        return [], []
+
+    gap = max(30.0, float(stale_gap_seconds or _SUPERSEDE_STALE_GAP_SECONDS))
+    groups: Dict[Tuple[str, str, str], List[dict]] = {}
+    for session in wan:
+        key = _session_device_group_key(session)
+        if not key[0]:
+            groups.setdefault(('', '', ''), []).append(session)
+            continue
+        groups.setdefault(key, []).append(session)
+
+    kept: List[dict] = []
+    superseded: List[dict] = []
+
+    for members in groups.values():
+        if len(members) < 2:
+            kept.extend(members)
+            continue
+
+        user_ids = {
+            str(s.get('user_id') or '').strip()
+            for s in members
+        }
+        user_ids.discard('')
+        if len(user_ids) < 2:
+            kept.extend(members)
+            continue
+
+        ranked = sorted(
+            members,
+            key=lambda s: _session_last_activity_epoch(s) or 0.0,
+            reverse=True,
+        )
+        newest_epoch = _session_last_activity_epoch(ranked[0]) or 0.0
+
+        for session in members:
+            mode = str(session.get('session_mode') or '').strip()
+            if mode in _SUPERSEDE_PROTECTED_MODES:
+                kept.append(session)
+                continue
+            epoch = _session_last_activity_epoch(session) or 0.0
+            if newest_epoch > 0 and (newest_epoch - epoch) >= gap:
+                superseded.append({
+                    'session': session,
+                    'user_name': str(
+                        session.get('user_name')
+                        or session.get('UserName')
+                        or '',
+                    ).strip(),
+                    'user_id': str(
+                        session.get('user_id')
+                        or session.get('UserId')
+                        or '',
+                    ).strip(),
+                    'session_id': str(
+                        session.get('id')
+                        or session.get('session_id')
+                        or session.get('emby_session_id')
+                        or '',
+                    ).strip(),
+                    'ip': parse_endpoint_ip(session.get('remote_endpoint') or ''),
+                    'client': str(session.get('client') or '').strip(),
+                    'device_name': str(session.get('device_name') or '').strip(),
+                    'reason': '检测到账户切换，已排除旧会话',
+                    'activity_lag_seconds': int(max(0.0, newest_epoch - epoch)),
+                })
+            else:
+                kept.append(session)
+
+    return kept, superseded
 
 
 def _is_transcode_session(session: dict) -> bool:

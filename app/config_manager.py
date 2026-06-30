@@ -322,8 +322,20 @@ def resolve_emby_credentials(data: dict, existing: dict = None) -> dict:
         lucky_token = ''
     if lucky_token and target_name:
         secrets_store.set_lucky_open_token(target_name, lucky_token)
+    rule_key = str(result.get('lucky_rule_key', '') or '').strip()
+    if is_password_mask(rule_key):
+        rule_key = ''
+    if rule_key and target_name:
+        secrets_store.set_lucky_rule_key(target_name, rule_key)
+    sub_key = str(result.get('lucky_sub_key', '') or '').strip()
+    if is_password_mask(sub_key):
+        sub_key = ''
+    if sub_key and target_name:
+        secrets_store.set_lucky_sub_key(target_name, sub_key)
     result.pop('api_key', None)
     result.pop('lucky_open_token', None)
+    result.pop('lucky_rule_key', None)
+    result.pop('lucky_sub_key', None)
     return result
 
 
@@ -388,6 +400,8 @@ def _strip_secrets_from_config(config: dict) -> dict:
         inst.pop('password', None)
     for inst in result.get('emby_instances', []):
         inst.pop('api_key', None)
+        inst.pop('lucky_rule_key', None)
+        inst.pop('lucky_sub_key', None)
     return result
 
 
@@ -399,9 +413,12 @@ def enrich_instance(inst: dict) -> dict:
 
 
 def enrich_emby_instance(inst: dict) -> dict:
-    """为运行时连接注入 secrets 中的 Emby API Key"""
+    """为运行时连接注入 secrets 中的 Emby API Key 与 Lucky 规则 key"""
     result = copy.deepcopy(inst)
-    result['api_key'] = secrets_store.get_emby_api_key(inst.get('name', ''))
+    name = inst.get('name', '')
+    result['api_key'] = secrets_store.get_emby_api_key(name)
+    result['lucky_rule_key'] = secrets_store.get_lucky_rule_key(name)
+    result['lucky_sub_key'] = secrets_store.get_lucky_sub_key(name)
     return result
 
 
@@ -458,6 +475,20 @@ def migrate_plaintext_secrets(config: dict) -> tuple:
                 secrets_store.set_emby_api_key(name, api_key)
                 migrated = True
                 logger.info(f'已从 config.yaml 迁移 Emby API Key: {name}')
+        rule_key = inst.pop('lucky_rule_key', '') or ''
+        sub_key = inst.pop('lucky_sub_key', '') or ''
+        if rule_key and rule_key != '******':
+            name = inst.get('name', '')
+            if name:
+                secrets_store.set_lucky_rule_key(name, rule_key)
+                migrated = True
+                logger.info(f'已从 config.yaml 迁移 Lucky rule_key: {name}')
+        if sub_key and sub_key != '******':
+            name = inst.get('name', '')
+            if name:
+                secrets_store.set_lucky_sub_key(name, sub_key)
+                migrated = True
+                logger.info(f'已从 config.yaml 迁移 Lucky sub_key: {name}')
 
     result['global'] = global_cfg
     return result, migrated
@@ -1231,8 +1262,20 @@ def _validate_emby_instance(inst: dict, existing_names: list = None,
             raise ValueError('Docker 采集需填写容器名或容器 ID')
     result['lucky_base_url'] = normalize_lucky_base_url(result.get('lucky_base_url', ''))
     result['lucky_verify_ssl'] = bool(result.get('lucky_verify_ssl', False))
-    result['lucky_rule_key'] = str(result.get('lucky_rule_key', '') or '').strip()
-    result['lucky_sub_key'] = str(result.get('lucky_sub_key', '') or '').strip()
+    rule_key = str(result.get('lucky_rule_key', '') or '').strip()
+    if is_password_mask(rule_key):
+        rule_key = ''
+    if not rule_key:
+        rule_key = secrets_store.get_lucky_rule_key(result['name'])
+        if not rule_key and original_name:
+            rule_key = secrets_store.get_lucky_rule_key(original_name)
+    sub_key = str(result.get('lucky_sub_key', '') or '').strip()
+    if is_password_mask(sub_key):
+        sub_key = ''
+    if not sub_key:
+        sub_key = secrets_store.get_lucky_sub_key(result['name'])
+        if not sub_key and original_name:
+            sub_key = secrets_store.get_lucky_sub_key(original_name)
     result['lucky_rule_label'] = str(result.get('lucky_rule_label', '') or '').strip()
     result['lucky_frontend_host'] = str(
         result.get('lucky_frontend_host', '') or '',
@@ -1243,7 +1286,7 @@ def _validate_emby_instance(inst: dict, existing_names: list = None,
     if mode == 'lucky' and require_lucky:
         if not result['lucky_base_url']:
             raise ValueError('请填写 Lucky 管理地址')
-        if not result['lucky_rule_key'] or not result['lucky_sub_key']:
+        if not rule_key or not sub_key:
             raise ValueError('请选择 Lucky 反代规则')
         token_name = original_name or result['name']
         req_token = str(inst.get('lucky_open_token', '') or '').strip()
@@ -1259,7 +1302,8 @@ def _validate_emby_instance(inst: dict, existing_names: list = None,
     result['connection_timeout'] = INSTANCE_HTTP_TIMEOUT
     result['wan_traffic_only'] = bool(result.get('wan_traffic_only', True))
     for key in ('reachable', 'attempt_sync', 'apply_rules_now',
-                'lucky_open_token', 'clear_traffic_data'):
+                'lucky_open_token', 'lucky_rule_key', 'lucky_sub_key',
+                'clear_traffic_data'):
         result.pop(key, None)
     return result
 
@@ -1296,6 +1340,18 @@ def validate_emby_instance_for_test(inst: dict, test_type: str = 'connectivity')
         if name:
             lucky_token = secrets_store.get_lucky_open_token(name)
     result['lucky_open_token'] = lucky_token
+    rule_key = str(result.get('lucky_rule_key', '') or '').strip()
+    if not rule_key:
+        name = result.get('name', '')
+        if name:
+            rule_key = secrets_store.get_lucky_rule_key(name)
+    sub_key = str(result.get('lucky_sub_key', '') or '').strip()
+    if not sub_key:
+        name = result.get('name', '')
+        if name:
+            sub_key = secrets_store.get_lucky_sub_key(name)
+    result['lucky_rule_key'] = rule_key
+    result['lucky_sub_key'] = sub_key
     if test_type in ('lucky', 'lucky_rules'):
         if not result.get('lucky_base_url'):
             raise ValueError('请填写 Lucky 管理地址')
@@ -1325,6 +1381,12 @@ def mask_emby_instance_for_api(inst: dict) -> dict:
         result['has_lucky_open_token'] = True
     else:
         result['has_lucky_open_token'] = False
+    if secrets_store.has_lucky_rule_keys(result.get('name', '')):
+        result['has_lucky_rule_keys'] = True
+    else:
+        result['has_lucky_rule_keys'] = False
+    result.pop('lucky_rule_key', None)
+    result.pop('lucky_sub_key', None)
     mode = result.get('traffic_collect_mode') or ''
     result['estimate_upload_enabled'] = mode == 'docker'
     return result

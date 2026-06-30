@@ -38,6 +38,7 @@ _SCHEMA_COLUMNS = (
 EVENT_RETENTION_COUNT = 1000
 _VACUUM_INTERVAL_DAYS = 30
 _last_vacuum_day = None
+_vacuum_running = False
 _retention_years = 5
 RETENTION_YEARS_MIN = 1
 RETENTION_YEARS_MAX = 20
@@ -465,6 +466,93 @@ def get_today_bytes(instance_name: str, direction: str = 'upload') -> int:
             return int(row['total']) if row else 0
         finally:
             conn.close()
+
+
+def get_status_traffic_batch(instance_names: list, cycle_starts: dict) -> dict:
+    """单次加锁批量读取状态 API 所需流量字段。"""
+    names = [n for n in (instance_names or []) if n]
+    if not names:
+        return {}
+    today = now_local().strftime('%Y-%m-%d')
+    yesterday = (now_local() - timedelta(days=1)).strftime('%Y-%m-%d')
+    placeholders = ','.join('?' * len(names))
+    result = {
+        n: {
+            'cycle_upload': 0,
+            'cycle_download': 0,
+            'device_upload': 0,
+            'device_download': 0,
+            'today_upload': 0,
+            'today_download': 0,
+            'yesterday_upload': 0,
+            'yesterday_download': 0,
+            'data_start_time': None,
+        }
+        for n in names
+    }
+
+    with _lock:
+        conn = get_conn()
+        try:
+            c = conn.cursor()
+            for direction in ('upload', 'download'):
+                col = _bytes_column(direction)
+                suffix = direction
+                c.execute(f'''
+                    SELECT instance_name, COALESCE(SUM({col}), 0) AS total
+                    FROM traffic_hourly
+                    WHERE instance_name IN ({placeholders})
+                    GROUP BY instance_name
+                ''', names)
+                for row in c.fetchall():
+                    result[row['instance_name']][f'device_{suffix}'] = int(row['total'])
+
+                c.execute(f'''
+                    SELECT instance_name, COALESCE(SUM({col}), 0) AS total
+                    FROM traffic_hourly
+                    WHERE instance_name IN ({placeholders})
+                      AND DATE(hour_start) = ?
+                    GROUP BY instance_name
+                ''', (*names, today))
+                for row in c.fetchall():
+                    result[row['instance_name']][f'today_{suffix}'] = int(row['total'])
+
+                c.execute(f'''
+                    SELECT instance_name, COALESCE(SUM({col}), 0) AS total
+                    FROM traffic_hourly
+                    WHERE instance_name IN ({placeholders})
+                      AND DATE(hour_start) = ?
+                    GROUP BY instance_name
+                ''', (*names, yesterday))
+                for row in c.fetchall():
+                    result[row['instance_name']][f'yesterday_{suffix}'] = int(row['total'])
+
+            c.execute(f'''
+                SELECT instance_name, MIN(hour_start) AS start_time
+                FROM traffic_hourly
+                WHERE instance_name IN ({placeholders})
+                GROUP BY instance_name
+            ''', names)
+            for row in c.fetchall():
+                result[row['instance_name']]['data_start_time'] = row['start_time']
+
+            for name in names:
+                cycle_start = (cycle_starts or {}).get(name)
+                if not cycle_start:
+                    continue
+                start_str = _to_local_naive(cycle_start).strftime('%Y-%m-%d %H:%M:%S')
+                for direction in ('upload', 'download'):
+                    col = _bytes_column(direction)
+                    c.execute(f'''
+                        SELECT COALESCE(SUM({col}), 0) AS total
+                        FROM traffic_hourly
+                        WHERE instance_name = ? AND hour_start >= ?
+                    ''', (name, start_str))
+                    row = c.fetchone()
+                    result[name][f'cycle_{direction}'] = int(row['total']) if row else 0
+        finally:
+            conn.close()
+    return result
 
 
 def get_data_start_time(instance_name: str):
@@ -1321,6 +1409,36 @@ def set_last_applied_cycle_start(instance_name: str, cycle_start_key: str):
             conn.close()
 
 
+def try_begin_cycle_transition(instance_name: str,
+                               expected_prev_key,
+                               new_key: str) -> bool:
+    """原子 claim：仅当 last_applied_cycle_start 仍为 expected_prev_key 时写入 new_key。"""
+    with _lock:
+        conn = get_conn()
+        try:
+            c = conn.cursor()
+            if expected_prev_key is None:
+                c.execute('''
+                    INSERT INTO instance_status (instance_name, last_applied_cycle_start)
+                    VALUES (?, ?)
+                    ON CONFLICT(instance_name) DO UPDATE SET
+                        last_applied_cycle_start = excluded.last_applied_cycle_start
+                    WHERE last_applied_cycle_start IS NULL
+                       OR trim(last_applied_cycle_start) = ''
+                ''', (instance_name, new_key))
+            else:
+                c.execute('''
+                    UPDATE instance_status
+                    SET last_applied_cycle_start = ?
+                    WHERE instance_name = ?
+                      AND last_applied_cycle_start = ?
+                ''', (new_key, instance_name, expected_prev_key))
+            conn.commit()
+            return c.rowcount > 0
+        finally:
+            conn.close()
+
+
 def add_device_event(instance_name: str, event_type: str,
                      speed_limit_kbps: int = None, reason: str = None):
     with _lock:
@@ -1713,9 +1831,40 @@ def _format_datetime_seconds(value) -> str:
     return text or None
 
 
+def _run_vacuum_background():
+    """后台执行 incremental_vacuum，避免阻塞采集与 API。"""
+    global _vacuum_running
+    with _lock:
+        if _vacuum_running:
+            return
+        _vacuum_running = True
+
+    def _worker():
+        global _vacuum_running
+        try:
+            conn = get_conn()
+            try:
+                conn.execute('PRAGMA incremental_vacuum')
+                conn.commit()
+                logger.info('数据库 incremental_vacuum 完成')
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning('数据库 incremental_vacuum 失败: %s', e)
+        finally:
+            with _lock:
+                _vacuum_running = False
+
+    threading.Thread(
+        target=_worker, name='traffic-db-vacuum', daemon=True,
+    ).start()
+
+
 def cleanup_old_data():
     """清理过期数据并定期 VACUUM，防止数据库无限增长"""
     global _last_vacuum_day
+    schedule_vacuum = False
+    hourly_deleted = 0
     with _lock:
         conn = get_conn()
         try:
@@ -1742,11 +1891,12 @@ def cleanup_old_data():
             conn.commit()
 
             today = now_local().date()
-            if _last_vacuum_day != today and now_local().day % _VACUUM_INTERVAL_DAYS == 1:
-                c.execute('VACUUM')
-                conn.commit()
+            if (
+                _last_vacuum_day != today
+                and now_local().day % _VACUUM_INTERVAL_DAYS == 1
+            ):
                 _last_vacuum_day = today
-                logger.info('数据库 VACUUM 完成')
+                schedule_vacuum = True
 
             if hourly_deleted > 0:
                 logger.info(f"数据清理完成: 删除 {hourly_deleted} 条过期小时统计")
@@ -1754,3 +1904,6 @@ def cleanup_old_data():
             logger.warning(f"数据清理失败: {e}")
         finally:
             conn.close()
+
+    if schedule_vacuum:
+        _run_vacuum_background()

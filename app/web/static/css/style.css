@@ -2416,13 +2416,25 @@ html:not(.emby-feature-enabled) .chart-control--device-type {
 
 .emby-debug-lucky-score-badge {
     flex-shrink: 0;
+    margin-left: auto;
+    min-width: 2.75rem;
+    padding: 1px 6px;
+    border: none;
+    border-radius: 4px;
     font-size: 9px;
     font-weight: 700;
-    padding: 1px 4px;
-    border-radius: 4px;
+    font-family: inherit;
+    line-height: 1.35;
     color: #1d4ed8;
     background: #dbeafe;
     font-variant-numeric: tabular-nums;
+    text-align: center;
+    cursor: help;
+}
+
+.emby-debug-lucky-score-badge:focus-visible {
+    outline: 2px solid #93c5fd;
+    outline-offset: 1px;
 }
 
 .emby-debug-lucky-sticky-badge {
@@ -2638,8 +2650,16 @@ html:not(.emby-feature-enabled) .chart-control--device-type {
 .emby-debug-lucky-verdict-line {
     display: flex;
     align-items: center;
+    gap: 3px 5px;
+    min-width: 0;
+}
+
+.emby-debug-lucky-verdict-line-leading {
+    display: flex;
+    align-items: center;
     flex-wrap: wrap;
     gap: 3px 5px;
+    flex: 1 1 auto;
     min-width: 0;
 }
 
@@ -2913,6 +2933,13 @@ html:not(.emby-feature-enabled) .chart-control--device-type {
     transform: translateY(0);
 }
 
+.emby-debug-tip--lucky-score {
+    width: min(320px, calc(100vw - 16px));
+    max-width: min(320px, calc(100vw - 16px));
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 .emby-debug-tip-highlight {
     color: #86efac;
     font-weight: 700;
@@ -3021,8 +3048,16 @@ html:not(.emby-feature-enabled) .chart-control--device-type {
         align-items: center;
     }
 
-    .emby-debug-lucky-verdict-line {
+    .emby-debug-lucky-verdict-line-leading {
         flex-wrap: wrap;
+    }
+
+    .emby-debug-lucky-score-badge {
+        margin-left: auto;
+    }
+
+    .emby-debug-lucky-verdict-line {
+        flex-wrap: nowrap;
     }
 
     .emby-debug-lucky-ip-label {

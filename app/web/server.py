@@ -3,6 +3,7 @@ from flask_cors import CORS
 import logging
 import sys
 import os
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -27,8 +28,16 @@ from emby_client import EmbyClient, is_playback_browse_server_log_message, parse
 
 logger = logging.getLogger(__name__)
 
+_GENERIC_API_ERROR = '服务器内部错误，请稍后重试'
+
 app = Flask(__name__)
-CORS(app, supports_credentials=True)
+_cors_origins = os.environ.get('CORS_ORIGINS', '').strip()
+if _cors_origins:
+    CORS(
+        app,
+        supports_credentials=True,
+        origins=[item.strip() for item in _cors_origins.split(',') if item.strip()],
+    )
 
 @app.after_request
 def add_no_cache_headers(response):
@@ -108,7 +117,7 @@ def api_auth_login():
         return jsonify({'success': True, 'username': username})
     except Exception as e:
         logger.error(f"API /auth/login 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/auth/logout', methods=['POST'])
@@ -137,7 +146,7 @@ def api_status():
         })
     except Exception as e:
         logger.error(f"API /status 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/status/live')
@@ -151,7 +160,7 @@ def api_status_live():
         })
     except Exception as e:
         logger.error(f"API /status/live 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/stats/<instance_name>/<period>')
@@ -227,7 +236,7 @@ def api_stats(instance_name, period):
         })
     except Exception as e:
         logger.error(f"API /stats 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/events')
@@ -239,7 +248,7 @@ def api_events():
         return jsonify({'success': True, 'data': events})
     except Exception as e:
         logger.error(f"API /events 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/system-logs')
@@ -253,7 +262,7 @@ def api_system_logs():
         return jsonify({'success': True, 'data': logs})
     except Exception as e:
         logger.error(f"API /system-logs 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/control/limit', methods=['POST'])
@@ -280,7 +289,7 @@ def api_control_limit():
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f"API /control/limit 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/control/speed-limits-mode', methods=['POST'])
@@ -309,7 +318,7 @@ def api_control_speed_limits_mode():
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f"API /control/speed-limits-mode 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/control/reset', methods=['POST'])
@@ -329,14 +338,18 @@ def api_control_reset():
                     'success': False,
                     'error': '该设备已禁用程序手动解除限速'
                 }), 400
-        monitor.manual_reset(instance_name)
+        if not monitor.manual_reset(instance_name):
+            return jsonify({
+                'success': False,
+                'error': '解除限速失败，请检查 qBittorrent 连接状态',
+            }), 500
         return jsonify({
             'success': True,
-            'message': '解除成功'
+            'message': '解除成功',
         })
     except Exception as e:
         logger.error(f"API /control/reset 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/control/reset-stats', methods=['POST'])
@@ -356,7 +369,7 @@ def api_control_reset_stats():
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f"API /control/reset-stats 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/instances')
@@ -366,7 +379,7 @@ def api_instances():
         return jsonify({'success': True, 'data': names})
     except Exception as e:
         logger.error(f"API /instances 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/config')
@@ -389,7 +402,7 @@ def api_config():
         })
     except Exception as e:
         logger.error(f"API /config 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/config/instances', methods=['GET'])
@@ -400,7 +413,7 @@ def api_config_instances_list():
         return jsonify({'success': True, 'data': masked})
     except Exception as e:
         logger.error(f"API GET /config/instances 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/config/instances/<name>', methods=['GET'])
@@ -415,7 +428,7 @@ def api_config_instance_get(name):
         })
     except Exception as e:
         logger.error(f"API GET /config/instances/{name} 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 def _defer_instance_sync(instance_name: str) -> None:
@@ -587,7 +600,7 @@ def api_config_instance_orphan_check():
         })
     except Exception as e:
         logger.error(f"API GET /config/instances/orphan-check 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/config/instances/orphan-data', methods=['GET'])
@@ -598,7 +611,7 @@ def api_config_instance_orphan_data():
         return _no_cache_json({'success': True, 'data': orphans})
     except Exception as e:
         logger.error(f"API GET /config/instances/orphan-data 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/config/instances/orphan-data/<name>', methods=['DELETE'])
@@ -617,7 +630,7 @@ def api_config_instance_orphan_data_delete(name):
             f"API DELETE /config/instances/orphan-data/{name} 错误: {e}",
             exc_info=True,
         )
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/config/instances/test', methods=['POST'])
@@ -658,7 +671,7 @@ def api_config_instance_test():
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f"API POST /config/instances/test 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/config/instances', methods=['POST'])
@@ -705,7 +718,7 @@ def api_config_instance_add():
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f"API POST /config/instances 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/config/instances/<name>', methods=['PUT'])
@@ -775,7 +788,7 @@ def api_config_instance_update(name):
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f"API PUT /config/instances/{name} 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/config/instances/<name>', methods=['DELETE'])
@@ -812,7 +825,7 @@ def api_config_instance_delete(name):
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f"API DELETE /config/instances/{name} 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/config/global', methods=['GET'])
@@ -825,7 +838,7 @@ def api_config_global_get():
         return jsonify({'success': True, 'data': global_cfg})
     except Exception as e:
         logger.error(f"API GET /config/global 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/config/global', methods=['PUT'])
@@ -857,7 +870,7 @@ def api_config_global_update():
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f"API PUT /config/global 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 # ── 用户界面偏好 ────────────────────────────────────────────
@@ -875,7 +888,7 @@ def api_user_device_prefs_get():
         })
     except Exception as e:
         logger.error(f"API GET /user/prefs/devices 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/user/prefs/devices', methods=['PUT'])
@@ -894,7 +907,7 @@ def api_user_device_prefs_update():
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f"API PUT /user/prefs/devices 错误: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 # ── Emby（只读展示）────────────────────────────────────────
@@ -967,7 +980,7 @@ def api_emby_status():
         })
     except Exception as e:
         logger.error(f'API /emby/status 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/status/live')
@@ -983,7 +996,7 @@ def api_emby_status_live():
         })
     except Exception as e:
         logger.error(f'API /emby/status/live 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/traffic-verify')
@@ -1000,7 +1013,7 @@ def api_emby_traffic_verify():
         })
     except Exception as e:
         logger.error(f'API /emby/traffic-verify 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/traffic-verify/reset', methods=['POST'])
@@ -1017,7 +1030,7 @@ def api_emby_traffic_verify_reset():
         return jsonify({'success': True, 'message': f'已重置 {instance_name} 在线验算累计'})
     except Exception as e:
         logger.error(f'API POST /emby/traffic-verify/reset 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/debug-traffic-config')
@@ -1033,7 +1046,7 @@ def api_emby_debug_traffic_config_get():
         })
     except Exception as e:
         logger.error(f'API GET /emby/debug-traffic-config 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/debug-traffic-config', methods=['PUT'])
@@ -1084,7 +1097,7 @@ def api_emby_debug_traffic_config_update():
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f'API PUT /emby/debug-traffic-config 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/sessions')
@@ -1109,7 +1122,7 @@ def api_emby_sessions():
         return jsonify({'success': True, 'data': rows})
     except Exception as e:
         logger.error(f'API /emby/sessions 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/stats/<instance_name>/<period>')
@@ -1164,7 +1177,7 @@ def api_emby_stats(instance_name, period):
         return jsonify({'success': True, 'data': data})
     except Exception as e:
         logger.error(f'API /emby/stats 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/playback-records')
@@ -1186,7 +1199,7 @@ def api_emby_playback_records():
         return jsonify({'success': True, 'data': records})
     except Exception as e:
         logger.error(f'API /emby/playback-records 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/browse-records')
@@ -1217,7 +1230,7 @@ def api_emby_browse_records():
         })
     except Exception as e:
         logger.error(f'API /emby/browse-records 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/activity-log')
@@ -1237,10 +1250,15 @@ def api_emby_activity_log():
         client = EmbyClient(inst)
         sessions = client.get_sessions() or []
         item_cache = {}
+        item_fetch_state = {'count': 0}
+        deadline = time.monotonic() + 20.0
         events = []
         for entry in client.get_activity_log(limit=limit):
             enrichment = EmbyClient.enrich_activity_entry(
                 client, entry, item_cache, sessions,
+                max_item_fetches=48,
+                item_fetch_state=item_fetch_state,
+                deadline_mono=deadline,
             )
             events.append(EmbyClient.normalize_activity_entry(
                 entry, instance_name, enrichment,
@@ -1248,7 +1266,7 @@ def api_emby_activity_log():
         return jsonify({'success': True, 'data': events})
     except Exception as e:
         logger.error(f'API /emby/activity-log 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/playback-users')
@@ -1266,7 +1284,7 @@ def api_emby_playback_users():
         return jsonify({'success': True, 'data': users})
     except Exception as e:
         logger.error(f'API /emby/playback-users 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/playback-stats/<instance_name>/<period>')
@@ -1387,7 +1405,7 @@ def api_emby_playback_stats(instance_name, period):
         return jsonify({'success': True, 'data': data})
     except Exception as e:
         logger.error(f'API /emby/playback-stats 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/system-logs/files')
@@ -1417,7 +1435,7 @@ def api_emby_system_log_files():
         return jsonify({'success': True, 'data': files})
     except Exception as e:
         logger.error(f'API /emby/system-logs/files 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/system-logs')
@@ -1467,7 +1485,7 @@ def api_emby_system_logs():
         return jsonify({'success': True, 'data': lines[:limit]})
     except Exception as e:
         logger.error(f'API /emby/system-logs 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/config/instances', methods=['GET'])
@@ -1481,7 +1499,7 @@ def api_emby_config_instances_list():
         return jsonify({'success': True, 'data': instances})
     except Exception as e:
         logger.error(f'API GET /emby/config/instances 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/config/instances/<name>', methods=['GET'])
@@ -1497,7 +1515,7 @@ def api_emby_config_instance_get(name):
         })
     except Exception as e:
         logger.error(f'API GET /emby/config/instances/{name} 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/config/instances/orphan-check', methods=['GET'])
@@ -1520,7 +1538,7 @@ def api_emby_config_instance_orphan_check():
         })
     except Exception as e:
         logger.error(f'API GET /emby/config/instances/orphan-check 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/config/instances/orphan-data', methods=['GET'])
@@ -1534,7 +1552,7 @@ def api_emby_config_instance_orphan_data():
         return _no_cache_json({'success': True, 'data': orphans})
     except Exception as e:
         logger.error(f'API GET /emby/config/instances/orphan-data 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/config/instances/orphan-data/<name>', methods=['DELETE'])
@@ -1557,7 +1575,7 @@ def api_emby_config_instance_orphan_data_delete(name):
             f'API DELETE /emby/config/instances/orphan-data/{name} 错误: {e}',
             exc_info=True,
         )
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/config/instances/test', methods=['POST'])
@@ -1633,7 +1651,7 @@ def api_emby_config_instances_test():
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f'API POST /emby/config/instances/test 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/config/instances', methods=['POST'])
@@ -1669,7 +1687,7 @@ def api_emby_config_instances_add():
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f'API POST /emby/config/instances 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/config/instances/<name>', methods=['PUT'])
@@ -1716,7 +1734,7 @@ def api_emby_config_instances_update(name):
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f'API PUT /emby/config/instances/{name} 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/control/reset-stats', methods=['POST'])
@@ -1741,7 +1759,7 @@ def api_emby_control_reset_stats():
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f'API /emby/control/reset-stats 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 def _get_emby_client(instance_name: str):
@@ -1780,7 +1798,7 @@ def api_emby_session_playing_command(instance_name, session_id, command):
             f'API /emby/sessions/{instance_name}/{session_id}/playing/{command} 错误: {e}',
             exc_info=True,
         )
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/sessions/<path:instance_name>/<session_id>/message', methods=['POST'])
@@ -1813,7 +1831,7 @@ def api_emby_session_message(instance_name, session_id):
             f'API /emby/sessions/{instance_name}/{session_id}/message 错误: {e}',
             exc_info=True,
         )
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 @app.route('/api/emby/config/instances/<name>', methods=['DELETE'])
@@ -1845,7 +1863,7 @@ def api_emby_config_instances_delete(name):
         return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
         logger.error(f'API DELETE /emby/config/instances/{name} 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 
 def run_web_server(host='0.0.0.0', port=8765):

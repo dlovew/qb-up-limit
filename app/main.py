@@ -1,5 +1,6 @@
 import os
 import sys
+import signal
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -32,13 +33,48 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import traffic_db
 import emby_traffic_db
+import playback_record_store
 from scheduler import TrafficMonitor
 from emby_scheduler import EmbyMonitor
 from web.server import init_web_server, run_web_server
 import config_manager
 
+_runtime = {}
+
+
+def _graceful_shutdown(signum=None, frame=None):
+    if _runtime.get('shutting_down'):
+        return
+    _runtime['shutting_down'] = True
+    sig_name = signal.Signals(signum).name if signum else 'EXIT'
+    logger.info('收到 %s 信号，正在优雅关闭服务...', sig_name)
+
+    monitor = _runtime.get('monitor')
+    emby_monitor = _runtime.get('emby_monitor')
+    if monitor:
+        try:
+            monitor.stop()
+        except Exception as e:
+            logger.warning('关闭 qB 监控失败: %s', e)
+    if emby_monitor:
+        try:
+            emby_monitor.stop()
+        except Exception as e:
+            logger.warning('关闭 Emby 监控失败: %s', e)
+
+    try:
+        playback_record_store.flush_all_pending()
+    except Exception as e:
+        logger.warning('刷新播放记录缓存失败: %s', e)
+
+    logger.info('服务已关闭')
+    sys.exit(0)
+
 
 def main():
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+
     logger.info("=" * 60)
     logger.info("qB-达量限速管理 qb-up-limit 启动中...")
     logger.info("=" * 60)
@@ -47,16 +83,25 @@ def main():
     runtime_config = config_manager.enrich_config(config)
 
     global_cfg = config_manager.get_global_config(config)
-    traffic_db.set_retention_years(global_cfg.get('data_retention_years', 5))
+    retention_years = global_cfg.get('data_retention_years', 5)
+    traffic_db.set_retention_years(retention_years)
+    emby_traffic_db.set_retention_years(retention_years)
     traffic_db.init_db()
     emby_traffic_db.init_db()
-    logger.info("数据库初始化完成")
+    logger.info(
+        "数据库初始化完成 (qB: %s, Emby: %s)",
+        traffic_db.DB_PATH,
+        emby_traffic_db.DB_PATH,
+    )
 
     monitor = TrafficMonitor(runtime_config, config_path=config_manager.CONFIG_PATH)
     monitor.start()
 
     emby_monitor = EmbyMonitor(runtime_config, config_path=config_manager.CONFIG_PATH)
     emby_monitor.start()
+
+    _runtime['monitor'] = monitor
+    _runtime['emby_monitor'] = emby_monitor
 
     init_web_server(monitor, emby_monitor)
 

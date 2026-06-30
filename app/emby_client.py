@@ -1029,7 +1029,9 @@ class EmbyClient:
 
     @staticmethod
     def _enrich_from_api_item(client: 'EmbyClient', entry: dict,
-                              item_cache: dict, parsed: dict) -> Optional[dict]:
+                              item_cache: dict, parsed: dict, *,
+                              max_item_fetches: int = None,
+                              item_fetch_state: dict = None) -> Optional[dict]:
         """高版本 Emby：活动日志带 ItemId/Item，直接查媒体详情，不走库内搜索。"""
         embedded = EmbyClient.entry_embedded_item(entry)
         if embedded:
@@ -1043,8 +1045,20 @@ class EmbyClient:
 
         cache_key = ('item', item_id)
         if cache_key not in item_cache:
-            user_id = entry.get('UserId') or ''
-            item_cache[cache_key] = client.get_item(item_id, user_id)
+            fetch_limited = (
+                max_item_fetches is not None
+                and item_fetch_state is not None
+                and int(item_fetch_state.get('count') or 0) >= max_item_fetches
+            )
+            if fetch_limited:
+                item_cache[cache_key] = None
+            else:
+                user_id = entry.get('UserId') or ''
+                item_cache[cache_key] = client.get_item(item_id, user_id)
+                if item_fetch_state is not None:
+                    item_fetch_state['count'] = int(
+                        item_fetch_state.get('count') or 0,
+                    ) + 1
         item = item_cache.get(cache_key)
         if item:
             return EmbyClient._merge_playback_meta(
@@ -1105,15 +1119,26 @@ class EmbyClient:
     @staticmethod
     def enrich_activity_entry(client: 'EmbyClient', entry: dict,
                               item_cache: dict,
-                              sessions: List[dict] = None) -> dict:
+                              sessions: List[dict] = None, *,
+                              max_item_fetches: int = None,
+                              item_fetch_state: dict = None,
+                              deadline_mono: float = None) -> dict:
+        if deadline_mono is not None:
+            import time
+            if time.monotonic() > deadline_mono:
+                return {}
         event_type = entry.get('Type') or ''
         if event_type not in PLAYBACK_EVENT_TYPES:
             return {}
         parsed = EmbyClient.parse_playback_activity_name(entry.get('Name') or '')
 
+        enrich_kwargs = {
+            'max_item_fetches': max_item_fetches,
+            'item_fetch_state': item_fetch_state,
+        }
         if EmbyClient.entry_item_id(entry) or EmbyClient.entry_embedded_item(entry):
             result = EmbyClient._enrich_from_api_item(
-                client, entry, item_cache, parsed,
+                client, entry, item_cache, parsed, **enrich_kwargs,
             )
         else:
             result = EmbyClient._enrich_from_activity_text(entry, parsed)

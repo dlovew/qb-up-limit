@@ -35,6 +35,8 @@ let persistRefreshInterval = 5;
 let countdownTimer = null;
 let secondsUntilRefresh = 5;
 let liveRefreshFallbackTicks = 0;
+let liveRefreshInFlight = false;
+let statusRefreshInFlight = false;
 const LIVE_REFRESH_FALLBACK_FACTOR = 2;
 let lastCollectGenerations = {};
 let lastStateGenerations = {};
@@ -832,23 +834,37 @@ function startRefreshCountdown() {
         let didRefresh = false;
 
         if (secondsUntilRefresh <= 0) {
-            if (badgeEl) {
-                badgeEl.classList.add('refreshing');
-                badgeEl.classList.remove('urgent');
+            if (!liveRefreshInFlight) {
+                liveRefreshInFlight = true;
+                if (badgeEl) {
+                    badgeEl.classList.add('refreshing');
+                    badgeEl.classList.remove('urgent');
+                }
+                try {
+                    await refreshLiveMetrics(true);
+                    secondsUntilRefresh = autoRefreshInterval;
+                } finally {
+                    liveRefreshInFlight = false;
+                }
+                didRefresh = true;
             }
-            await refreshLiveMetrics(true);
-            secondsUntilRefresh = autoRefreshInterval;
-            didRefresh = true;
         }
 
         if (liveRefreshFallbackTicks >= persistRefreshInterval * LIVE_REFRESH_FALLBACK_FACTOR) {
-            if (badgeEl) {
-                badgeEl.classList.add('refreshing');
-                badgeEl.classList.remove('urgent');
+            if (!statusRefreshInFlight) {
+                statusRefreshInFlight = true;
+                if (badgeEl) {
+                    badgeEl.classList.add('refreshing');
+                    badgeEl.classList.remove('urgent');
+                }
+                try {
+                    await refreshStatus(false, true);
+                    liveRefreshFallbackTicks = 0;
+                } finally {
+                    statusRefreshInFlight = false;
+                }
+                didRefresh = true;
             }
-            await refreshStatus(false, true);
-            liveRefreshFallbackTicks = 0;
-            didRefresh = true;
         }
 
         if (!didRefresh) {
@@ -3331,6 +3347,8 @@ function populateChartInstanceSelect(instances, platform = getChartPlatform()) {
 }
 
 let _chartPlaybackUsersSeq = 0;
+let _chartUpdateSeq = 0;
+let _eventsLoadSeq = 0;
 let _chartPlaybackUsersReady = false;
 
 function getChartPlaybackUserSelection() {
@@ -5885,6 +5903,8 @@ function setupChartHScrollRailInteraction(scrollWrap) {
     setupChartDragScroll(scrollWrap, mainCol);
 }
 
+let chartDragScrollCleanup = null;
+
 function setupChartDragScroll(scrollWrap, mainCol) {
     if (scrollWrap.dataset.dragScrollReady) return;
     scrollWrap.dataset.dragScrollReady = '1';
@@ -5907,7 +5927,7 @@ function setupChartDragScroll(scrollWrap, mainCol) {
         startScrollLeft = scrollWrap.scrollLeft;
     }, true);
 
-    document.addEventListener('mousemove', (e) => {
+    const onMouseMove = (e) => {
         if (!pending && !dragging) return;
 
         if (pending && !dragging) {
@@ -5924,7 +5944,7 @@ function setupChartDragScroll(scrollWrap, mainCol) {
         scrollWrap.scrollLeft = startScrollLeft - (e.clientX - startX);
         syncChartHScrollRail(scrollWrap);
         engageChartHScrollRail(mainCol);
-    }, true);
+    };
 
     const stopDrag = () => {
         pending = false;
@@ -5934,10 +5954,22 @@ function setupChartDragScroll(scrollWrap, mainCol) {
         }
     };
 
+    document.addEventListener('mousemove', onMouseMove, true);
     document.addEventListener('mouseup', stopDrag);
+
+    if (chartDragScrollCleanup) chartDragScrollCleanup();
+    chartDragScrollCleanup = () => {
+        document.removeEventListener('mousemove', onMouseMove, true);
+        document.removeEventListener('mouseup', stopDrag);
+        delete scrollWrap.dataset.dragScrollReady;
+        chartDragScrollCleanup = null;
+    };
 }
 
 function teardownChartScrollLayout() {
+    if (chartDragScrollCleanup) {
+        chartDragScrollCleanup();
+    }
     if (chartWheelZoomCleanup) {
         chartWheelZoomCleanup();
         chartWheelZoomCleanup = null;
@@ -6449,6 +6481,7 @@ function normalizePlaybackStatsPayload(rows, period, playbackUser) {
 
 async function updateChart(silent = false) {
     if (chartFullscreenActive) return;
+    const requestId = ++_chartUpdateSeq;
     ensureChartQueryRangeReady();
     const platform = getChartPlatform();
     const instance = document.getElementById('chartInstance')?.value || '';
@@ -6501,6 +6534,7 @@ async function updateChart(silent = false) {
         );
         const ok = results.filter(Boolean);
         if (!ok.length) return;
+        if (requestId !== _chartUpdateSeq) return;
 
         let uploadData = isAllDevices
             ? aggregateChartStatsRows(ok.map(r => r.uploadData), period)
@@ -6528,6 +6562,7 @@ async function updateChart(silent = false) {
             platform,
             playbackUser: playbackUser || null,
         };
+        if (requestId !== _chartUpdateSeq) return;
         renderChart(uploadData, downloadData, period, instance, !silent);
     } catch (e) {
         if (!silent) {
@@ -7187,11 +7222,14 @@ async function loadEvents(silent = false) {
         if (container) container.innerHTML = '<div class="empty-tip">暂无设备</div>';
         return;
     }
+    const requestId = ++_eventsLoadSeq;
     try {
         const params = new URLSearchParams({ limit: '500', instance });
         const res = await axios.get(`/api/events?${params}`);
+        if (requestId !== _eventsLoadSeq) return;
         if (res.data.success) renderEvents(res.data.data);
     } catch (e) {
+        if (requestId !== _eventsLoadSeq) return;
         if (!silent) {
             showToast('事件日志加载失败', 'error');
         }
@@ -7217,18 +7255,22 @@ function renderEvents(events) {
         device_online: '🟢 设备上线',
         device_offline: '🔴 设备离线',
     };
-    container.innerHTML = events.map(e => `
-        <div class="event-item ${e.event_type}">
+    container.innerHTML = events.map(e => {
+        const typeLabel = typeMap[e.event_type] || escapeHtml(e.event_type);
+        const typeClass = typeMap[e.event_type] ? e.event_type : 'unknown';
+        return `
+        <div class="event-item ${typeClass}">
             <div class="event-time">${new Date(e.event_time).toLocaleString('zh-CN')}</div>
             <div class="event-type">
-                ${typeMap[e.event_type] || e.event_type}
+                ${typeLabel}
                 &nbsp;·&nbsp; <b>${escapeHtml(e.instance_name)}</b>
                 ${e.speed_limit_kbps != null
                     ? `&nbsp;·&nbsp; ${e.speed_limit_kbps > 0 ? e.speed_limit_kbps + ' KB/s' : '不限速'}`
                     : ''}
             </div>
             ${e.reason ? `<div class="event-reason">${escapeHtml(e.reason)}</div>` : ''}
-        </div>`).join('');
+        </div>`;
+    }).join('');
 }
 
 async function loadSystemLogs(silent = false) {
@@ -8206,7 +8248,7 @@ function showTestResult(data, prefix, testType) {
     const stepHtml = (data.steps || []).map(s => `
         <div class="test-step ${s.ok ? 'ok' : 'fail'}">
             <span class="test-step-icon">${s.ok ? '✔' : '✗'}</span>
-            <span class="test-step-label">${STEP_LABELS[s.step] || s.step}</span>
+            <span class="test-step-label">${escapeHtml(STEP_LABELS[s.step] || s.step)}</span>
             <span class="test-step-msg">${escapeHtml(s.message)}</span>
         </div>`).join('');
 

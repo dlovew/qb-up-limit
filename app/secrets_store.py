@@ -212,11 +212,10 @@ def rename_emby_api_key(old_name: str, new_name: str) -> None:
         return
     with _lock:
         secrets = _load_emby_secrets()
-        if old_name not in secrets:
-            return
-        secrets[new_name] = secrets.pop(old_name)
-        _save_emby_secrets(secrets)
-        rename_lucky_open_token(old_name, new_name)
+        if old_name in secrets:
+            secrets[new_name] = secrets.pop(old_name)
+            _save_emby_secrets(secrets)
+    rename_lucky_open_token(old_name, new_name)
 
 
 def _load_lucky_secrets() -> dict:
@@ -250,6 +249,7 @@ def set_lucky_open_token(instance_name: str, open_token: str) -> None:
 
 def delete_lucky_open_token(instance_name: str) -> None:
     set_lucky_open_token(instance_name, '')
+    delete_lucky_rule_keys(instance_name)
 
 
 def has_lucky_open_token(instance_name: str) -> bool:
@@ -261,7 +261,82 @@ def rename_lucky_open_token(old_name: str, new_name: str) -> None:
         return
     with _lock:
         secrets = _load_lucky_secrets()
-        if old_name not in secrets:
-            return
-        secrets[new_name] = secrets.pop(old_name)
+        changed = False
+        if old_name in secrets:
+            secrets[new_name] = secrets.pop(old_name)
+            changed = True
+        for field in ('rule_key', 'sub_key'):
+            old_key = _lucky_field_key(old_name, field)
+            new_key = _lucky_field_key(new_name, field)
+            if old_key in secrets:
+                secrets[new_key] = secrets.pop(old_key)
+                changed = True
+        if changed:
+            _save_lucky_secrets(secrets)
+
+
+def _lucky_field_key(instance_name: str, field: str) -> str:
+    return f'{instance_name}::{field}'
+
+
+def get_lucky_rule_key(instance_name: str) -> str:
+    if not instance_name:
+        return ''
+    token = _load_lucky_secrets().get(_lucky_field_key(instance_name, 'rule_key'))
+    if not token:
+        return ''
+    return decrypt_value(token)
+
+
+def get_lucky_sub_key(instance_name: str) -> str:
+    if not instance_name:
+        return ''
+    token = _load_lucky_secrets().get(_lucky_field_key(instance_name, 'sub_key'))
+    if not token:
+        return ''
+    return decrypt_value(token)
+
+
+def set_lucky_rule_key(instance_name: str, rule_key: str) -> None:
+    if not instance_name:
+        return
+    with _lock:
+        secrets = _load_lucky_secrets()
+        field_key = _lucky_field_key(instance_name, 'rule_key')
+        if rule_key:
+            secrets[field_key] = encrypt_value(rule_key)
+        else:
+            secrets.pop(field_key, None)
         _save_lucky_secrets(secrets)
+
+
+def set_lucky_sub_key(instance_name: str, sub_key: str) -> None:
+    if not instance_name:
+        return
+    with _lock:
+        secrets = _load_lucky_secrets()
+        field_key = _lucky_field_key(instance_name, 'sub_key')
+        if sub_key:
+            secrets[field_key] = encrypt_value(sub_key)
+        else:
+            secrets.pop(field_key, None)
+        _save_lucky_secrets(secrets)
+
+
+def delete_lucky_rule_keys(instance_name: str) -> None:
+    if not instance_name:
+        return
+    with _lock:
+        secrets = _load_lucky_secrets()
+        changed = False
+        for field in ('rule_key', 'sub_key'):
+            field_key = _lucky_field_key(instance_name, field)
+            if field_key in secrets:
+                secrets.pop(field_key, None)
+                changed = True
+        if changed:
+            _save_lucky_secrets(secrets)
+
+
+def has_lucky_rule_keys(instance_name: str) -> bool:
+    return bool(get_lucky_rule_key(instance_name) and get_lucky_sub_key(instance_name))

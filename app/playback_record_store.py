@@ -22,9 +22,12 @@ logger = logging.getLogger(__name__)
 MAX_STORED_RECORDS = 500
 OFFLINE_TIMEOUT_SECONDS = 5 * 60
 STOP_GRACE_SECONDS = 5
+_SAVE_DEBOUNCE_SECONDS = 2.0
 
 _lock = threading.RLock()
 _runtime: Dict[str, dict] = {}
+_pending_stores: Dict[str, dict] = {}
+_flush_timers: Dict[str, threading.Timer] = {}
 
 _PLAYBACK_STATUSES = frozenset({'playing', 'ended', 'incomplete'})
 
@@ -125,6 +128,7 @@ def _parse_iso(s: str) -> Optional[datetime]:
 
 
 def _load_store(instance_name: str) -> dict:
+    flush_pending_store(instance_name)
     _ensure_migrated(instance_name)
     path = _store_path(instance_name)
     default = {
@@ -144,12 +148,67 @@ def _load_store(instance_name: str) -> dict:
     return data
 
 
-def _save_store(store: dict) -> None:
+def _write_store_now(store: dict) -> None:
     path = _store_path(store.get('instance_name') or '')
     os.makedirs(os.path.dirname(path), exist_ok=True)
     records = store.get('records') or []
     store['records'] = records[:MAX_STORED_RECORDS]
     _write_json(path, store)
+
+
+def _cancel_flush_timer(instance_name: str) -> None:
+    timer = _flush_timers.pop(instance_name, None)
+    if timer is not None:
+        timer.cancel()
+
+
+def _schedule_flush(instance_name: str) -> None:
+    _cancel_flush_timer(instance_name)
+
+    def _run():
+        with _lock:
+            store = _pending_stores.pop(instance_name, None)
+            _flush_timers.pop(instance_name, None)
+        if store:
+            _write_store_now(store)
+
+    timer = threading.Timer(_SAVE_DEBOUNCE_SECONDS, _run)
+    timer.daemon = True
+    _flush_timers[instance_name] = timer
+    timer.start()
+
+
+def flush_pending_store(instance_name: str) -> None:
+    name = (instance_name or '').strip()
+    if not name:
+        return
+    with _lock:
+        _cancel_flush_timer(name)
+        store = _pending_stores.pop(name, None)
+    if store:
+        _write_store_now(store)
+
+
+def flush_all_pending() -> None:
+    with _lock:
+        names = list(_pending_stores.keys())
+    for name in names:
+        flush_pending_store(name)
+
+
+def _save_store(store: dict, *, immediate: bool = False) -> None:
+    name = (store.get('instance_name') or '').strip()
+    if not name:
+        return
+    if immediate:
+        with _lock:
+            _cancel_flush_timer(name)
+            _pending_stores.pop(name, None)
+        _write_store_now(store)
+        return
+    with _lock:
+        _pending_stores[name] = store
+    _schedule_flush(name)
 
 
 def _runtime_bucket(instance_name: str) -> dict:
@@ -716,7 +775,7 @@ def checkpoint_stopped_session_upload(instance_name: str, session: dict) -> bool
         prev = max(0, int(record.get('estimated_upload_bytes') or 0))
         record['estimated_upload_bytes'] = prev + taken
         record['live_upload_checkpoint_bytes'] = int(record['estimated_upload_bytes'])
-        _save_store(store)
+        _save_store(store, immediate=True)
         logger.info(
             f'[Playback:{name}] 停止播放刷入上行 checkpoint='
             f'{taken} total={record["estimated_upload_bytes"]}',
@@ -760,13 +819,14 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
     with _lock:
         store = _load_store(instance_name)
         changed = False
+        needs_immediate_save = False
         bucket = _runtime_bucket(instance_name)
 
         if not api_online:
             bucket['was_api_online'] = False
             if _handle_offline(instance_name, store, now_mono):
                 changed = True
-                _save_store(store)
+                _save_store(store, immediate=True)
             return _wrap_return(changed, store)
 
         if not bucket.get('was_api_online', True):
@@ -793,6 +853,7 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
                         settle_reason='item_change',
                     )
                     changed = True
+                    needs_immediate_save = True
                     record = None
             if record is None:
                 record = _new_record(instance_name, store, prepared)
@@ -811,6 +872,7 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
                     record = _new_record(instance_name, store, prepared)
                     store.setdefault('records', []).insert(0, record)
                     changed = True
+                    needs_immediate_save = True
                 else:
                     _apply_session_meta(record, prepared)
                     snap = emby_watch_progress.update_for_record(
@@ -867,6 +929,8 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
             )
             if outcome in ('updated', 'finalized'):
                 changed = True
+                if outcome == 'finalized':
+                    needs_immediate_save = True
 
         if changed:
             records = store.get('records') or []
@@ -874,7 +938,7 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
             others = [r for r in records if r.get('status') != 'playing']
             others.sort(key=_ended_record_sort_key, reverse=True)
             store['records'] = (playing + others)[:MAX_STORED_RECORDS]
-            _save_store(store)
+            _save_store(store, immediate=needs_immediate_save)
         return _wrap_return(changed, store)
 
 
@@ -936,7 +1000,7 @@ def rename_instance_records(old_name: str, new_name: str) -> None:
         store['instance_name'] = new_name
         for record in store.get('records') or []:
             record['instance_name'] = new_name
-        _save_store(store)
+        _save_store(store, immediate=True)
         if old_path != _store_path(new_name):
             try:
                 os.remove(old_path)

@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 from emby_lucky import parse_accept_time_epoch
 from emby_traffic_filter import (
+    filter_superseded_wan_sessions,
     is_wan_remote_session,
     parse_endpoint_ip,
     playback_accumulator_key,
@@ -27,6 +28,14 @@ _WAVE_ASSIGN_MIN_SCORE = 80.0
 _DUAL_PLAYING_MAX_DELTA = 90.0
 _DUAL_PLAYING_TIME_PENALTY = 100.0
 _DEFAULT_TICK_SECONDS = 2.0
+_ACTIVITY_FRESHNESS_WINDOW = 90.0
+_ACTIVITY_FRESHNESS_BONUS = 30.0
+_ACTIVITY_FRESHNESS_PEER_BONUS = 15.0
+_ACTIVITY_FRESHNESS_PEER_GAP = 60.0
+_BROWSE_LEGACY_PREFIX = 'browse:sid:'
+_BROWSE_RECENT_ACTIVITY_SECONDS = 600.0
+_BROWSE_CONFIDENCE_HIGH_AGE = 120.0
+_BROWSE_CONFIDENCE_MEDIUM_AGE = 300.0
 
 _CONN_ROLE_LABELS = {
     'control': '保活',
@@ -87,13 +96,61 @@ def persist_key_for_session(session: dict) -> str:
 
 
 def browse_persist_key_for_session(session: dict) -> str:
+    uid = str(
+        session.get('user_id') or session.get('UserId') or '',
+    ).strip()
     sid = str(
         session.get('emby_session_id')
         or session.get('session_id')
         or session.get('id')
         or '',
     ).strip()
-    return f'browse:sid:{sid}' if sid else ''
+    if uid and sid:
+        return f'browse:{uid}:{sid}'
+    if sid:
+        return f'{_BROWSE_LEGACY_PREFIX}{sid}'
+    return ''
+
+
+def legacy_browse_persist_key_for_session(session: dict) -> str:
+    sid = str(
+        session.get('emby_session_id')
+        or session.get('session_id')
+        or session.get('id')
+        or '',
+    ).strip()
+    return f'{_BROWSE_LEGACY_PREFIX}{sid}' if sid else ''
+
+
+def browse_persist_key_variants_for_session(session: dict) -> List[str]:
+    keys: List[str] = []
+    primary = browse_persist_key_for_session(session)
+    if primary:
+        keys.append(primary)
+    legacy = legacy_browse_persist_key_for_session(session)
+    if legacy and legacy not in keys:
+        keys.append(legacy)
+    return keys
+
+
+def sid_from_browse_persist_key(key: str) -> str:
+    text = str(key or '').strip()
+    if text.startswith(_BROWSE_LEGACY_PREFIX):
+        return text[len(_BROWSE_LEGACY_PREFIX):]
+    if text.startswith('browse:'):
+        parts = text.split(':')
+        if len(parts) >= 3:
+            return str(parts[-1] or '').strip()
+    return ''
+
+
+def user_from_persist_key(pkey: str) -> str:
+    text = str(pkey or '').strip()
+    if not text or text.startswith('browse:') or text.startswith('sid:'):
+        return ''
+    if '|' in text:
+        return text.split('|', 1)[0].strip().casefold()
+    return ''
 
 
 def _session_has_viewing_item(session: Optional[dict]) -> bool:
@@ -162,6 +219,28 @@ def session_activity_epoch(session: dict) -> Optional[float]:
     return _session_started_epoch(session)
 
 
+def _session_activity_age_seconds(
+    session: dict,
+    now_epoch: Optional[float] = None,
+) -> Optional[float]:
+    epoch = _session_active_epoch(session)
+    if epoch is None:
+        return None
+    now = (
+        float(now_epoch)
+        if now_epoch is not None
+        else datetime.now(timezone.utc).timestamp()
+    )
+    return max(0.0, now - epoch)
+
+
+def _is_browse_like_session(session: dict) -> bool:
+    mode = str((session or {}).get('session_mode') or '').strip()
+    if mode in ('viewing', 'connected'):
+        return True
+    return _session_has_viewing_item(session)
+
+
 def conn_accept_epoch(conn: dict) -> Optional[float]:
     epoch = conn.get('accept_epoch')
     if epoch is not None:
@@ -175,12 +254,31 @@ def conn_accept_epoch(conn: dict) -> Optional[float]:
 def _time_match_score(
     accept_at: Optional[float],
     session: dict,
+    *,
+    traffic_role: str = '',
+    delta_out: int = 0,
+    now_epoch: Optional[float] = None,
 ) -> Tuple[float, float, List[str]]:
     if accept_at is None:
         return 0.0, -1.0, []
+    now = (
+        float(now_epoch)
+        if now_epoch is not None
+        else datetime.now(timezone.utc).timestamp()
+    )
     mode = str((session or {}).get('session_mode') or '').strip()
     play_epoch = _session_started_epoch(session)
     active_epoch = _session_active_epoch(session)
+    activity_age = _session_activity_age_seconds(session, now)
+    browse_like = _is_browse_like_session(session)
+    ongoing_browse = (
+        str(traffic_role or '').strip() == 'browse'
+        and max(0, int(delta_out or 0)) > 0
+    )
+    recent_activity = (
+        activity_age is not None
+        and activity_age <= _BROWSE_RECENT_ACTIVITY_SECONDS
+    )
     details: List[str] = []
     score = 0.0
     best_delta = -1.0
@@ -201,6 +299,7 @@ def _time_match_score(
         mode != 'paused'
         and anchor_epoch is not None
         and accept_at < anchor_epoch - _STALE_CONN_BEFORE_SEGMENT_SECONDS
+        and not (browse_like and (recent_activity or ongoing_browse))
     ):
         return -1.0, best_delta, ['建连早于会话过久']
 
@@ -214,6 +313,17 @@ def _time_match_score(
             _apply_delta(abs(accept_at - active_epoch), 180.0, 150.0, '选片活动')
     elif active_epoch is not None:
         _apply_delta(abs(accept_at - active_epoch), 300.0, 80.0, '在线活动')
+
+    if browse_like and activity_age is not None and (recent_activity or ongoing_browse):
+        recency_delta = activity_age
+        recency_score = max(0.0, 150.0 - min(recency_delta, 180.0))
+        if recency_score > score:
+            score = recency_score
+            details.append(
+                f'选片近期活动 {int(recency_delta)}s +{int(recency_score):.0f}',
+            )
+        if best_delta < 0 or recency_delta < best_delta:
+            best_delta = recency_delta
 
     if best_delta > _ACCEPT_TIME_MATCH_SECONDS and score <= 0:
         return max(0.0, 200.0 - best_delta), best_delta, details
@@ -287,16 +397,56 @@ def _sticky_binding_score(
     if not pkey:
         return 0.0, []
     addr = str(remote_addr or '').strip()
+    sess_user = str(session.get('user_name') or '').strip().casefold()
     for label, store in (
         ('入账绑定', bindings or {}),
         ('匹配记忆', match_hints or {}),
     ):
         bound = str(store.get(addr) or '').strip()
-        if bound and bound == pkey:
-            return _STICKY_BINDING_BONUS, [
-                f'{label}粘性 +{int(_STICKY_BINDING_BONUS):.0f}',
-            ]
+        if not bound or bound != pkey:
+            continue
+        bound_user = user_from_persist_key(bound)
+        if bound_user and sess_user and bound_user != sess_user:
+            continue
+        return _STICKY_BINDING_BONUS, [
+            f'{label}粘性 +{int(_STICKY_BINDING_BONUS):.0f}',
+        ]
     return 0.0, []
+
+
+def _activity_freshness_bonus(
+    session: dict,
+    peer_sessions: Optional[List[dict]] = None,
+) -> Tuple[float, List[str]]:
+    epoch = session_activity_epoch(session)
+    if epoch is None:
+        return 0.0, []
+    now = datetime.now(timezone.utc).timestamp()
+    age = now - epoch
+    details: List[str] = []
+    bonus = 0.0
+    if age <= _ACTIVITY_FRESHNESS_WINDOW:
+        bonus += _ACTIVITY_FRESHNESS_BONUS
+        details.append(f'近期活动 +{int(_ACTIVITY_FRESHNESS_BONUS):.0f}')
+
+    sess_uid = str(session.get('user_id') or '').strip()
+    if peer_sessions and sess_uid:
+        peer_epochs: List[float] = []
+        for peer in peer_sessions:
+            if peer is session:
+                continue
+            peer_uid = str(peer.get('user_id') or '').strip()
+            if not peer_uid or peer_uid == sess_uid:
+                continue
+            peer_epoch = session_activity_epoch(peer)
+            if peer_epoch is not None:
+                peer_epochs.append(peer_epoch)
+        if peer_epochs and epoch >= max(peer_epochs) + _ACTIVITY_FRESHNESS_PEER_GAP:
+            bonus += _ACTIVITY_FRESHNESS_PEER_BONUS
+            details.append(
+                f'同设备最新用户 +{int(_ACTIVITY_FRESHNESS_PEER_BONUS):.0f}',
+            )
+    return bonus, details
 
 
 def _dual_playing_time_penalty(
@@ -344,16 +494,19 @@ def score_conn_for_session_detail(
     match_hints: Optional[Dict[str, str]] = None,
     wave_accept_epoch: Optional[float] = None,
     playing_session_count: int = 0,
+    peer_sessions: Optional[List[dict]] = None,
 ) -> Tuple[float, float, List[str]]:
     accept_at = conn_accept_epoch(conn)
     role = traffic_role or _traffic_role(conn, delta_out, is_satellite=False)
     emby_mode = str((session or {}).get('session_mode') or 'connected').strip()
     traffic_out = max(0, int(conn.get('traffic_out') or 0))
 
-    time_score, time_delta, time_details = _time_match_score(accept_at, session)
+    time_score, time_delta, time_details = _time_match_score(
+        accept_at, session, traffic_role=role, delta_out=delta_out,
+    )
     if wave_accept_epoch is not None and accept_at is not None:
         wave_score, wave_td, wave_details = _time_match_score(
-            wave_accept_epoch, session,
+            wave_accept_epoch, session, traffic_role=role, delta_out=delta_out,
         )
         if wave_score > time_score:
             time_score = wave_score + _WAVE_ALIGN_BONUS
@@ -394,6 +547,12 @@ def score_conn_for_session_detail(
     bitrate_score, bitrate_details = _bitrate_plausibility_score(delta_out, session)
     total += bitrate_score
     details.extend(bitrate_details)
+
+    freshness_score, freshness_details = _activity_freshness_bonus(
+        session, peer_sessions,
+    )
+    total += freshness_score
+    details.extend(freshness_details)
 
     total += sticky_score
     details.extend(sticky_details)
@@ -568,6 +727,7 @@ def _assign_sessions_to_drafts(
 ) -> None:
     hints = dict(match_hints or {})
     playing_count = _playing_session_count(sessions)
+    peer_sessions = list(sessions or [])
 
     def score_draft(
         draft: dict,
@@ -584,6 +744,7 @@ def _assign_sessions_to_drafts(
             match_hints=hints,
             wave_accept_epoch=wave_epoch,
             playing_session_count=playing_count,
+            peer_sessions=peer_sessions,
         )
 
     if not sessions:
@@ -783,11 +944,29 @@ def _confidence_for(
     primary_conflict: bool,
     ambiguous: bool,
     match_score: float,
+    activity_age_seconds: Optional[float] = None,
+    traffic_role: str = '',
+    delta_out: int = 0,
 ) -> str:
     if not has_emby or emby_mode == 'orphan':
         return 'low'
     if primary_conflict or ambiguous:
         return 'low'
+    browse_like = emby_mode in ('viewing', 'connected', 'paused')
+    ongoing_browse = (
+        str(traffic_role or conn_role or '').strip() == 'browse'
+        and max(0, int(delta_out or 0)) > 0
+    )
+    if conn_role in ('control', 'browse') and browse_like:
+        age = activity_age_seconds
+        if age is None and time_delta >= 0:
+            age = time_delta
+        if age is not None and age >= 0:
+            if ongoing_browse or age <= _BROWSE_CONFIDENCE_HIGH_AGE:
+                return 'high'
+            if age <= _BROWSE_CONFIDENCE_MEDIUM_AGE:
+                return 'medium'
+            return 'low'
     if conn_role == 'stream_primary' and emby_mode == 'playing':
         if match_score >= 400 and time_delta >= 0 and time_delta <= 30:
             return 'high'
@@ -824,7 +1003,7 @@ def _build_reasons(
     if conn_role == 'control':
         reasons.append('流量极低，判定为保活/控制连接')
     elif conn_role == 'browse':
-        reasons.append('有流量但未达主推流阈值')
+        reasons.append('有流量，会话处于选片/在线（非播放推流）')
     elif conn_role == 'stream_pending':
         reasons.append('流量达标，待分配主推流位')
     elif conn_role == 'stream_primary':
@@ -1012,13 +1191,18 @@ def _analyze_ip_group(
             )
         elif billing_state == 'browse_credited' and browse_persist_key:
             bucket = browse_upload_bucket if browse_upload_bucket is not None else {}
-            accumulator_bytes = max(0, int(bucket.get(browse_persist_key) or 0))
+            accumulator_bytes = 0
+            session = draft.get('best_session') or {}
+            for key in browse_persist_key_variants_for_session(session):
+                accumulator_bytes += max(0, int(bucket.get(key) or 0))
         elif bound_key:
             accumulator_bytes = max(0, int(upload_bucket.get(bound_key) or 0))
 
         ambiguous = bool(draft.get('ambiguous'))
         match_score = float(draft.get('best_score') or -1)
         time_delta = float(draft.get('time_delta', -1))
+        best_session = draft.get('best_session') or {}
+        activity_age = _session_activity_age_seconds(best_session)
         confidence = _confidence_for(
             conn_role,
             emby_mode,
@@ -1027,6 +1211,9 @@ def _analyze_ip_group(
             primary_conflict=primary_conflict,
             ambiguous=ambiguous,
             match_score=match_score,
+            activity_age_seconds=activity_age,
+            traffic_role=str(draft.get('traffic_role') or ''),
+            delta_out=int(draft.get('delta_out') or 0),
         )
         score_details = list(draft.get('score_details') or [])
         reasons = _build_reasons(
@@ -1145,6 +1332,9 @@ def analyze_lucky_connections(
         s for s in (sessions or [])
         if isinstance(s, dict) and is_wan_remote_session(s)
     ]
+    matching_remote, _superseded_meta = filter_superseded_wan_sessions(
+        matching_remote,
+    )
     bindings = dict(bindings or {})
     hints = dict(match_hints or {})
     upload_bucket = dict(upload_bucket or {})
@@ -1190,6 +1380,7 @@ def analyze_lucky_connections(
 
     emby_without_lucky: List[dict] = []
     lucky_ips = set(by_ip.keys())
+
     for session in matching_remote:
         ep = parse_endpoint_ip(session.get('remote_endpoint') or '')
         if ep and ep in lucky_ips:

@@ -378,7 +378,7 @@ class EmbyInstanceWorker:
 
     def _fetch_sessions(self, client: EmbyClient) -> list:
         try:
-            return client.get_wan_client_sessions()
+            return client.get_all_client_sessions()
         except Exception as e:
             logger.debug(f'[Emby:{self.name}] 获取会话失败: {e}')
             return []
@@ -786,7 +786,8 @@ class EmbyInstanceWorker:
             self._mode_switch_pending_upload_bytes = 0
             self._mode_switch_pending_since_mono = None
         self._wan_client_sessions_last = [
-            dict(s) for s in sessions if isinstance(s, dict)
+            dict(s) for s in sessions
+            if isinstance(s, dict) and s.get('is_remote')
         ]
         from emby_client import EmbyClient
         open_sessions = [
@@ -1393,7 +1394,7 @@ class EmbyInstanceWorker:
                 logger.debug(
                     f'[Emby:{self.name}] 会话流量持久化失败: {e}',
                 )
-        if not self._wan_client_sessions_last:
+        if not sessions:
             try:
                 emby_playback_traffic.clear_instance_live_upload_state(self.name)
             except Exception as e:

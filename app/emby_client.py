@@ -1241,16 +1241,21 @@ class EmbyClient:
             'viewing_episode_label': viewing_episode_label,
         }
 
-    def get_wan_client_sessions(self) -> List[dict]:
-        """外网在线客户端（含选片/暂停/播放），供 Lucky 连接匹配。"""
+    def get_all_client_sessions(self) -> List[dict]:
+        """全部在线客户端（含局域网/外网、选片/暂停/播放）。"""
         result: List[dict] = []
         for raw in self.get_sessions():
             if not isinstance(raw, dict):
                 continue
-            session = self.normalize_session(raw)
-            if session.get('is_remote'):
-                result.append(session)
+            result.append(self.normalize_session(raw))
         return result
+
+    def get_wan_client_sessions(self) -> List[dict]:
+        """外网在线客户端（含选片/暂停/播放），供 Lucky 连接匹配。"""
+        return [
+            session for session in self.get_all_client_sessions()
+            if session.get('is_remote')
+        ]
 
     def send_session_playing_command(self, session_id: str, command: str) -> dict:
         command = (command or '').strip()

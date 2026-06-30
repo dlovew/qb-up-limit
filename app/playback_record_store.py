@@ -20,7 +20,8 @@ from secrets_store import _read_json, _write_json
 logger = logging.getLogger(__name__)
 
 MAX_STORED_RECORDS = 500
-OFFLINE_TIMEOUT_SECONDS = 30 * 60
+OFFLINE_TIMEOUT_SECONDS = 5 * 60
+STOP_GRACE_SECONDS = 5
 
 _lock = threading.RLock()
 _runtime: Dict[str, dict] = {}
@@ -156,7 +157,22 @@ def _runtime_bucket(instance_name: str) -> dict:
         bucket = _runtime.setdefault(instance_name, {})
         bucket.setdefault('offline_since', None)
         bucket.setdefault('was_api_online', True)
+        bucket.setdefault('pending_stop_since', {})
         return bucket
+
+
+def _pending_stop_map(bucket: dict) -> Dict[int, float]:
+    pending = bucket.get('pending_stop_since')
+    if not isinstance(pending, dict):
+        pending = {}
+        bucket['pending_stop_since'] = pending
+    return pending
+
+
+def _clear_pending_stop(bucket: dict, record: dict) -> None:
+    rid = int((record or {}).get('id') or 0)
+    if rid > 0:
+        _pending_stop_map(bucket).pop(rid, None)
 
 
 def _alloc_id(store: dict) -> int:
@@ -225,9 +241,16 @@ def _apply_session_meta(record: dict, session: dict) -> None:
             record[key] = meta[key]
     if 'is_paused' in prepared:
         record['is_paused'] = bool(prepared.get('is_paused'))
-    record['estimate_upload_enabled'] = bool(
-        prepared.get('estimate_upload_enabled', record.get('estimate_upload_enabled', True)),
+    mode = str(
+        prepared.get('traffic_collect_mode')
+        or record.get('traffic_collect_mode')
+        or '',
+    ).strip().lower()
+    enabled = mode in ('docker', 'lucky') or bool(
+        prepared.get('estimate_upload_enabled', record.get('estimate_upload_enabled', False)),
     )
+    record['traffic_collect_mode'] = mode if mode in ('docker', 'lucky') else ''
+    record['estimate_upload_enabled'] = enabled
     pos = prepared.get('position_seconds')
     if pos is not None and record.get('status') == 'playing':
         record['end_position_seconds'] = max(0, int(pos))
@@ -251,9 +274,8 @@ def _apply_watch_snapshot(record: dict, snapshot: dict) -> None:
 def _resolve_upload_bytes(instance_name: str, record: dict) -> None:
     if not record.get('is_remote'):
         return
-    if record.get('estimate_upload_enabled') is False:
-        return
-    if record.get('estimated_upload_bytes') is not None:
+    mode = str(record.get('traffic_collect_mode') or '').strip().lower()
+    if mode not in ('docker', 'lucky') and not record.get('estimate_upload_enabled'):
         return
     emby_playback_upload_sync.resolve_upload_bytes(
         instance_name,
@@ -297,7 +319,8 @@ def _estimate_played_wall_seconds(record: dict) -> Optional[int]:
 
 def _finalize_record(instance_name: str, record: dict, *,
                      status: str, stopped_at: str = None,
-                     interrupt_reason: str = None) -> None:
+                     interrupt_reason: str = None,
+                     settle_reason: str = None) -> None:
     if status not in _PLAYBACK_STATUSES or status == 'playing':
         return
     if record.get('status') != 'playing':
@@ -309,6 +332,11 @@ def _finalize_record(instance_name: str, record: dict, *,
         record['stopped_at'] = stopped_at or record.get('last_tick_at') or _utc_now_iso()
     if interrupt_reason:
         record['interrupt_reason'] = interrupt_reason
+    reason = str(
+        settle_reason or interrupt_reason or '',
+    ).strip()
+    if reason:
+        record['settle_reason'] = reason
     snap = emby_watch_progress.snapshot_for_record(instance_name, record)
     if snap:
         _apply_watch_snapshot(record, snap)
@@ -326,10 +354,22 @@ def _finalize_record(instance_name: str, record: dict, *,
     _take_upload(instance_name, record)
     if status == 'ended' or (status == 'incomplete' and record.get('estimated_upload_bytes')):
         _persist_upload_fact(instance_name, record)
+    try:
+        import emby_playback_traffic
+        emby_playback_traffic.on_playback_segment_finalized(instance_name, record)
+    except Exception as e:
+        logger.debug(f'[Playback:{instance_name}] 播放段流量结案回调失败: {e}')
     emby_watch_progress.reset_tracker_for_record(instance_name, record)
+    bucket = _runtime_bucket(instance_name)
+    _clear_pending_stop(bucket, record)
     if record.get('emby_session_id'):
-        bucket = _runtime_bucket(instance_name)
         bucket.pop(f'sid:{record["emby_session_id"]}', None)
+    if reason in ('emby_confirmed_stop', 'grace_expired', 'item_change'):
+        logger.info(
+            f'[Playback:{instance_name}] 播放段结案 rid={record.get("id")} '
+            f'sid={record.get("emby_session_id") or "?"} reason={reason}',
+        )
+    record.pop('live_upload_checkpoint_bytes', None)
 
 
 def _new_record(instance_name: str, store: dict, session: dict) -> dict:
@@ -356,6 +396,11 @@ def _new_record(instance_name: str, store: dict, session: dict) -> dict:
     if sid:
         bucket[f'sid:{sid}'] = rid
     bucket[f'track:{_segment_key(record)}'] = rid
+    try:
+        import emby_playback_traffic
+        emby_playback_traffic.on_playback_segment_started(instance_name, record)
+    except Exception as e:
+        logger.debug(f'[Playback:{instance_name}] 播放段流量开始回调失败: {e}')
     return record
 
 
@@ -438,12 +483,245 @@ def _active_playing_sessions(sessions: list) -> List[dict]:
     result = []
     for raw in sessions or []:
         session = _prepare_session(raw)
-        if not session.get('is_playing'):
-            continue
-        if not session.get('title') and not session.get('series_name'):
+        if not EmbyClient.is_current_playback_session(session):
             continue
         result.append(session)
     return result
+
+
+def _sessions_with_now_playing(sessions: list) -> List[dict]:
+    """API 中仍挂着 NowPlayingItem 的会话（含暂停/短暂 IsPlaying=false）。"""
+    result = []
+    for raw in sessions or []:
+        session = _prepare_session(raw)
+        if not EmbyClient.session_has_now_playing_media(session):
+            continue
+        result.append(session)
+    return result
+
+
+def _session_keeps_open_playback_record(session: dict) -> bool:
+    """仍在播或暂停中则保持 open（与设备卡片「当前播放会话」口径一致）。"""
+    return EmbyClient.is_current_playback_session(session)
+
+
+def _emby_confirms_stop(session: dict) -> bool:
+    """Emby /Sessions 明确报告已停止（非暂停、非播放中）。"""
+    if not session:
+        return False
+    if bool(session.get('is_paused')):
+        return False
+    return not bool(session.get('is_playing'))
+
+
+def _find_api_session_by_sid(sessions: list, record: dict) -> Optional[dict]:
+    sid = str((record or {}).get('emby_session_id') or '').strip()
+    if not sid:
+        return None
+    for raw in sessions or []:
+        prepared = _prepare_session(raw)
+        if str(prepared.get('id') or '').strip() == sid:
+            return prepared
+    return None
+
+
+def _refresh_open_record_from_session(
+    instance_name: str,
+    record: dict,
+    session: dict,
+) -> None:
+    _apply_session_meta(record, session)
+    snap = emby_watch_progress.update_for_record(instance_name, record, session)
+    _apply_watch_snapshot(record, snap)
+    record['last_tick_at'] = _utc_now_iso()
+
+
+def _handle_stale_open_record(
+    instance_name: str,
+    bucket: dict,
+    record: dict,
+    sessions: list,
+    now_mono: float,
+) -> str:
+    """open 段本轮未在活跃列表：Emby 确认停止则立即结案，否则 5 秒宽限后结案。"""
+    matched = _find_api_session_for_record(sessions, record)
+    if matched is not None:
+        if _session_keeps_open_playback_record(matched):
+            _clear_pending_stop(bucket, record)
+            _refresh_open_record_from_session(instance_name, record, matched)
+            return 'updated'
+        if _emby_confirms_stop(matched):
+            _clear_pending_stop(bucket, record)
+            _finalize_record(
+                instance_name, record, status='ended',
+                settle_reason='emby_confirmed_stop',
+            )
+            return 'finalized'
+
+    api_session = _find_api_session_by_sid(sessions, record)
+    if api_session is not None:
+        if _session_keeps_open_playback_record(api_session):
+            _clear_pending_stop(bucket, record)
+            if matched is None:
+                _refresh_open_record_from_session(instance_name, record, api_session)
+                return 'updated'
+            return 'unchanged'
+        if _emby_confirms_stop(api_session):
+            _clear_pending_stop(bucket, record)
+            _finalize_record(
+                instance_name, record, status='ended',
+                settle_reason='emby_confirmed_stop',
+            )
+            return 'finalized'
+
+    pending = _pending_stop_map(bucket)
+    rid = int(record.get('id') or 0)
+    if rid <= 0:
+        return 'unchanged'
+    since = pending.get(rid)
+    if since is None:
+        pending[rid] = now_mono
+        sid = str(record.get('emby_session_id') or '').strip()
+        logger.info(
+            f'[Playback:{instance_name}] 播放段停止待确认 rid={rid} '
+            f'sid={sid or "?"} grace={STOP_GRACE_SECONDS}s',
+        )
+        return 'pending'
+    if now_mono - float(since) < STOP_GRACE_SECONDS:
+        return 'pending'
+    pending.pop(rid, None)
+    _finalize_record(
+        instance_name, record, status='ended',
+        settle_reason='grace_expired',
+    )
+    return 'finalized'
+
+
+def _session_matches_open_record(session: dict, record: dict) -> bool:
+    if not session or not record:
+        return False
+    rec_sid = str(record.get('emby_session_id') or '').strip()
+    sess_sid = str(session.get('id') or '').strip()
+    if rec_sid and sess_sid and rec_sid != sess_sid:
+        return False
+    rec_item = str(record.get('item_id') or '').strip()
+    sess_item = str(session.get('item_id') or '').strip()
+    if rec_item and sess_item and rec_item != sess_item:
+        return False
+    rec_user = str(record.get('user_id') or '').strip()
+    sess_user = str(session.get('user_id') or '').strip()
+    if rec_user and sess_user and rec_user != sess_user:
+        return False
+    rec_client = EmbyClient._normalize_client_key(record.get('client') or '')
+    sess_client = EmbyClient._normalize_client_key(session.get('client') or '')
+    if rec_client and sess_client and rec_client != sess_client:
+        return False
+    return bool(rec_sid or rec_item or (rec_user and rec_client))
+
+
+def _find_api_session_for_record(sessions: list, record: dict) -> Optional[dict]:
+    for session in _sessions_with_now_playing(sessions):
+        if _session_matches_open_record(session, record):
+            return session
+    return None
+
+
+def _open_playback_sids(store: dict) -> Set[str]:
+    sids: Set[str] = set()
+    for rec in store.get('records') or []:
+        if rec.get('status') != 'playing':
+            continue
+        sid = str(rec.get('emby_session_id') or '').strip()
+        if sid:
+            sids.add(sid)
+    return sids
+
+
+def open_playback_session_ids(instance_name: str) -> Set[str]:
+    """实例级仍在播放中的 emby_session_id（供流量 purge 等逻辑查询）。"""
+    if not instance_name:
+        return set()
+    with _lock:
+        store = _load_store(instance_name)
+        return _open_playback_sids(store)
+
+
+def open_playing_upload_checkpoints(instance_name: str) -> Dict[str, int]:
+    """仍在播放中的外网段可续传累加器增量（checkpoint 总额减已入账）。"""
+    name = (instance_name or '').strip()
+    if not name:
+        return {}
+    with _lock:
+        store = _load_store(name)
+        result: Dict[str, int] = {}
+        for rec in store.get('records') or []:
+            if rec.get('status') != 'playing' or not rec.get('is_remote'):
+                continue
+            booked = max(0, int(rec.get('estimated_upload_bytes') or 0))
+            chk = max(0, int(rec.get('live_upload_checkpoint_bytes') or 0))
+            restorable = max(0, chk - booked)
+            from emby_traffic_filter import playback_accumulator_key
+            acc_key = str(rec.get('upload_accumulator_key') or '').strip()
+            if not acc_key:
+                acc_key = playback_accumulator_key(rec) or ''
+            if acc_key:
+                result[acc_key] = max(result.get(acc_key, 0), restorable)
+        return result
+
+
+def protected_playback_session_ids(instance_name: str) -> Set[str]:
+    """open 或停止待确认中的 sid：播放累加器不得提前清理。"""
+    name = (instance_name or '').strip()
+    if not name:
+        return set()
+    with _lock:
+        store = _load_store(name)
+        sids = set(_open_playback_sids(store))
+        runtime = _runtime.get(name) or {}
+        pending = runtime.get('pending_stop_since') or {}
+        if not pending:
+            return sids
+        rid_to_sid: Dict[int, str] = {}
+        for rec in store.get('records') or []:
+            if rec.get('status') != 'playing':
+                continue
+            rid = int(rec.get('id') or 0)
+            sid = str(rec.get('emby_session_id') or '').strip()
+            if rid > 0 and sid:
+                rid_to_sid[rid] = sid
+        for rid in pending:
+            sid = rid_to_sid.get(int(rid))
+            if sid:
+                sids.add(sid)
+        return sids
+
+
+def checkpoint_stopped_session_upload(instance_name: str, session: dict) -> bool:
+    """停止播放时将累加器刷入 open 记录并清零（tick 未结案时的兜底）。"""
+    name = (instance_name or '').strip()
+    if not name or not isinstance(session, dict):
+        return False
+    with _lock:
+        store = _load_store(name)
+        prepared = _prepare_session(session)
+        record = _find_open_record(store, prepared, name)
+        if not record or record.get('status') != 'playing':
+            return False
+        if not record.get('is_remote'):
+            return False
+        import emby_playback_upload_sync
+        taken = emby_playback_upload_sync.try_take_upload(name, record)
+        if not taken:
+            return False
+        prev = max(0, int(record.get('estimated_upload_bytes') or 0))
+        record['estimated_upload_bytes'] = prev + taken
+        record['live_upload_checkpoint_bytes'] = int(record['estimated_upload_bytes'])
+        _save_store(store)
+        logger.info(
+            f'[Playback:{name}] 停止播放刷入上行 checkpoint='
+            f'{taken} total={record["estimated_upload_bytes"]}',
+        )
+        return True
 
 
 def _handle_offline(instance_name: str, store: dict, now_mono: float) -> bool:
@@ -510,7 +788,10 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
                 old_item = str(record.get('item_id') or '')
                 new_item = str(session.get('item_id') or '')
                 if old_item and new_item and old_item != new_item:
-                    _finalize_record(instance_name, record, status='ended')
+                    _finalize_record(
+                        instance_name, record, status='ended',
+                        settle_reason='item_change',
+                    )
                     changed = True
                     record = None
             if record is None:
@@ -523,7 +804,10 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
                 old_item = str(record.get('item_id') or '')
                 new_item = str(prepared.get('item_id') or '')
                 if old_item and new_item and old_item != new_item:
-                    _finalize_record(instance_name, record, status='ended')
+                    _finalize_record(
+                        instance_name, record, status='ended',
+                        settle_reason='item_change',
+                    )
                     record = _new_record(instance_name, store, prepared)
                     store.setdefault('records', []).insert(0, record)
                     changed = True
@@ -535,7 +819,35 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
                     _apply_watch_snapshot(record, snap)
                     changed = True
             record['last_tick_at'] = _utc_now_iso()
-            seen_rids.add(int(record.get('id') or 0))
+            if (
+                record.get('status') == 'playing'
+                and record.get('is_remote')
+                and (
+                    record.get('estimate_upload_enabled')
+                    or str(record.get('traffic_collect_mode') or '').strip().lower()
+                    in ('docker', 'lucky')
+                )
+            ):
+                try:
+                    import emby_playback_traffic
+                    accum = emby_playback_traffic.peek_accumulated_upload(
+                        instance_name, record,
+                    )
+                    booked = max(0, int(record.get('estimated_upload_bytes') or 0))
+                    accum_val = max(0, int(accum or 0))
+                    total_snapshot = booked + accum_val
+                    if total_snapshot > int(
+                        record.get('live_upload_checkpoint_bytes') or 0,
+                    ):
+                        record['live_upload_checkpoint_bytes'] = total_snapshot
+                        changed = True
+                except Exception as e:
+                    logger.debug(
+                        f'[Playback:{instance_name}] 会话流量 checkpoint 同步失败: {e}',
+                    )
+            rid = int(record.get('id') or 0)
+            seen_rids.add(rid)
+            _clear_pending_stop(bucket, record)
             if sid:
                 bucket[f'sid:{sid}'] = record.get('id')
             bucket[f'track:{_segment_key(record)}'] = record.get('id')
@@ -549,8 +861,12 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
             sid = str(record.get('emby_session_id') or '')
             if sid and sid in seen_sids:
                 continue
-            _finalize_record(instance_name, record, status='ended')
-            changed = True
+
+            outcome = _handle_stale_open_record(
+                instance_name, bucket, record, sessions, now_mono,
+            )
+            if outcome in ('updated', 'finalized'):
+                changed = True
 
         if changed:
             records = store.get('records') or []

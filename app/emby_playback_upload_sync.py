@@ -1,9 +1,12 @@
 """外网播放估算上行：累加器 take 一次，写入播放记录。"""
 
+import logging
 from typing import List, Optional
 
 import emby_playback_traffic
 from emby_client import EmbyClient
+
+logger = logging.getLogger(__name__)
 
 
 def _upload_int(val) -> Optional[int]:
@@ -43,18 +46,55 @@ def try_take_upload(instance_name: str, subject: dict) -> Optional[int]:
     return None
 
 
+def _adjust_taken_for_legacy_checkpoint(
+    playback_record: dict,
+    existing: int,
+    taken: int,
+) -> int:
+    """续传缺陷：checkpoint 未扣除已入账部分时，避免 finalize 重复累加。"""
+    taken = max(0, int(taken or 0))
+    if taken <= 0 or existing <= 0:
+        return taken
+    chk = max(0, int(playback_record.get('live_upload_checkpoint_bytes') or 0))
+    if chk <= 0:
+        return taken
+    # 旧逻辑 checkpoint 仅镜像累加器且未随入账更新：chk == existing 时 taken 含重复部分
+    if chk <= existing:
+        overlap = min(existing, taken)
+        if overlap > 0:
+            logger.debug(
+                '[Playback] 结案去重 legacy checkpoint overlap=%s existing=%s taken=%s',
+                overlap,
+                existing,
+                taken,
+            )
+            return max(0, taken - overlap)
+    return taken
+
+
 def resolve_upload_bytes(instance_name: str, *, playback_record: dict) -> Optional[int]:
     """解析估算上行并写入播放记录。返回写入的字节数。"""
     if not playback_record or not playback_record.get('is_remote'):
         return None
 
-    existing = _upload_int(playback_record.get('estimated_upload_bytes'))
-    if existing:
-        return existing
-
-    taken = try_take_upload(instance_name, playback_record)
-    if taken:
-        playback_record['estimated_upload_bytes'] = taken
-        return taken
-
+    existing = max(0, int(playback_record.get('estimated_upload_bytes') or 0))
+    raw_taken = try_take_upload(instance_name, playback_record)
+    increment = _adjust_taken_for_legacy_checkpoint(
+        playback_record,
+        existing,
+        max(0, int(raw_taken or 0)),
+    )
+    total = existing + increment
+    if total > 0:
+        playback_record['estimated_upload_bytes'] = total
+        try:
+            from playback_upload_repair import warn_if_inflated_playback_upload
+            warn_if_inflated_playback_upload(
+                instance_name,
+                playback_record,
+                upload_bytes=total,
+            )
+        except Exception:
+            pass
+        return total
     return None

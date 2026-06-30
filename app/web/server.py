@@ -23,7 +23,7 @@ from qb_monitor import (
 )
 from web.auth import init_auth, login_user, logout_user, verify_credentials, get_session_username
 
-from emby_client import EmbyClient, parse_emby_log_line, DEFAULT_SESSION_MESSAGE_TIMEOUT_MS
+from emby_client import EmbyClient, is_playback_browse_server_log_message, parse_emby_log_line, DEFAULT_SESSION_MESSAGE_TIMEOUT_MS
 
 logger = logging.getLogger(__name__)
 
@@ -376,8 +376,10 @@ def api_config():
             config_manager.get_global_config(monitor.config),
             monitor.config,
         )
-        collect = global_cfg['collect_interval']
-        refresh = global_cfg.get('refresh_interval', 1)
+        collect = monitor.collect_interval
+        refresh = monitor.refresh_interval
+        global_cfg['collect_interval'] = collect
+        global_cfg['refresh_interval'] = refresh
         return jsonify({
             'success': True,
             'global': global_cfg,
@@ -933,12 +935,19 @@ def _emby_debug_traffic_config_payload(global_cfg: dict = None) -> dict:
     m3_scale = config_manager.clamp_emby_m3_wan_pool_scale(
         cfg.get('emby_m3_wan_pool_scale', 1.0),
     )
+    browse_min_mb = config_manager.clamp_emby_browse_upload_min_mb(
+        cfg.get('emby_browse_upload_min_mb', 1.0),
+    )
     return {
         'new_session_window_seconds': max(1, min(30, new_window)),
         'seek_window_seconds': max(1, min(30, seek_window)),
         'priority_mode': mode,
         'mode_switch_grace_seconds': max(0, min(10, mode_switch_grace)),
         'm3_wan_pool_scale': m3_scale,
+        'browse_upload_min_mb': browse_min_mb,
+        'browse_upload_min_bytes': config_manager.emby_browse_upload_min_bytes(
+            {'emby_browse_upload_min_mb': browse_min_mb},
+        ),
     }
 
 
@@ -1055,6 +1064,8 @@ def api_emby_debug_traffic_config_update():
             )
         if 'm3_wan_pool_scale' in data:
             merged_global['emby_m3_wan_pool_scale'] = data.get('m3_wan_pool_scale')
+        if 'browse_upload_min_mb' in data:
+            merged_global['emby_browse_upload_min_mb'] = data.get('browse_upload_min_mb')
 
         validated, full_config = config_manager.update_global(
             merged_global, base_config=monitor.config,
@@ -1178,6 +1189,37 @@ def api_emby_playback_records():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/emby/browse-records')
+def api_emby_browse_records():
+    err = _emby_required()
+    if err:
+        return err
+    try:
+        instance_name = request.args.get('instance')
+        if not instance_name:
+            return jsonify({'success': False, 'error': '请选择设备'}), 400
+        if not config_manager.get_emby_instance(instance_name, emby_monitor.config):
+            return jsonify({'success': False, 'error': '设备不存在'}), 404
+        limit = min(int(request.args.get('limit', 200)), 500)
+        global_cfg = config_manager.get_global_config(emby_monitor.config)
+        min_bytes = config_manager.emby_browse_upload_min_bytes(global_cfg)
+        min_mb = config_manager.clamp_emby_browse_upload_min_mb(
+            global_cfg.get('emby_browse_upload_min_mb', 1.0),
+        )
+        records = emby_traffic_db.list_browse_upload_records(
+            instance_name, limit=limit, min_upload_bytes=min_bytes,
+        )
+        return jsonify({
+            'success': True,
+            'data': records,
+            'browse_upload_min_mb': min_mb,
+            'browse_upload_min_bytes': min_bytes,
+        })
+    except Exception as e:
+        logger.error(f'API /emby/browse-records 错误: {e}', exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/emby/activity-log')
 def api_emby_activity_log():
     err = _emby_required()
@@ -1236,74 +1278,88 @@ def api_emby_playback_stats(instance_name, period):
         user_name = (request.args.get('user') or '').strip()
         if not user_name:
             return jsonify({'success': False, 'error': '缺少 user 参数'}), 400
-        if not config_manager.get_emby_instance(instance_name, emby_monitor.config):
+        inst = config_manager.get_emby_instance(instance_name, emby_monitor.config)
+        if not inst:
             return jsonify({'success': False, 'error': '设备不存在'}), 404
         all_users = user_name == emby_traffic_db.PLAYBACK_ALL_USERS_TOKEN
+        import emby_browse_upload_stats as browse_stats
+        credit_browse = browse_stats.resolve_instance_credit_browse(inst)
+        browse_kw = {'credit_browse': credit_browse}
         if period == 'hourly':
             hours = min(int(request.args.get('hours', 24)), 366)
             if all_users:
-                data = emby_traffic_db.get_playback_upload_hourly_stats_all_users(
-                    instance_name, hours,
+                data = browse_stats.get_combined_playback_upload_hourly_stats_all_users(
+                    instance_name, hours=hours,
                     start=request.args.get('start'), end=request.args.get('end'),
+                    **browse_kw,
                 )
             else:
-                data = emby_traffic_db.get_playback_upload_hourly_stats(
-                    instance_name, user_name, hours,
+                data = browse_stats.get_combined_playback_upload_hourly_stats(
+                    instance_name, user_name, hours=hours,
                     start=request.args.get('start'), end=request.args.get('end'),
+                    **browse_kw,
                 )
         elif period == 'daily':
             days = min(int(request.args.get('days', 31)), 366)
             if all_users:
-                data = emby_traffic_db.get_playback_upload_daily_stats_all_users(
-                    instance_name, days,
+                data = browse_stats.get_combined_playback_upload_daily_stats_all_users(
+                    instance_name, days=days,
                     start=request.args.get('start'), end=request.args.get('end'),
+                    **browse_kw,
                 )
             else:
-                data = emby_traffic_db.get_playback_upload_daily_stats(
-                    instance_name, user_name, days,
+                data = browse_stats.get_combined_playback_upload_daily_stats(
+                    instance_name, user_name, days=days,
                     start=request.args.get('start'), end=request.args.get('end'),
+                    **browse_kw,
                 )
         elif period == 'monthly':
             months = min(int(request.args.get('months', 12)), 60)
             if all_users:
-                data = emby_traffic_db.get_playback_upload_monthly_stats_all_users(
-                    instance_name, months,
+                data = browse_stats.get_combined_playback_upload_monthly_stats_all_users(
+                    instance_name, months=months,
                     start=request.args.get('start'), end=request.args.get('end'),
+                    **browse_kw,
                 )
             else:
-                data = emby_traffic_db.get_playback_upload_monthly_stats(
-                    instance_name, user_name, months,
+                data = browse_stats.get_combined_playback_upload_monthly_stats(
+                    instance_name, user_name, months=months,
                     start=request.args.get('start'), end=request.args.get('end'),
+                    **browse_kw,
                 )
         elif period == 'weekly':
             weeks = min(int(request.args.get('weeks', 12)), 104)
             if all_users:
-                data = emby_traffic_db.get_playback_upload_weekly_stats_all_users(
-                    instance_name, weeks,
+                data = browse_stats.get_combined_playback_upload_weekly_stats_all_users(
+                    instance_name, weeks=weeks,
                     start=request.args.get('start'), end=request.args.get('end'),
+                    **browse_kw,
                 )
             else:
-                data = emby_traffic_db.get_playback_upload_weekly_stats(
-                    instance_name, user_name, weeks,
+                data = browse_stats.get_combined_playback_upload_weekly_stats(
+                    instance_name, user_name, weeks=weeks,
                     start=request.args.get('start'), end=request.args.get('end'),
+                    **browse_kw,
                 )
         elif period == 'yearly':
             years = min(int(request.args.get('years', 5)), 20)
             start_year = request.args.get('start_year')
             end_year = request.args.get('end_year')
             if all_users:
-                data = emby_traffic_db.get_playback_upload_yearly_stats_all_users(
-                    instance_name, years,
+                data = browse_stats.get_combined_playback_upload_yearly_stats_all_users(
+                    instance_name, years=years,
                     start=request.args.get('start'), end=request.args.get('end'),
                     start_year=int(start_year) if start_year else None,
                     end_year=int(end_year) if end_year else None,
+                    **browse_kw,
                 )
             else:
-                data = emby_traffic_db.get_playback_upload_yearly_stats(
-                    instance_name, user_name, years,
+                data = browse_stats.get_combined_playback_upload_yearly_stats(
+                    instance_name, user_name, years=years,
                     start=request.args.get('start'), end=request.args.get('end'),
                     start_year=int(start_year) if start_year else None,
                     end_year=int(end_year) if end_year else None,
+                    **browse_kw,
                 )
         elif period == 'cycle':
             from config_manager import DEFAULT_CYCLE, get_global_config
@@ -1319,12 +1375,12 @@ def api_emby_playback_stats(instance_name, period):
             count = min(int(request.args.get('cycles', 12)), 50)
             periods = iter_cycle_periods(DEFAULT_CYCLE, tz, count=count)
             if all_users:
-                data = emby_traffic_db.get_playback_upload_cycle_stats_all_users(
-                    instance_name, periods,
+                data = browse_stats.get_combined_playback_upload_cycle_stats_all_users(
+                    instance_name, periods, **browse_kw,
                 )
             else:
-                data = emby_traffic_db.get_playback_upload_cycle_stats(
-                    instance_name, user_name, periods,
+                data = browse_stats.get_combined_playback_upload_cycle_stats(
+                    instance_name, user_name, periods, **browse_kw,
                 )
         else:
             return jsonify({'success': False, 'error': '播放用户统计暂不支持该周期'}), 400
@@ -1395,6 +1451,9 @@ def api_emby_system_logs():
         for name in target_names:
             for line in client.get_server_log_lines(name, limit=limit):
                 parsed = parse_emby_log_line(line)
+                message = parsed.get('message') or parsed.get('raw') or line
+                if is_playback_browse_server_log_message(message):
+                    continue
                 if level_filter and parsed.get('level') != level_filter:
                     continue
                 lines.append({
@@ -1517,6 +1576,49 @@ def api_emby_config_instances_test():
             return jsonify({'success': result.get('ok', False), 'data': result,
                             'error': result.get('error')})
 
+        if test_type in ('lucky', 'lucky_rules', 'lucky_connect'):
+            from emby_lucky import (
+                LuckyClient,
+                auto_match_candidate,
+                build_rule_label,
+            )
+            token = validated.get('lucky_open_token', '')
+            lc = LuckyClient(
+                validated.get('lucky_base_url', ''),
+                open_token=token,
+                verify_ssl=bool(validated.get('lucky_verify_ssl', False)),
+            )
+            if test_type == 'lucky_rules':
+                candidates, err = lc.list_proxy_candidates()
+                if err:
+                    return jsonify({'success': False, 'error': err}), 400
+                matched, _all = auto_match_candidate(
+                    candidates,
+                    emby_host=validated.get('host', ''),
+                    emby_port=int(validated.get('port') or 8096),
+                    frontend_host=validated.get('lucky_frontend_host', ''),
+                )
+                return jsonify({
+                    'success': True,
+                    'data': {
+                        'candidates': candidates,
+                        'matched': matched,
+                        'matched_label': build_rule_label(matched) if matched else '',
+                    },
+                })
+            if test_type == 'lucky' and validated.get('lucky_rule_key') and validated.get('lucky_sub_key'):
+                result = lc.test_access_detail(
+                    validated['lucky_rule_key'],
+                    validated['lucky_sub_key'],
+                )
+            else:
+                result = lc.test_connection()
+            return jsonify({
+                'success': result.get('ok', False),
+                'data': result,
+                'error': result.get('error'),
+            })
+
         client = EmbyClient(validated)
         if test_type == 'api':
             result = client.test_api()
@@ -1580,6 +1682,7 @@ def api_emby_config_instances_update(name):
         if not raw:
             return jsonify({'success': False, 'error': '请求无效'}), 400
         attempt_sync, reachable, data_policy = config_manager.pop_instance_save_flags(raw)
+        clear_traffic_data = bool(raw.pop('clear_traffic_data', False))
         api_key_in_request = str(raw.get('api_key', '') or '').strip()
         existing = config_manager.get_emby_instance(
             name, config_manager.load_config())
@@ -1588,6 +1691,8 @@ def api_emby_config_instances_update(name):
         active_names = _fresh_active_emby_instance_names()
         _apply_emby_rename_data_policy(name, new_name, data_policy, active_names)
         validated = config_manager.update_emby_instance(name, data)
+        if clear_traffic_data and emby_monitor:
+            emby_monitor.reset_traffic_stats(validated['name'])
         basics_only = config_manager.emby_instance_only_basics_changed(
             existing, validated, api_key_in_request=api_key_in_request)
         if basics_only:

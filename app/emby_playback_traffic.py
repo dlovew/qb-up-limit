@@ -1,23 +1,55 @@
 """Emby 单次外网播放会话的上行流量估算累计。"""
 
+import logging
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
+from emby_client import EmbyClient
 from emby_traffic_filter import (
     is_wan_playback_session,
+    is_wan_remote_session,
     legacy_playback_accumulator_key,
+    parse_endpoint_ip,
     playback_accumulator_key,
     session_docker_share_bps,
     session_stream_bps,
 )
 
+try:
+    from emby_lucky_verdict import (
+        analyze_lucky_connections,
+        binding_targets_from_analysis,
+        is_wan_browse_session,
+        match_hints_from_analysis,
+    )
+except ImportError:
+    def analyze_lucky_connections(*args, **kwargs):
+        return {'version': 2, 'groups': [], 'rows': [], 'emby_without_lucky': []}
+
+    def binding_targets_from_analysis(analysis):
+        return {}
+
+    def match_hints_from_analysis(analysis):
+        return {}
+
+    def is_wan_browse_session(session, *, credit_browse=True):
+        return False
+
+logger = logging.getLogger(__name__)
+
 _lock = threading.RLock()
 _upload_accumulators: Dict[str, Dict[str, int]] = {}
+_browse_upload_accumulators: Dict[str, Dict[str, int]] = {}
+_browse_session_meta: Dict[str, Dict[str, dict]] = {}
 _allocator_runtime: Dict[str, dict] = {}
 _live_tick_uploads: Dict[str, Dict[str, int]] = {}
 _accumulator_touch_mono: Dict[str, Dict[str, float]] = {}
+_conn_bindings: Dict[str, Dict[str, str]] = {}
+_conn_match_hints: Dict[str, Dict[str, str]] = {}
+_segment_conn_baselines: Dict[str, Dict[str, Dict[str, int]]] = {}
+_conn_info_cache: Dict[str, Dict[str, dict]] = {}
 
 DEFAULT_NEW_SESSION_WINDOW_SECONDS = 8
 DEFAULT_SEEK_WINDOW_SECONDS = 6
@@ -26,6 +58,221 @@ _VALID_PRIORITY_MODES = frozenset({'seek_first', 'new_first'})
 _MAX_WINDOW_SECONDS = 30
 _SESSION_STATE_GRACE_SECONDS = 120
 _ACCUMULATOR_STALE_SECONDS = 30 * 60
+
+_hydrated_instances: Set[str] = set()
+
+
+def _keys_for_session(session: dict, *, credit_browse: bool = False) -> Set[str]:
+    keys: Set[str] = set()
+    if not isinstance(session, dict):
+        return keys
+    for key in _accumulator_key_candidates(session):
+        if key:
+            keys.add(key)
+    persist = _persist_key_for_session(session)
+    if persist:
+        keys.add(persist)
+    if credit_browse:
+        try:
+            from emby_lucky_verdict import browse_persist_key_for_session
+            browse_key = browse_persist_key_for_session(session)
+            if browse_key:
+                keys.add(browse_key)
+        except Exception:
+            pass
+    return keys
+
+
+def collect_online_persist_keys(
+    instance_name: str,
+    sessions: list,
+    *,
+    credit_browse: bool = False,
+) -> Set[str]:
+    """收集当前在线外网会话对应的累加器键（含选片与受保护播放段）。"""
+    name = (instance_name or '').strip()
+    keys: Set[str] = set()
+    if not name:
+        return keys
+    for raw in sessions or []:
+        if not isinstance(raw, dict):
+            continue
+        prepared = raw
+        if raw.get('NowPlayingItem') or raw.get('PlayState'):
+            prepared = EmbyClient.normalize_session(raw)
+        if is_wan_playback_session(prepared):
+            keys.update(_keys_for_session(prepared, credit_browse=credit_browse))
+        elif credit_browse and is_wan_remote_session(prepared):
+            keys.update(_keys_for_session(prepared, credit_browse=True))
+    try:
+        import playback_record_store
+        for sid in playback_record_store.protected_playback_session_ids(name):
+            if sid:
+                keys.add(f'sid:{sid}')
+        for key, _ in playback_record_store.open_playing_upload_checkpoints(
+            name,
+        ).items():
+            if key:
+                keys.add(key)
+    except Exception:
+        pass
+    return keys
+
+
+def _playback_checkpoint_bytes(instance_name: str, active_keys: Set[str]) -> Dict[str, int]:
+    if not active_keys:
+        return {}
+    try:
+        import playback_record_store
+        checkpoints = playback_record_store.open_playing_upload_checkpoints(
+            instance_name,
+        )
+    except Exception:
+        return {}
+    return {
+        key: val
+        for key, val in checkpoints.items()
+        if key in active_keys and int(val or 0) > 0
+    }
+
+
+def hydrate_live_upload_state(
+    instance_name: str,
+    sessions: list,
+    *,
+    credit_browse: bool = False,
+) -> None:
+    """服务重启后：仅恢复当前在线会话的播放/选片累加器与 Lucky 连接归属。"""
+    name = (instance_name or '').strip()
+    if not name or name in _hydrated_instances:
+        return
+    _hydrated_instances.add(name)
+    active_keys = collect_online_persist_keys(
+        name, sessions, credit_browse=credit_browse,
+    )
+    if not active_keys:
+        return
+    try:
+        import emby_traffic_db
+        db_upload = emby_traffic_db.load_session_upload_accumulators(name)
+        db_browse = emby_traffic_db.load_browse_upload_accumulators(name)
+        db_bindings = emby_traffic_db.load_lucky_conn_bindings(name)
+    except Exception as e:
+        logger.warning(f'[Emby:{name}] 读取会话流量持久化失败: {e}')
+        return
+    checkpoints = _playback_checkpoint_bytes(name, active_keys)
+    restored_upload = 0
+    restored_browse = 0
+    restored_bindings = 0
+    now_mono = time.monotonic()
+    with _lock:
+        upload_bucket = _upload_accumulators.setdefault(name, {})
+        for key in active_keys:
+            if key.startswith('browse:'):
+                continue
+            mem = max(0, int(upload_bucket.get(key) or 0))
+            if key in checkpoints:
+                val = max(mem, int(checkpoints.get(key) or 0))
+            else:
+                val = max(mem, int(db_upload.get(key) or 0))
+            if val > 0:
+                upload_bucket[key] = val
+                _touch_accumulator_key(name, key, now_mono)
+                restored_upload += 1
+        browse_bucket = _browse_upload_accumulators.setdefault(name, {})
+        for key in active_keys:
+            if not key.startswith('browse:'):
+                continue
+            val = max(
+                int(browse_bucket.get(key) or 0),
+                int(db_browse.get(key) or 0),
+            )
+            if val > 0:
+                browse_bucket[key] = val
+                restored_browse += 1
+        bindings = _conn_bindings.setdefault(name, {})
+        for addr, pkey in db_bindings.items():
+            if pkey in active_keys and addr:
+                bindings[addr] = pkey
+                restored_bindings += 1
+    if restored_upload or restored_browse or restored_bindings:
+        logger.info(
+            f'[Emby:{name}] 会话流量续传: 播放键={restored_upload} '
+            f'选片键={restored_browse} 连接归属={restored_bindings}',
+        )
+
+
+def sync_live_upload_persistence(
+    instance_name: str,
+    sessions: list,
+    *,
+    credit_browse: bool = False,
+) -> None:
+    """将当前在线会话的累加器与连接归属写入数据库。"""
+    name = (instance_name or '').strip()
+    if not name:
+        return
+    active_keys = collect_online_persist_keys(
+        name, sessions, credit_browse=credit_browse,
+    )
+    with _lock:
+        upload_bucket = dict(_upload_accumulators.get(name) or {})
+        browse_bucket = dict(_browse_upload_accumulators.get(name) or {})
+        bindings = dict(_conn_bindings.get(name) or {})
+    filtered_upload = {
+        k: v for k, v in upload_bucket.items()
+        if k in active_keys and int(v or 0) > 0 and not k.startswith('browse:')
+    }
+    filtered_browse = {
+        k: v for k, v in browse_bucket.items()
+        if k in active_keys and int(v or 0) > 0
+    }
+    filtered_bindings = {
+        addr: pkey for addr, pkey in bindings.items()
+        if pkey in active_keys and str(addr).strip()
+    }
+    try:
+        import emby_traffic_db
+        emby_traffic_db.replace_session_upload_accumulators(name, filtered_upload)
+        emby_traffic_db.replace_browse_upload_accumulators(name, filtered_browse)
+        emby_traffic_db.replace_lucky_conn_bindings(name, filtered_bindings)
+    except Exception as e:
+        logger.debug(f'[Emby:{name}] 会话流量持久化失败: {e}')
+
+
+def clear_persisted_live_upload_state(instance_name: str) -> None:
+    """清空实例级会话流量持久化并允许下次重新 hydrate。"""
+    name = (instance_name or '').strip()
+    if not name:
+        return
+    _hydrated_instances.discard(name)
+    try:
+        import emby_traffic_db
+        emby_traffic_db.clear_live_upload_persistence(name)
+    except Exception as e:
+        logger.debug(f'[Emby:{name}] 清空会话流量持久化失败: {e}')
+
+
+def _delete_persisted_upload_keys(instance_name: str, keys: list) -> None:
+    uniq = [str(k).strip() for k in (keys or []) if str(k).strip()]
+    if not uniq:
+        return
+    playback_keys = [k for k in uniq if not k.startswith('browse:')]
+    browse_keys = [k for k in uniq if k.startswith('browse:')]
+    try:
+        import emby_traffic_db
+        if playback_keys:
+            emby_traffic_db.delete_session_upload_accumulator_keys(
+                instance_name, playback_keys,
+            )
+        if browse_keys:
+            emby_traffic_db.delete_browse_upload_accumulator_keys(
+                instance_name, browse_keys,
+            )
+    except Exception as e:
+        logger.debug(
+            f'[Emby:{instance_name}] 删除持久化累加器键失败: {e}',
+        )
 
 
 def _safe_int(value, default: int = 0) -> int:
@@ -80,6 +327,7 @@ def _migrate_accumulator_key(name: str, old_key: str, new_key: str,
     touched = _accumulator_touch_mono.setdefault(name, {})
     touched.pop(old_key, None)
     _touch_accumulator_key(name, new_key, now_mono)
+    _delete_persisted_upload_keys(name, [old_key])
 
 
 def _active_upload_sessions(sessions: list) -> List[dict]:
@@ -313,6 +561,7 @@ def _cleanup_stale_accumulators(name: str, now_mono: float,
     stale_after = max(60, int(stale_seconds or _ACCUMULATOR_STALE_SECONDS))
     runtime_sessions = (_allocator_runtime.get(name) or {}).get('sessions') or {}
     tick_bucket = _live_tick_uploads.get(name)
+    removed_keys: List[str] = []
     for key in list(bucket.keys()):
         seen_at = float(touched.get(key) or 0.0)
         if seen_at <= 0.0:
@@ -325,6 +574,10 @@ def _cleanup_stale_accumulators(name: str, now_mono: float,
         runtime_sessions.pop(key, None)
         if isinstance(tick_bucket, dict):
             tick_bucket.pop(key, None)
+        removed_keys.append(key)
+
+    if removed_keys:
+        _delete_persisted_upload_keys(name, removed_keys)
 
     if not bucket:
         _upload_accumulators.pop(name, None)
@@ -637,6 +890,521 @@ def accumulate_wan_upload(instance_name: str, sessions: list, delta_up: int,
         )
 
 
+def _segment_traffic_key(record: dict) -> str:
+    persist = playback_accumulator_key(record) or str(
+        record.get('upload_accumulator_key') or '',
+    ).strip()
+    item_id = str(record.get('item_id') or '').strip()
+    if persist and item_id:
+        return f'{persist}|{item_id}'
+    return persist or item_id
+
+
+def _persist_key_for_session(session: dict) -> str:
+    key = playback_accumulator_key(session)
+    if key:
+        return key
+    sid = str(
+        session.get('emby_session_id')
+        or session.get('session_id')
+        or session.get('id')
+        or ''
+    ).strip()
+    if sid:
+        return f'sid:{sid}'
+    return ''
+
+
+def _lucky_runtime(instance_name: str) -> dict:
+    state = _conn_bindings.setdefault(instance_name, {})
+    hints = _conn_match_hints.setdefault(instance_name, {})
+    _segment_conn_baselines.setdefault(instance_name, {})
+    _conn_info_cache.setdefault(instance_name, {})
+    return {
+        'bindings': state,
+        'match_hints': hints,
+        'segment_baselines': _segment_conn_baselines[instance_name],
+        'conn_info': _conn_info_cache[instance_name],
+    }
+
+
+def _sync_lucky_match_hints(
+    instance_name: str,
+    sessions: list,
+    analysis: dict,
+) -> None:
+    """同步跨 tick 连接匹配记忆，并清理已下线会话。"""
+    name = (instance_name or '').strip()
+    if not name:
+        return
+    active_keys = {
+        _persist_key_for_session(s)
+        for s in (sessions or [])
+        if isinstance(s, dict) and is_wan_remote_session(s)
+        and _persist_key_for_session(s)
+    }
+    runtime = _lucky_runtime(name)
+    hints: Dict[str, str] = runtime['match_hints']
+    for addr, pkey in match_hints_from_analysis(analysis).items():
+        if pkey in active_keys:
+            hints[addr] = pkey
+    for addr in list(hints.keys()):
+        if hints.get(addr) not in active_keys:
+            hints.pop(addr, None)
+
+
+def on_playback_segment_started(instance_name: str, record: dict) -> None:
+    """新播放段：记录连接累计基线，连播换集后本段从零展示。"""
+    name = (instance_name or '').strip()
+    if not name or not record:
+        return
+    seg_key = _segment_traffic_key(record)
+    if not seg_key:
+        return
+    with _lock:
+        runtime = _lucky_runtime(name)
+        runtime['segment_baselines'].setdefault(seg_key, {})
+
+
+def on_playback_segment_finalized(instance_name: str, record: dict) -> None:
+    name = (instance_name or '').strip()
+    if not name or not record:
+        return
+    seg_key = _segment_traffic_key(record)
+    if not seg_key:
+        return
+    with _lock:
+        baselines = _segment_conn_baselines.get(name) or {}
+        baselines.pop(seg_key, None)
+
+
+def _apply_conn_deltas_to_accumulator(
+    instance_name: str,
+    conn_shares: Dict[str, int],
+) -> int:
+    name = (instance_name or '').strip()
+    if not name or not conn_shares:
+        return 0
+    now_mono = time.monotonic()
+    assigned = 0
+    with _lock:
+        wan_tick_uploads: Dict[str, int] = {}
+        for persist_key, amount in conn_shares.items():
+            amount = max(0, int(amount or 0))
+            if amount <= 0 or not persist_key:
+                continue
+            wan_tick_uploads[persist_key] = (
+                wan_tick_uploads.get(persist_key, 0) + amount
+            )
+            assigned += amount
+        if wan_tick_uploads:
+            bucket = _upload_accumulators.setdefault(name, {})
+            for key, amount in wan_tick_uploads.items():
+                bucket[key] = bucket.get(key, 0) + amount
+                _touch_accumulator_key(name, key, now_mono)
+        _set_live_tick_uploads(name, wan_tick_uploads)
+    return assigned
+
+
+def _apply_conn_deltas_to_browse_accumulator(
+    instance_name: str,
+    conn_shares: Dict[str, int],
+) -> int:
+    name = (instance_name or '').strip()
+    if not name or not conn_shares:
+        return 0
+    now_mono = time.monotonic()
+    assigned = 0
+    with _lock:
+        for persist_key, amount in conn_shares.items():
+            amount = max(0, int(amount or 0))
+            if amount <= 0 or not persist_key:
+                continue
+            bucket = _browse_upload_accumulators.setdefault(name, {})
+            bucket[persist_key] = bucket.get(persist_key, 0) + amount
+            assigned += amount
+    return assigned
+
+
+def _snapshot_browse_upload_buckets(name: str) -> Dict[str, int]:
+    with _lock:
+        return dict(_browse_upload_accumulators.get(name) or {})
+
+
+def peek_browse_upload_bucket(name: str) -> Dict[str, int]:
+    """选片累计桶快照（只读）。"""
+    return _snapshot_browse_upload_buckets((name or '').strip())
+
+
+def peek_browse_upload_bytes_for_sid(instance_name: str, sid: str) -> int:
+    """读取指定会话 sid 在选片累计桶中的字节（不清除）。"""
+    from emby_lucky_verdict import browse_persist_key_for_session
+
+    name = (instance_name or '').strip()
+    sid = str(sid or '').strip()
+    if not name or not sid:
+        return 0
+    key = browse_persist_key_for_session({'id': sid})
+    if not key:
+        return 0
+    bucket = peek_browse_upload_bucket(name)
+    return max(0, int(bucket.get(key) or 0))
+
+
+def remember_browse_session_meta(instance_name: str, sid: str, meta: dict) -> None:
+    name = (instance_name or '').strip()
+    sid = str(sid or '').strip()
+    if not name or not sid or not isinstance(meta, dict):
+        return
+    user_name = str(meta.get('user_name') or '').strip()
+    if not user_name:
+        return
+    with _lock:
+        bucket = _browse_session_meta.setdefault(name, {})
+        prev = bucket.get(sid) or {}
+        bucket[sid] = {
+            'user_name': user_name,
+            'user_id': str(meta.get('user_id') or prev.get('user_id') or ''),
+            'viewing_title': str(
+                meta.get('viewing_title') or prev.get('viewing_title') or '',
+            ),
+            'series_name': str(
+                meta.get('series_name') or prev.get('series_name') or '',
+            ),
+            'episode_label': str(
+                meta.get('episode_label') or prev.get('episode_label') or '',
+            ),
+            'episode_title': str(
+                meta.get('episode_title') or prev.get('episode_title') or '',
+            ),
+            'device_name': str(
+                meta.get('device_name') or prev.get('device_name') or '',
+            ),
+            'client': str(meta.get('client') or prev.get('client') or ''),
+            'client_ip': str(meta.get('client_ip') or prev.get('client_ip') or ''),
+            'production_year': (
+                meta.get('production_year')
+                if meta.get('production_year') is not None
+                else prev.get('production_year')
+            ),
+            'emby_session_id': sid,
+            'session_id': sid,
+            'id': sid,
+        }
+
+
+def get_browse_session_meta(instance_name: str, sid: str) -> dict:
+    name = (instance_name or '').strip()
+    sid = str(sid or '').strip()
+    if not name or not sid:
+        return {}
+    with _lock:
+        return dict((_browse_session_meta.get(name) or {}).get(sid) or {})
+
+
+def pop_browse_session_meta(instance_name: str, sid: str) -> None:
+    name = (instance_name or '').strip()
+    sid = str(sid or '').strip()
+    if not name or not sid:
+        return
+    with _lock:
+        bucket = _browse_session_meta.get(name)
+        if bucket:
+            bucket.pop(sid, None)
+            if not bucket:
+                _browse_session_meta.pop(name, None)
+
+
+def _browse_sid_from_key(key: str) -> str:
+    text = str(key or '').strip()
+    prefix = 'browse:sid:'
+    if text.startswith(prefix):
+        return text[len(prefix):]
+    return ''
+
+
+def _session_for_sid(sessions: list, sid: str) -> Optional[dict]:
+    target = str(sid or '').strip()
+    if not target:
+        return None
+    for raw in sessions or []:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get('NowPlayingItem') or raw.get('PlayState'):
+            prepared = EmbyClient.normalize_session(raw)
+        else:
+            prepared = raw
+        psid = str(
+            prepared.get('id')
+            or prepared.get('emby_session_id')
+            or prepared.get('session_id')
+            or '',
+        ).strip()
+        if psid == target:
+            return prepared
+    return None
+
+
+def _meta_from_lucky_row(row: dict) -> dict:
+    emby_user = str(row.get('emby_user') or '').strip()
+    user_name = emby_user.split('·', 1)[0].strip() if emby_user else ''
+    return {
+        'user_name': user_name,
+        'user_id': '',
+        'viewing_title': str(row.get('media_label') or '').strip(),
+    }
+
+
+def _remember_browse_meta_from_analysis(instance_name: str, analysis: dict) -> None:
+    name = (instance_name or '').strip()
+    if not name or not isinstance(analysis, dict):
+        return
+    for row in analysis.get('rows') or []:
+        if str(row.get('billing_state') or '') != 'browse_credited':
+            continue
+        key = str(row.get('browse_persist_key') or '').strip()
+        sid = _browse_sid_from_key(key)
+        if not sid:
+            continue
+        meta = _meta_from_lucky_row(row)
+        if meta.get('user_name'):
+            remember_browse_session_meta(name, sid, meta)
+
+
+def _wan_pool_sessions(sessions: list, *, credit_browse: bool) -> list:
+    if credit_browse:
+        return [
+            s for s in (sessions or [])
+            if isinstance(s, dict) and is_wan_remote_session(s)
+        ]
+    return [
+        s for s in (sessions or [])
+        if isinstance(s, dict) and is_wan_playback_session(s)
+    ]
+
+
+def take_accumulated_browse_upload_by_key(
+    instance_name: str,
+    persist_key: str,
+) -> Optional[int]:
+    """读取并清除指定选片累计键的上行字节。"""
+    name = (instance_name or '').strip()
+    key = str(persist_key or '').strip()
+    if not name or not key:
+        return None
+    with _lock:
+        bucket = _browse_upload_accumulators.get(name) or {}
+        value = bucket.pop(key, None)
+        if not bucket:
+            _browse_upload_accumulators.pop(name, None)
+    if key:
+        _delete_persisted_upload_keys(name, [key])
+    if value is None:
+        return None
+    raw = max(0, int(value))
+    return raw if raw > 0 else None
+
+
+def take_accumulated_browse_upload(instance_name: str, subject: dict) -> Optional[int]:
+    """读取并清除与选片段匹配的累计上行。"""
+    if not subject:
+        return None
+    key = str(subject.get('upload_accumulator_key') or '').strip()
+    if not key:
+        from emby_lucky_verdict import browse_persist_key_for_session
+        key = browse_persist_key_for_session(subject)
+    if not key:
+        return None
+    return take_accumulated_browse_upload_by_key(instance_name, key)
+
+
+def accumulate_wan_upload_by_conn(
+    instance_name: str,
+    sessions: list,
+    conn_deltas: Dict[str, int],
+    conn_rows: List[dict],
+    *,
+    tick_seconds: float = None,
+    credit_browse: bool = False,
+) -> dict:
+    """Lucky：按 ConnsStatistics 连接级增量归属到外网会话。"""
+    name = (instance_name or '').strip()
+    deltas = {
+        str(addr).strip(): max(0, int(v or 0))
+        for addr, v in (conn_deltas or {}).items()
+        if str(addr).strip() and int(v or 0) > 0
+    }
+    if not name or not deltas:
+        return _allocation_debug_payload()
+
+    active_remote = _wan_pool_sessions(sessions, credit_browse=credit_browse)
+    if not active_remote:
+        return _allocation_debug_payload(
+            total_upload_bytes=sum(deltas.values()),
+            remainder_bytes=sum(deltas.values()),
+        )
+
+    assigned_total = 0
+    remainder_total = 0
+    merged = _allocation_debug_payload()
+    conn_shares: Dict[str, int] = {}
+    browse_shares: Dict[str, int] = {}
+    unassigned_by_ip: Dict[str, int] = {}
+
+    with _lock:
+        runtime = _lucky_runtime(name)
+        bindings: Dict[str, str] = runtime['bindings']
+        match_hints: Dict[str, str] = dict(runtime.get('match_hints') or {})
+        upload_bucket = dict(_upload_accumulators.get(name) or {})
+        browse_bucket = dict(_browse_upload_accumulators.get(name) or {})
+        for conn in conn_rows or []:
+            addr = str(conn.get('remote_addr') or '').strip()
+            if addr:
+                runtime['conn_info'][addr] = dict(conn)
+
+        active_keys = {
+            _persist_key_for_session(s)
+            for s in active_remote
+            if _persist_key_for_session(s)
+        }
+        if credit_browse:
+            from emby_lucky_verdict import browse_persist_key_for_session
+            for s in active_remote:
+                if is_wan_browse_session(s, credit_browse=True):
+                    bkey = browse_persist_key_for_session(s)
+                    if bkey:
+                        active_keys.add(bkey)
+        for addr in list(bindings.keys()):
+            if bindings.get(addr) not in active_keys:
+                bindings.pop(addr, None)
+
+        analysis = analyze_lucky_connections(
+            sessions,
+            conn_rows,
+            deltas,
+            bindings=bindings,
+            match_hints=match_hints,
+            upload_bucket=upload_bucket,
+            browse_upload_bucket=browse_bucket,
+            credit_browse=credit_browse,
+        )
+        for addr, pkey in binding_targets_from_analysis(analysis).items():
+            bindings[addr] = pkey
+        _sync_lucky_match_hints(name, sessions, analysis)
+
+        for row in analysis.get('rows') or []:
+            addr = str(row.get('remote_addr') or '').strip()
+            delta = max(0, int(deltas.get(addr) or 0))
+            if delta <= 0:
+                continue
+            billing = str(row.get('billing_state') or '')
+            pkey = str(row.get('billing_persist_key') or '').strip()
+            browse_key = str(row.get('browse_persist_key') or '').strip()
+            if billing == 'credited' and pkey:
+                conn_shares[pkey] = conn_shares.get(pkey, 0) + delta
+            elif billing == 'browse_credited' and browse_key:
+                browse_sid = _browse_sid_from_key(browse_key)
+                stream_session = _session_for_sid(sessions, browse_sid)
+                if stream_session and EmbyClient.is_active_playback_stream(
+                    stream_session,
+                ):
+                    play_key = _persist_key_for_session(stream_session)
+                    if play_key:
+                        conn_shares[play_key] = (
+                            conn_shares.get(play_key, 0) + delta
+                        )
+                    else:
+                        browse_shares[browse_key] = (
+                            browse_shares.get(browse_key, 0) + delta
+                        )
+                else:
+                    browse_shares[browse_key] = (
+                        browse_shares.get(browse_key, 0) + delta
+                    )
+            else:
+                ip = str(
+                    row.get('ip') or parse_endpoint_ip(addr) or '',
+                ).strip()
+                if ip:
+                    unassigned_by_ip[ip] = unassigned_by_ip.get(ip, 0) + delta
+                else:
+                    remainder_total += delta
+
+    for ip, pool in unassigned_by_ip.items():
+        pool = max(0, int(pool or 0))
+        if pool <= 0:
+            continue
+        ip_sessions = [
+            s for s in active_remote
+            if parse_endpoint_ip(s.get('remote_endpoint') or '') == ip
+        ]
+        if not ip_sessions:
+            remainder_total += pool
+            continue
+        infos = [
+            {'key': _persist_key_for_session(s), 'bps': session_stream_bps(s)}
+            for s in ip_sessions
+        ]
+        infos = [i for i in infos if i.get('key')]
+        extra = _distribute_weighted(pool, infos)
+        for key, amount in extra.items():
+            conn_shares[key] = conn_shares.get(key, 0) + amount
+
+    assigned_total = _apply_conn_deltas_to_accumulator(name, conn_shares)
+    assigned_total += _apply_conn_deltas_to_browse_accumulator(name, browse_shares)
+    _remember_browse_meta_from_analysis(name, analysis)
+    remainder_total += max(0, sum(deltas.values()) - assigned_total)
+
+    total = sum(deltas.values())
+    merged['total_upload_bytes'] = total
+    merged['wan_upload_bytes'] = assigned_total
+    merged['assigned_bytes'] = assigned_total
+    merged['remainder_bytes'] = max(0, total - assigned_total)
+    merged['program_remainder_bytes'] = remainder_total
+    merged['wan_session_count'] = len(active_remote)
+    return merged
+
+
+def get_lucky_conn_debug_snapshot(
+    instance_name: str,
+    sessions: list,
+    conn_rows: List[dict],
+    conn_deltas: Dict[str, int],
+    *,
+    credit_browse: bool = False,
+) -> dict:
+    """调试：Lucky 连接统一裁决快照（按 IP 分组）。"""
+    name = (instance_name or '').strip()
+    if not name:
+        return {
+            'version': 2,
+            'groups': [],
+            'rows': [],
+            'emby_without_lucky': [],
+            'total_connections': 0,
+        }
+    deltas = {
+        str(k).strip(): max(0, int(v or 0))
+        for k, v in (conn_deltas or {}).items()
+        if str(k).strip()
+    }
+    with _lock:
+        bindings = dict(_conn_bindings.get(name) or {})
+        match_hints = dict(_conn_match_hints.get(name) or {})
+        upload_bucket = dict(_upload_accumulators.get(name) or {})
+        browse_bucket = dict(_browse_upload_accumulators.get(name) or {})
+    return analyze_lucky_connections(
+        sessions,
+        conn_rows,
+        deltas,
+        bindings=bindings,
+        match_hints=match_hints,
+        upload_bucket=upload_bucket,
+        browse_upload_bucket=browse_bucket,
+        credit_browse=credit_browse,
+    )
+
+
 def peek_accumulated_upload(instance_name: str, event: dict) -> Optional[int]:
     name = (instance_name or '').strip()
     if not name or not event:
@@ -648,8 +1416,14 @@ def peek_accumulated_upload(instance_name: str, event: dict) -> Optional[int]:
     return value
 
 
-def annotate_live_sessions_upload(instance_name: str, sessions: list) -> List[dict]:
-    """给实时会话附加当前已累计分摊上行与本轮分摊新增（调试展示）。"""
+def annotate_live_sessions_upload(
+    instance_name: str,
+    sessions: list,
+    *,
+    lucky_ip_traffic: Dict[str, Dict[str, int]] = None,
+    lucky_ip_tick_deltas: Dict[str, int] = None,
+) -> List[dict]:
+    """给实时会话附加本段上行累计与本轮新增（统一读会话累加器）。"""
     name = (instance_name or '').strip()
     result: List[dict] = []
     upload_bucket: Dict[str, int] = {}
@@ -663,7 +1437,11 @@ def annotate_live_sessions_upload(instance_name: str, sessions: list) -> List[di
         else:
             continue
 
-        if name and session.get('is_remote') and bool(session.get('is_playing')):
+        if (
+            name
+            and session.get('is_remote')
+            and EmbyClient.is_current_playback_session(session)
+        ):
             live_key, upload_live = _resolve_bucket_upload(upload_bucket, session)
             if upload_live is None:
                 upload_live = 0
@@ -719,24 +1497,68 @@ def clear_instance_live_upload_state(instance_name: str) -> None:
         return
     with _lock:
         _upload_accumulators.pop(name, None)
+        # 选片累计桶不在此清空：选片会话断开后仍需保留累计字节，
+        # 等待结算器在宽限期后读取入库（由 take_accumulated_browse_upload_by_key 按键清除）。
         _live_tick_uploads.pop(name, None)
         _accumulator_touch_mono.pop(name, None)
         _allocator_runtime.pop(name, None)
+        _conn_bindings.pop(name, None)
+        _conn_match_hints.pop(name, None)
+        _segment_conn_baselines.pop(name, None)
+        _conn_info_cache.pop(name, None)
+        # 选片会话 meta 不在此清空：断开宽限期内结算器仍需用户名。
+    # 选片结算器跟踪状态不在此清空：无会话时正是断开/离开选片后的入库宽限期。
 
 
 def purge_stopped_wan_live_upload_state(instance_name: str, sessions: list) -> None:
-    """停止播放后清理实时分摊桶与运行时状态，避免同会话再次播放时叠加旧累计。"""
+    """停止播放后清理实时分摊桶；open/待确认记录存活期间不得清桶。"""
     name = (instance_name or '').strip()
     if not name:
         return
+    from emby_client import EmbyClient
+    try:
+        import playback_record_store
+        protected_sids = playback_record_store.protected_playback_session_ids(name)
+    except Exception:
+        protected_sids = set()
     for raw in sessions or []:
         if not isinstance(raw, dict):
             continue
-        if not raw.get('is_remote'):
+        prepared = raw
+        if raw.get('NowPlayingItem') or raw.get('PlayState'):
+            prepared = EmbyClient.normalize_session(raw)
+        if EmbyClient.is_current_playback_session(prepared):
             continue
-        if bool(raw.get('is_playing')):
+        if not EmbyClient.session_has_now_playing_media(prepared):
             continue
-        if not (raw.get('item_id') or raw.get('title')):
+        sid = str(
+            prepared.get('id')
+            or raw.get('emby_session_id')
+            or raw.get('id')
+            or raw.get('Id')
+            or raw.get('session_id')
+            or ''
+        ).strip()
+        endpoint = (
+            prepared.get('remote_endpoint')
+            or raw.get('remote_endpoint')
+            or raw.get('RemoteEndPoint')
+            or ''
+        ).strip()
+        remote_ok = bool(prepared.get('is_remote') or raw.get('is_remote'))
+        if not remote_ok and endpoint:
+            from emby_traffic_filter import is_wan_endpoint
+            remote_ok = is_wan_endpoint(endpoint)
+        if not remote_ok:
+            continue
+        if sid and sid in protected_sids:
+            try:
+                import playback_record_store
+                playback_record_store.checkpoint_stopped_session_upload(name, prepared)
+            except Exception as e:
+                logger.debug(
+                    f'[Emby:{name}] 停止播放流量刷入失败 sid={sid}: {e}',
+                )
             continue
         with _lock:
             bucket = _upload_accumulators.get(name) or {}
@@ -750,6 +1572,7 @@ def purge_stopped_wan_live_upload_state(instance_name: str, sessions: list) -> N
                     _upload_accumulators.pop(name, None)
                 if isinstance(touched, dict) and not touched:
                     _accumulator_touch_mono.pop(name, None)
+                _delete_persisted_upload_keys(name, [key])
             _purge_session_allocation_runtime(name, raw, bucket_key=key or '')
 
 
@@ -773,9 +1596,125 @@ def take_accumulated_upload(instance_name: str, event: dict) -> Optional[int]:
         if isinstance(touched, dict) and not touched:
             _accumulator_touch_mono.pop(name, None)
         _purge_session_allocation_runtime(name, event, bucket_key=key or '')
+    if key:
+        _delete_persisted_upload_keys(name, [key])
     if value is None:
         return None
     raw = max(0, int(value))
     if raw <= 0:
         return None
     return raw
+
+
+def _assign_lucky_ip_upload(instance_name: str, sessions: list, delta_up: int) -> dict:
+    """Lucky 回退路径：同 IP 多会话时按码率权重分摊。"""
+    name = (instance_name or '').strip()
+    delta_up = max(0, int(delta_up or 0))
+    active = _active_upload_sessions(sessions)
+    if not name or delta_up <= 0 or not active:
+        return _allocation_debug_payload(
+            total_upload_bytes=delta_up,
+            remainder_bytes=delta_up,
+        )
+
+    infos = [
+        {'key': _persist_key_for_session(s), 'bps': session_stream_bps(s)}
+        for s in active
+    ]
+    infos = [i for i in infos if i.get('key')]
+    shares = _distribute_weighted(delta_up, infos)
+    assigned = _apply_conn_deltas_to_accumulator(name, shares)
+    return _allocation_debug_payload(
+        total_upload_bytes=delta_up,
+        wan_upload_bytes=assigned,
+        assigned_bytes=assigned,
+        remainder_bytes=max(0, delta_up - assigned),
+        target_session_count=len(active),
+        wan_session_count=len(active),
+    )
+
+
+def accumulate_wan_upload_by_ip(
+    instance_name: str,
+    sessions: list,
+    ip_deltas: Dict[str, int],
+    *,
+    tick_seconds: float = None,
+) -> dict:
+    """Lucky 模式：按客户端 IP 增量分摊到对应外网会话。"""
+    name = (instance_name or '').strip()
+    deltas = {
+        str(ip).strip(): max(0, int(v or 0))
+        for ip, v in (ip_deltas or {}).items()
+        if str(ip).strip() and int(v or 0) > 0
+    }
+    if not name or not deltas:
+        return _allocation_debug_payload()
+    active_remote = [
+        s for s in (sessions or [])
+        if isinstance(s, dict) and is_wan_playback_session(s)
+    ]
+    if not active_remote:
+        return _allocation_debug_payload(
+            total_upload_bytes=sum(deltas.values()),
+            remainder_bytes=sum(deltas.values()),
+        )
+
+    assigned_total = 0
+    remainder_total = 0
+    merged_debug = _allocation_debug_payload()
+    matched_ips = set()
+    for ip, delta in deltas.items():
+        ip_sessions = [
+            s for s in active_remote
+            if parse_endpoint_ip(s.get('remote_endpoint') or '') == ip
+        ]
+        if not ip_sessions:
+            continue
+        matched_ips.add(ip)
+        part = _assign_lucky_ip_upload(name, ip_sessions, delta)
+        assigned = int(
+            part.get('wan_upload_bytes') or part.get('assigned_bytes') or 0,
+        )
+        assigned_total += assigned
+        remainder_total += max(0, int(part.get('remainder_bytes') or 0))
+        merged_debug['wan_upload_bytes'] = (
+            int(merged_debug.get('wan_upload_bytes') or 0) + assigned
+        )
+        merged_debug['assigned_bytes'] = (
+            int(merged_debug.get('assigned_bytes') or 0) + assigned
+        )
+
+    unmatched_delta = sum(
+        v for ip, v in deltas.items() if ip not in matched_ips
+    )
+    if unmatched_delta > 0 and active_remote:
+        fallback_sessions = active_remote
+        if len(deltas) == 1 and len(active_remote) == 1:
+            fallback_sessions = active_remote
+        elif not matched_ips:
+            fallback_sessions = active_remote
+        else:
+            fallback_sessions = [
+                s for s in active_remote
+                if parse_endpoint_ip(s.get('remote_endpoint') or '') not in matched_ips
+            ] or active_remote
+        part = _assign_lucky_ip_upload(name, fallback_sessions, unmatched_delta)
+        assigned = int(
+            part.get('wan_upload_bytes') or part.get('assigned_bytes') or 0,
+        )
+        assigned_total += assigned
+        remainder_total += max(0, int(part.get('remainder_bytes') or 0))
+        merged_debug['wan_upload_bytes'] = (
+            int(merged_debug.get('wan_upload_bytes') or 0) + assigned
+        )
+        merged_debug['assigned_bytes'] = (
+            int(merged_debug.get('assigned_bytes') or 0) + assigned
+        )
+
+    total = sum(deltas.values())
+    merged_debug['total_upload_bytes'] = total
+    merged_debug['wan_pool_bytes'] = assigned_total
+    merged_debug['remainder_bytes'] = max(0, total - assigned_total)
+    merged_debug['program_remainder_bytes'] = remainder_total
+    return merged_debug

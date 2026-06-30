@@ -2,7 +2,7 @@ import json
 import sqlite3
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import threading
 
 logger = logging.getLogger(__name__)
@@ -77,6 +77,17 @@ def set_timezone(tz):
     _timezone = tz
 
 
+def get_config_timezone():
+    """返回与 scheduler 一致的配置时区，未注入时默认 Asia/Shanghai。"""
+    if _timezone is not None:
+        return _timezone
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo('Asia/Shanghai')
+    except Exception:
+        return timezone.utc
+
+
 def now_local() -> datetime:
     """配置时区下的当前本地 naive 时间（用于入库与查询）"""
     if _timezone is not None:
@@ -110,7 +121,9 @@ def _normalize_direction(direction: str) -> str:
 
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(
+        DB_PATH, check_same_thread=False, timeout=30.0,
+    )
     conn.row_factory = sqlite3.Row
     return conn
 

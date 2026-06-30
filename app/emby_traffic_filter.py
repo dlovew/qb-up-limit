@@ -72,6 +72,13 @@ def is_wan_playback_session(session: dict) -> bool:
     return is_wan_endpoint(session.get('remote_endpoint') or '')
 
 
+def is_wan_remote_session(session: dict) -> bool:
+    """外网在线会话（含选片/暂停），用于 Lucky 连接匹配池。"""
+    if not isinstance(session, dict):
+        return False
+    return is_wan_endpoint(session.get('remote_endpoint') or '')
+
+
 def _is_transcode_session(session: dict) -> bool:
     if not session:
         return False

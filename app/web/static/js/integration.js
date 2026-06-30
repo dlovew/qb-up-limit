@@ -655,6 +655,54 @@ function isMobileViewport() {
     return window.matchMedia('(max-width: 992px)').matches;
 }
 
+function isDesktopPanelSwitchViewport() {
+    return window.matchMedia('(min-width: 769px)').matches;
+}
+
+function mountPanelContextSwitches(tab) {
+    const navbarHome = document.getElementById('navbarContextSwitchHome');
+    const platformSwitch = document.getElementById('platformTypeSwitch');
+    const syslogSwitch = document.getElementById('syslogTypeSwitch');
+    const statsSlot = document.getElementById('statsPanelSwitchSlot');
+    const eventsSlot = document.getElementById('eventsPanelSwitchSlot');
+    const syslogsSlot = document.getElementById('syslogsPanelSwitchSlot');
+    if (!navbarHome) return;
+
+    const isDesktop = isDesktopPanelSwitchViewport();
+    const showPlatform = embyFeatureEnabled && (tab === 'stats' || tab === 'events');
+    const showSyslog = tab === 'syslogs';
+
+    let platformParent = navbarHome;
+    if (isDesktop && showPlatform) {
+        platformParent = (tab === 'stats' ? statsSlot : eventsSlot) || navbarHome;
+    }
+
+    let syslogParent = navbarHome;
+    if (isDesktop && showSyslog) {
+        syslogParent = syslogsSlot || navbarHome;
+    }
+
+    if (platformSwitch && platformParent && platformSwitch.parentElement !== platformParent) {
+        platformParent.appendChild(platformSwitch);
+    }
+    if (syslogSwitch && syslogParent && syslogSwitch.parentElement !== syslogParent) {
+        syslogParent.appendChild(syslogSwitch);
+    }
+
+    [statsSlot, eventsSlot, syslogsSlot].forEach((slot) => {
+        if (!slot) return;
+        const occupied = (platformSwitch && slot.contains(platformSwitch))
+            || (syslogSwitch && slot.contains(syslogSwitch));
+        slot.hidden = !occupied;
+        slot.setAttribute('aria-hidden', occupied ? 'false' : 'true');
+    });
+
+    const homeVisible = (platformSwitch && navbarHome.contains(platformSwitch) && !platformSwitch.hidden)
+        || (syslogSwitch && navbarHome.contains(syslogSwitch) && !syslogSwitch.hidden);
+    navbarHome.hidden = !homeVisible;
+    navbarHome.setAttribute('aria-hidden', homeVisible ? 'false' : 'true');
+}
+
 function normalizeDeviceViewMode(mode) {
     const value = String(mode || '').trim().toLowerCase();
     return DEVICE_VIEW_MODES.has(value) ? value : 'qb';
@@ -1018,6 +1066,8 @@ function syncNavbarContextSwitchUi() {
         syslogSwitch.hidden = !showSyslog;
         syslogSwitch.setAttribute('aria-hidden', showSyslog ? 'false' : 'true');
     }
+
+    mountPanelContextSwitches(tab);
 
     syncDeviceViewSwitchUi();
     syncPlatformTypeSwitchUi(getDeviceTypeFilter() || 'qb');
@@ -1629,6 +1679,9 @@ function bindGlobalEmbySettingsSection() {
 }
 
 window.addEventListener('resize', () => {
+    if (typeof syncNavbarContextSwitchUi === 'function') {
+        syncNavbarContextSwitchUi();
+    }
     if (!embyFeatureEnabled) return;
     syncViewportDeviceViewMode();
     if (typeof currentTab !== 'undefined' && currentTab === 'devices') {

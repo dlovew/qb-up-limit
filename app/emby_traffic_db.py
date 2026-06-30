@@ -13,10 +13,19 @@ logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _emby_schema_ensured = False
+_migrations_started = False
+_migrations_running = False
 
 _EMBY_SCHEMA_COLUMNS = (
     ('emby_traffic_hourly', 'backfilled_uploaded_bytes', 'BIGINT NOT NULL DEFAULT 0'),
     ('emby_traffic_hourly', 'backfilled_downloaded_bytes', 'BIGINT NOT NULL DEFAULT 0'),
+    ('emby_browse_upload_facts', 'series_name', 'TEXT'),
+    ('emby_browse_upload_facts', 'episode_label', 'TEXT'),
+    ('emby_browse_upload_facts', 'episode_title', 'TEXT'),
+    ('emby_browse_upload_facts', 'device_name', 'TEXT'),
+    ('emby_browse_upload_facts', 'client', 'TEXT'),
+    ('emby_browse_upload_facts', 'client_ip', 'TEXT'),
+    ('emby_browse_upload_facts', 'production_year', 'INTEGER'),
 )
 
 
@@ -98,6 +107,78 @@ def init_db():
                     UNIQUE(instance_name, user_name, hour_start)
                 )
             ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS emby_browse_upload_facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    instance_name TEXT NOT NULL,
+                    segment_id INTEGER NOT NULL,
+                    user_name TEXT NOT NULL,
+                    user_id TEXT,
+                    stopped_at DATETIME NOT NULL,
+                    estimated_upload_bytes BIGINT NOT NULL DEFAULT 0,
+                    viewing_title TEXT,
+                    settle_reason TEXT,
+                    UNIQUE(instance_name, segment_id)
+                )
+            ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS emby_browse_upload_hourly (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    instance_name TEXT NOT NULL,
+                    user_name TEXT NOT NULL,
+                    hour_start DATETIME NOT NULL,
+                    uploaded_bytes BIGINT NOT NULL DEFAULT 0,
+                    segment_count INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(instance_name, user_name, hour_start)
+                )
+            ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS emby_lucky_ip_baselines (
+                    instance_name TEXT NOT NULL,
+                    ip TEXT NOT NULL,
+                    traffic_out BIGINT NOT NULL DEFAULT 0,
+                    traffic_in BIGINT NOT NULL DEFAULT 0,
+                    updated_at DATETIME,
+                    PRIMARY KEY (instance_name, ip)
+                )
+            ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS emby_lucky_conn_baselines (
+                    instance_name TEXT NOT NULL,
+                    remote_addr TEXT NOT NULL,
+                    traffic_out BIGINT NOT NULL DEFAULT 0,
+                    traffic_in BIGINT NOT NULL DEFAULT 0,
+                    updated_at DATETIME,
+                    PRIMARY KEY (instance_name, remote_addr)
+                )
+            ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS emby_session_upload_accumulators (
+                    instance_name TEXT NOT NULL,
+                    persist_key TEXT NOT NULL,
+                    bytes BIGINT NOT NULL DEFAULT 0,
+                    updated_at DATETIME,
+                    PRIMARY KEY (instance_name, persist_key)
+                )
+            ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS emby_browse_upload_accumulators (
+                    instance_name TEXT NOT NULL,
+                    persist_key TEXT NOT NULL,
+                    bytes BIGINT NOT NULL DEFAULT 0,
+                    updated_at DATETIME,
+                    PRIMARY KEY (instance_name, persist_key)
+                )
+            ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS emby_lucky_conn_bindings (
+                    instance_name TEXT NOT NULL,
+                    remote_addr TEXT NOT NULL,
+                    persist_key TEXT NOT NULL,
+                    updated_at DATETIME,
+                    PRIMARY KEY (instance_name, remote_addr)
+                )
+            ''')
             for table, column, col_type in _EMBY_SCHEMA_COLUMNS:
                 try:
                     c.execute(
@@ -109,7 +190,34 @@ def init_db():
             _emby_schema_ensured = True
         finally:
             conn.close()
-    _run_pending_migrations()
+    _start_background_migrations()
+
+
+def _start_background_migrations():
+    """重迁移放后台执行，避免阻塞启动并与采集线程争用 SQLite。"""
+    global _migrations_started
+    with _lock:
+        if _migrations_started:
+            return
+        _migrations_started = True
+
+    def _worker():
+        global _migrations_running
+        with _lock:
+            if _migrations_running:
+                return
+            _migrations_running = True
+        try:
+            _run_pending_migrations()
+        except Exception as e:
+            logger.error('后台数据库迁移失败: %s', e, exc_info=True)
+        finally:
+            with _lock:
+                _migrations_running = False
+
+    threading.Thread(
+        target=_worker, name='emby-db-migrate', daemon=True,
+    ).start()
 
 
 def _ensure_traffic_timezone_from_config():
@@ -163,6 +271,433 @@ def has_docker_baseline(instance_name: str) -> bool:
             c = conn.cursor()
             last_tx = _get_last_total(c, instance_name, 'last_total_uploaded')
             return last_tx > 0
+        finally:
+            conn.close()
+
+
+def get_instance_last_totals(instance_name: str) -> tuple:
+    """读取实例上次落库的累计上传/下载基线（用于 Lucky 单调递增写入）。"""
+    _ensure_emby_schema()
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            return (
+                _get_last_total(c, instance_name, 'last_total_uploaded'),
+                _get_last_total(c, instance_name, 'last_total_downloaded'),
+            )
+        finally:
+            conn.close()
+
+
+def load_lucky_ip_baselines(instance_name: str) -> dict:
+    """读取 Lucky 各 IP 上次见到的累计 TrafficOut/In。"""
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name:
+        return {}
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT ip, traffic_out, traffic_in
+                FROM emby_lucky_ip_baselines
+                WHERE instance_name = ?
+            ''', (name,))
+            result = {}
+            for row in c.fetchall():
+                ip = str(row['ip'] or '').strip()
+                if not ip:
+                    continue
+                result[ip] = {
+                    'out': max(0, int(row['traffic_out'] or 0)),
+                    'in': max(0, int(row['traffic_in'] or 0)),
+                }
+            return result
+        finally:
+            conn.close()
+
+
+def save_lucky_ip_baselines(instance_name: str, baselines: dict) -> None:
+    """持久化 Lucky IP 累计基线（IP 暂离 accessdetail 时保留，避免重连漏计）。"""
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name or not baselines:
+        return
+    now = _now()
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            for ip, values in baselines.items():
+                ip = str(ip or '').strip()
+                if not ip or not isinstance(values, dict):
+                    continue
+                c.execute('''
+                    INSERT INTO emby_lucky_ip_baselines (
+                        instance_name, ip, traffic_out, traffic_in, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(instance_name, ip) DO UPDATE SET
+                        traffic_out = excluded.traffic_out,
+                        traffic_in = excluded.traffic_in,
+                        updated_at = excluded.updated_at
+                ''', (
+                    name,
+                    ip,
+                    max(0, int(values.get('out') or 0)),
+                    max(0, int(values.get('in') or 0)),
+                    now,
+                ))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def clear_lucky_ip_baselines(instance_name: str) -> None:
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name:
+        return
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'DELETE FROM emby_lucky_ip_baselines WHERE instance_name = ?',
+                (name,),
+            )
+            c.execute(
+                'DELETE FROM emby_lucky_conn_baselines WHERE instance_name = ?',
+                (name,),
+            )
+            _clear_live_upload_persistence_unlocked(c, name)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def load_lucky_conn_baselines(instance_name: str) -> dict:
+    """读取 Lucky 各 RemoteAddr 上次见到的累计 TrafficOut/In。"""
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name:
+        return {}
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT remote_addr, traffic_out, traffic_in
+                FROM emby_lucky_conn_baselines
+                WHERE instance_name = ?
+            ''', (name,))
+            result = {}
+            for row in c.fetchall():
+                addr = str(row['remote_addr'] or '').strip()
+                if not addr:
+                    continue
+                result[addr] = {
+                    'out': max(0, int(row['traffic_out'] or 0)),
+                    'in': max(0, int(row['traffic_in'] or 0)),
+                }
+            return result
+        finally:
+            conn.close()
+
+
+def save_lucky_conn_baselines(instance_name: str, baselines: dict) -> None:
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name or not baselines:
+        return
+    now = _now()
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            for addr, values in baselines.items():
+                addr = str(addr or '').strip()
+                if not addr or not isinstance(values, dict):
+                    continue
+                c.execute('''
+                    INSERT INTO emby_lucky_conn_baselines (
+                        instance_name, remote_addr, traffic_out, traffic_in, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(instance_name, remote_addr) DO UPDATE SET
+                        traffic_out = excluded.traffic_out,
+                        traffic_in = excluded.traffic_in,
+                        updated_at = excluded.updated_at
+                ''', (
+                    name,
+                    addr,
+                    max(0, int(values.get('out') or 0)),
+                    max(0, int(values.get('in') or 0)),
+                    now,
+                ))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def load_session_upload_accumulators(instance_name: str) -> dict:
+    """读取实例级播放会话上行累加器快照。"""
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name:
+        return {}
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT persist_key, bytes
+                FROM emby_session_upload_accumulators
+                WHERE instance_name = ?
+            ''', (name,))
+            result = {}
+            for row in c.fetchall():
+                key = str(row['persist_key'] or '').strip()
+                if not key:
+                    continue
+                val = max(0, int(row['bytes'] or 0))
+                if val > 0:
+                    result[key] = val
+            return result
+        finally:
+            conn.close()
+
+
+def replace_session_upload_accumulators(instance_name: str, bucket: dict) -> None:
+    """全量替换实例播放累加器（仅保留当前在线会话键）。"""
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name:
+        return
+    cleaned = {
+        str(k).strip(): max(0, int(v or 0))
+        for k, v in (bucket or {}).items()
+        if str(k).strip() and int(v or 0) > 0
+    }
+    now = _now()
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'DELETE FROM emby_session_upload_accumulators WHERE instance_name = ?',
+                (name,),
+            )
+            for key, val in cleaned.items():
+                c.execute('''
+                    INSERT INTO emby_session_upload_accumulators (
+                        instance_name, persist_key, bytes, updated_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                ''', (name, key, val, now))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def delete_session_upload_accumulator_keys(
+    instance_name: str, keys: list,
+) -> None:
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name or not keys:
+        return
+    uniq = [str(k).strip() for k in keys if str(k).strip()]
+    if not uniq:
+        return
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            for key in uniq:
+                c.execute('''
+                    DELETE FROM emby_session_upload_accumulators
+                    WHERE instance_name = ? AND persist_key = ?
+                ''', (name, key))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def load_browse_upload_accumulators(instance_name: str) -> dict:
+    """读取实例级选片上行累加器快照。"""
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name:
+        return {}
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT persist_key, bytes
+                FROM emby_browse_upload_accumulators
+                WHERE instance_name = ?
+            ''', (name,))
+            result = {}
+            for row in c.fetchall():
+                key = str(row['persist_key'] or '').strip()
+                if not key:
+                    continue
+                val = max(0, int(row['bytes'] or 0))
+                if val > 0:
+                    result[key] = val
+            return result
+        finally:
+            conn.close()
+
+
+def replace_browse_upload_accumulators(instance_name: str, bucket: dict) -> None:
+    """全量替换实例选片累加器（仅保留当前在线会话键）。"""
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name:
+        return
+    cleaned = {
+        str(k).strip(): max(0, int(v or 0))
+        for k, v in (bucket or {}).items()
+        if str(k).strip() and int(v or 0) > 0
+    }
+    now = _now()
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'DELETE FROM emby_browse_upload_accumulators WHERE instance_name = ?',
+                (name,),
+            )
+            for key, val in cleaned.items():
+                c.execute('''
+                    INSERT INTO emby_browse_upload_accumulators (
+                        instance_name, persist_key, bytes, updated_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                ''', (name, key, val, now))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def delete_browse_upload_accumulator_keys(
+    instance_name: str, keys: list,
+) -> None:
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name or not keys:
+        return
+    uniq = [str(k).strip() for k in keys if str(k).strip()]
+    if not uniq:
+        return
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            for key in uniq:
+                c.execute('''
+                    DELETE FROM emby_browse_upload_accumulators
+                    WHERE instance_name = ? AND persist_key = ?
+                ''', (name, key))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def load_lucky_conn_bindings(instance_name: str) -> dict:
+    """读取 Lucky 连接归属记忆（remote_addr → persist_key）。"""
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name:
+        return {}
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT remote_addr, persist_key
+                FROM emby_lucky_conn_bindings
+                WHERE instance_name = ?
+            ''', (name,))
+            result = {}
+            for row in c.fetchall():
+                addr = str(row['remote_addr'] or '').strip()
+                pkey = str(row['persist_key'] or '').strip()
+                if addr and pkey:
+                    result[addr] = pkey
+            return result
+        finally:
+            conn.close()
+
+
+def replace_lucky_conn_bindings(instance_name: str, bindings: dict) -> None:
+    """全量替换实例 Lucky 连接归属（仅保留当前在线会话键）。"""
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name:
+        return
+    cleaned = {
+        str(addr).strip(): str(pkey).strip()
+        for addr, pkey in (bindings or {}).items()
+        if str(addr).strip() and str(pkey).strip()
+    }
+    now = _now()
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'DELETE FROM emby_lucky_conn_bindings WHERE instance_name = ?',
+                (name,),
+            )
+            for addr, pkey in cleaned.items():
+                c.execute('''
+                    INSERT INTO emby_lucky_conn_bindings (
+                        instance_name, remote_addr, persist_key, updated_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                ''', (name, addr, pkey, now))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _clear_live_upload_persistence_unlocked(c, instance_name: str) -> None:
+    name = (instance_name or '').strip()
+    if not name:
+        return
+    c.execute(
+        'DELETE FROM emby_session_upload_accumulators WHERE instance_name = ?',
+        (name,),
+    )
+    c.execute(
+        'DELETE FROM emby_browse_upload_accumulators WHERE instance_name = ?',
+        (name,),
+    )
+    c.execute(
+        'DELETE FROM emby_lucky_conn_bindings WHERE instance_name = ?',
+        (name,),
+    )
+
+
+def clear_live_upload_persistence(instance_name: str) -> None:
+    """清空播放/选片累加器与 Lucky 连接归属持久化。"""
+    _ensure_emby_schema()
+    name = (instance_name or '').strip()
+    if not name:
+        return
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            _clear_live_upload_persistence_unlocked(c, name)
+            conn.commit()
         finally:
             conn.close()
 
@@ -409,6 +944,50 @@ def get_total_bytes(instance_name: str, direction: str = 'upload') -> int:
             conn.close()
 
 
+def get_playback_upload_period_bytes(instance_name: str,
+                                     start_dt: datetime) -> int:
+    """外网播放会话上传：自 start_dt 起 ended 段 estimated_upload_bytes 之和。"""
+    name = (instance_name or '').strip()
+    if not name:
+        return 0
+    start_s = start_dt.strftime('%Y-%m-%d %H:%M:%S')
+    _ensure_emby_schema()
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT COALESCE(SUM(estimated_upload_bytes), 0) AS total
+                FROM emby_playback_upload_facts
+                WHERE instance_name = ? AND stopped_at >= ?
+            ''', (name, start_s))
+            row = c.fetchone()
+            return int(row['total']) if row else 0
+        finally:
+            conn.close()
+
+
+def get_playback_upload_total_bytes(instance_name: str) -> int:
+    """外网播放会话上传：纳入监控以来全部 ended 段之和（与流量统计一致）。"""
+    name = (instance_name or '').strip()
+    if not name:
+        return 0
+    _ensure_emby_schema()
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT COALESCE(SUM(estimated_upload_bytes), 0) AS total
+                FROM emby_playback_upload_facts
+                WHERE instance_name = ?
+            ''', (name,))
+            row = c.fetchone()
+            return int(row['total']) if row else 0
+        finally:
+            conn.close()
+
+
 def get_hourly_stats(instance_name: str, hours: int = 24,
                      direction: str = 'upload',
                      start: str = None, end: str = None) -> list:
@@ -619,6 +1198,7 @@ def delete_instance_data(instance_name: str):
             for table in (
                 'emby_traffic_hourly', 'emby_traffic_monthly', 'emby_instance_status',
                 'emby_playback_upload_facts', 'emby_playback_upload_hourly',
+                'emby_browse_upload_facts', 'emby_browse_upload_hourly',
             ):
                 c.execute(
                     f'DELETE FROM {table} WHERE instance_name = ?',
@@ -645,6 +1225,31 @@ def reset_instance_traffic(instance_name: str):
                 'DELETE FROM emby_traffic_monthly WHERE instance_name = ?',
                 (instance_name,),
             )
+            c.execute(
+                'DELETE FROM emby_playback_upload_facts WHERE instance_name = ?',
+                (instance_name,),
+            )
+            c.execute(
+                'DELETE FROM emby_playback_upload_hourly WHERE instance_name = ?',
+                (instance_name,),
+            )
+            c.execute(
+                'DELETE FROM emby_browse_upload_facts WHERE instance_name = ?',
+                (instance_name,),
+            )
+            c.execute(
+                'DELETE FROM emby_browse_upload_hourly WHERE instance_name = ?',
+                (instance_name,),
+            )
+            c.execute(
+                'DELETE FROM emby_lucky_ip_baselines WHERE instance_name = ?',
+                (instance_name,),
+            )
+            c.execute(
+                'DELETE FROM emby_lucky_conn_baselines WHERE instance_name = ?',
+                (instance_name,),
+            )
+            _clear_live_upload_persistence_unlocked(c, instance_name)
             c.execute('''
                 UPDATE emby_instance_status SET
                     last_delta_bytes = 0,
@@ -665,10 +1270,12 @@ _EMBY_DATA_INSTANCE_TABLES = (
 _EMBY_MEANINGFUL_DATA_TABLES = (
     'emby_traffic_hourly', 'emby_traffic_monthly',
     'emby_playback_upload_facts', 'emby_playback_upload_hourly',
+    'emby_browse_upload_facts', 'emby_browse_upload_hourly',
 )
 
 _EMBY_RENAME_DATA_TABLES = _EMBY_DATA_INSTANCE_TABLES + (
     'emby_playback_upload_facts', 'emby_playback_upload_hourly',
+    'emby_browse_upload_facts', 'emby_browse_upload_hourly',
 )
 
 
@@ -914,7 +1521,6 @@ def _iter_playback_records_for_rebuild(instance_name: str = None):
 
 def rebuild_playback_upload_stats(instance_name: str = None) -> dict:
     """从播放记录 JSON 重建外网用户上行事实表与小时聚合。"""
-    _ensure_emby_schema()
     _ensure_traffic_timezone_from_config()
     with _lock:
         conn = traffic_db.get_conn()
@@ -969,6 +1575,39 @@ def rebuild_playback_upload_stats(instance_name: str = None) -> dict:
     return stats
 
 
+def _migration_applied(name: str) -> bool:
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute(
+                'SELECT 1 FROM emby_schema_migrations WHERE name = ?',
+                (name,),
+            )
+            return c.fetchone() is not None
+        except sqlite3.OperationalError:
+            return False
+        finally:
+            conn.close()
+
+
+def _mark_migration_applied(name: str) -> None:
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                INSERT INTO emby_schema_migrations (name, applied_at)
+                VALUES (?, ?)
+            ''', (
+                name,
+                _now().strftime('%Y-%m-%d %H:%M:%S'),
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+
+
 def _run_pending_migrations():
     _ensure_traffic_timezone_from_config()
     with _lock:
@@ -981,41 +1620,44 @@ def _run_pending_migrations():
                     applied_at DATETIME NOT NULL
                 )
             ''')
-            c.execute(
-                'SELECT 1 FROM emby_schema_migrations WHERE name = ?',
-                ('playback_upload_local_timezone_v1',),
-            )
-            if c.fetchone():
-                return
             conn.commit()
         finally:
             conn.close()
 
-    try:
-        stats = rebuild_playback_upload_stats()
-        with _lock:
-            conn = traffic_db.get_conn()
-            try:
-                c = conn.cursor()
-                c.execute('''
-                    INSERT INTO emby_schema_migrations (name, applied_at)
-                    VALUES (?, ?)
-                ''', (
-                    'playback_upload_local_timezone_v1',
-                    _now().strftime('%Y-%m-%d %H:%M:%S'),
-                ))
-                conn.commit()
-                logger.info(
-                    '迁移 playback_upload_local_timezone_v1 完成: '
-                    f'重建 {stats["facts"]} 条外网播放上行记录'
-                )
-            finally:
-                conn.close()
-    except Exception as e:
-        logger.error(
-            f'迁移 playback_upload_local_timezone_v1 失败: {e}',
-            exc_info=True,
-        )
+    if not _migration_applied('playback_upload_local_timezone_v1'):
+        try:
+            stats = rebuild_playback_upload_stats()
+            _mark_migration_applied('playback_upload_local_timezone_v1')
+            logger.info(
+                '迁移 playback_upload_local_timezone_v1 完成: '
+                f'重建 {stats["facts"]} 条外网播放上行记录'
+            )
+        except Exception as e:
+            logger.error(
+                f'迁移 playback_upload_local_timezone_v1 失败: {e}',
+                exc_info=True,
+            )
+
+    if not _migration_applied('playback_upload_restart_repair_v1'):
+        try:
+            from playback_upload_repair import (
+                repair_inflated_playback_upload_estimates,
+            )
+            stats = repair_inflated_playback_upload_estimates(
+                rebuild_stats=True,
+            )
+            _mark_migration_applied('playback_upload_restart_repair_v1')
+            logger.info(
+                '迁移 playback_upload_restart_repair_v1 完成: '
+                f'扫描={stats.get("scanned", 0)} '
+                f'纠偏={stats.get("repaired", 0)} '
+                f'同步checkpoint={stats.get("synced_checkpoint", 0)}'
+            )
+        except Exception as e:
+            logger.error(
+                f'迁移 playback_upload_restart_repair_v1 失败: {e}',
+                exc_info=True,
+            )
 
 
 def save_playback_upload_fact(instance_name: str, segment_id: int,
@@ -1059,7 +1701,7 @@ def save_playback_upload_fact(instance_name: str, segment_id: int,
 
 
 def list_playback_upload_users(instance_name: str) -> list:
-    """仅有 ended 外网段入库的用户名列表。"""
+    """有外网播放或选片入库记录的用户名列表。"""
     name = (instance_name or '').strip()
     if not name:
         return []
@@ -1071,9 +1713,53 @@ def list_playback_upload_users(instance_name: str) -> list:
             c.execute('''
                 SELECT DISTINCT user_name FROM emby_playback_upload_facts
                 WHERE instance_name = ? AND user_name != ''
+                UNION
+                SELECT DISTINCT user_name FROM emby_browse_upload_facts
+                WHERE instance_name = ? AND user_name != ''
                 ORDER BY user_name COLLATE NOCASE
-            ''', (name,))
+            ''', (name, name))
             return [row['user_name'] for row in c.fetchall() if row['user_name']]
+        finally:
+            conn.close()
+
+
+def list_browse_upload_records(
+    instance_name: str,
+    limit: int = 200,
+    *,
+    min_upload_bytes: int = None,
+) -> list:
+    """选片流量入库记录（用户视角日志数据源）。"""
+    import config_manager
+    name = (instance_name or '').strip()
+    if not name:
+        return []
+    if min_upload_bytes is None:
+        min_upload_bytes = config_manager.emby_browse_upload_min_bytes()
+    min_upload_bytes = max(0, int(min_upload_bytes or 0))
+    limit = max(1, min(int(limit or 200), 500))
+    _ensure_emby_schema()
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                SELECT id, instance_name, segment_id, user_name, user_id,
+                       stopped_at, estimated_upload_bytes, viewing_title,
+                       settle_reason, series_name, episode_label, episode_title,
+                       device_name, client, client_ip, production_year
+                FROM emby_browse_upload_facts
+                WHERE instance_name = ?
+                  AND estimated_upload_bytes >= ?
+                ORDER BY stopped_at DESC, id DESC
+                LIMIT ?
+            ''', (name, min_upload_bytes, limit))
+            rows = []
+            for row in c.fetchall():
+                item = dict(row)
+                item['instance_name'] = name
+                rows.append(item)
+            return rows
         finally:
             conn.close()
 
@@ -1577,3 +2263,72 @@ def get_playback_upload_cycle_stats_all_users(instance_name: str,
         finally:
             conn.close()
     return result
+
+
+# ── 选片流量（与播放独立） ──────────────────────────────────────────────
+
+
+def save_browse_upload_fact(instance_name: str, segment_id: int,
+                            user_name: str, user_id: str,
+                            stopped_at: str, upload_bytes: int,
+                            viewing_title: str = '',
+                            settle_reason: str = '',
+                            series_name: str = '',
+                            episode_label: str = '',
+                            episode_title: str = '',
+                            device_name: str = '',
+                            client: str = '',
+                            client_ip: str = '',
+                            production_year: int = None,
+                            min_upload_bytes: int = None) -> bool:
+    """选片段结束时写入事实表并累加小时聚合。"""
+    import config_manager
+    name = (instance_name or '').strip()
+    if min_upload_bytes is None:
+        min_upload_bytes = config_manager.emby_browse_upload_min_bytes()
+    min_upload_bytes = max(0, int(min_upload_bytes or 0))
+    if not name or not user_name or int(upload_bytes or 0) < min_upload_bytes:
+        return False
+    stopped_s = _normalize_stopped_at(stopped_at)
+    hour_start = _hour_start_from_stopped(stopped_s)
+    year_val = None
+    if production_year is not None:
+        try:
+            year_val = int(production_year)
+        except (TypeError, ValueError):
+            year_val = None
+    _ensure_emby_schema()
+    with _lock:
+        conn = traffic_db.get_conn()
+        try:
+            c = conn.cursor()
+            c.execute('''
+                INSERT OR IGNORE INTO emby_browse_upload_facts (
+                    instance_name, segment_id, user_name, user_id, stopped_at,
+                    estimated_upload_bytes, viewing_title, settle_reason,
+                    series_name, episode_label, episode_title,
+                    device_name, client, client_ip, production_year
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                name, int(segment_id), user_name, user_id or '',
+                stopped_s, int(upload_bytes), viewing_title or '',
+                settle_reason or '',
+                series_name or '', episode_label or '', episode_title or '',
+                device_name or '', client or '', client_ip or '',
+                year_val,
+            ))
+            if c.rowcount <= 0:
+                return False
+            c.execute('''
+                INSERT INTO emby_browse_upload_hourly (
+                    instance_name, user_name, hour_start, uploaded_bytes, segment_count
+                ) VALUES (?, ?, ?, ?, 1)
+                ON CONFLICT(instance_name, user_name, hour_start) DO UPDATE SET
+                    uploaded_bytes = uploaded_bytes + excluded.uploaded_bytes,
+                    segment_count = segment_count + 1
+            ''', (name, user_name, hour_start, int(upload_bytes)))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+

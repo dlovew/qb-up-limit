@@ -37,8 +37,6 @@ def _entry_matches_instance(entry: dict, instance: str) -> bool:
         return True
     if f'[Emby:{instance}]' in msg:
         return True
-    if f'[Playback:{instance}]' in msg:
-        return True
     for pattern in (
         f': {instance}',
         f'：{instance}',
@@ -50,10 +48,19 @@ def _entry_matches_instance(entry: dict, instance: str) -> bool:
     return False
 
 
+def _is_playback_or_browse_app_log(entry: dict) -> bool:
+    msg = entry.get('message') or ''
+    if '[Playback:' in msg or '[Browse:' in msg:
+        return True
+    return False
+
+
 def _is_emby_device_log(entry: dict) -> bool:
+    if _is_playback_or_browse_app_log(entry):
+        return False
     msg = entry.get('message') or ''
     logger_name = (entry.get('logger') or '').lower()
-    if '[Emby:' in msg or '[Playback:' in msg:
+    if '[Emby:' in msg:
         return True
     if 'emby' in logger_name:
         return True
@@ -127,6 +134,8 @@ def get_system_logs(limit: int = 1000, level: str = None, instance: str = None,
             if service and not _entry_matches_service(entry, service):
                 continue
             if instance and not _entry_matches_instance(entry, instance):
+                continue
+            if _is_playback_or_browse_app_log(entry) and service != 'emby':
                 continue
             entries.append(entry)
             if len(entries) >= limit:

@@ -5,6 +5,7 @@ let chartUserCategoryWidth = null;
 let chartWheelZoomCleanup = null;
 
 let chartDatasetVisibility = [true, true];
+let currentChartTrafficScale = { divisor: 1024 ** 2, unit: 'MB' };
 let lastChartLegendTotals = null;
 let chartViewType = 'bar';
 let lastChartPayload = null;
@@ -55,23 +56,72 @@ function isEmbyChartUploadOnly() {
     return getChartPlatform() === 'emby';
 }
 
+function formatEmbyUploadTooltipLines(totalBytes, browseBytes, options = {}) {
+    const showSession = options.showSession !== false;
+    const showBrowse = options.showBrowse !== false;
+    const total = Math.max(0, Number(totalBytes) || 0);
+    const browse = Math.max(0, Number(browseBytes) || 0);
+    const session = Math.max(0, total - browse);
+    const visibleTotal = (showSession ? session : 0) + (showBrowse ? browse : 0);
+
+    if (!showSession && !showBrowse) return [];
+
+    if (showSession && showBrowse) {
+        const lines = [`总计：${formatEmbyTrafficText(visibleTotal)}`];
+        if (browse > 0) {
+            lines.push(`  会话上传：${formatEmbyTrafficText(session)}`);
+            lines.push(`  选片上传：${formatEmbyTrafficText(browse)}`);
+        }
+        return lines;
+    }
+    if (showSession) {
+        return [`会话上传：${formatEmbyTrafficText(session)}`];
+    }
+    return [`选片上传：${formatEmbyTrafficText(browse)}`];
+}
+
+function getFirstVisibleChartDatasetIndex() {
+    if (chartDatasetVisibility[0] !== false) return 0;
+    if (chartDatasetVisibility[1] !== false) return 1;
+    return -1;
+}
+
+function isChartTooltipItemVisible(datasetIndex) {
+    return chartDatasetVisibility[datasetIndex] !== false;
+}
+
+function syncChartLegendLabels() {
+    const emby = isEmbyChartUploadOnly();
+    const uploadBtn = document.querySelector('#chartLegendPanel .chart-legend-item[data-chart-dataset="0"] span');
+    const secondBtn = document.querySelector('#chartLegendPanel .chart-legend-item[data-chart-dataset="1"] span');
+    if (uploadBtn) uploadBtn.textContent = emby ? '会话上传' : '上行';
+    if (secondBtn) secondBtn.textContent = emby ? '选片上传' : '下行';
+    const secondDot = document.querySelector('#chartLegendPanel .chart-legend-item[data-chart-dataset="1"] .chart-legend-dot');
+    if (secondDot) {
+        secondDot.classList.toggle('chart-legend-dot--download', !emby);
+        secondDot.classList.toggle('chart-legend-dot--upload', emby);
+    }
+}
+
 function syncChartLegendPlatformUi() {
     const uploadOnly = isEmbyChartUploadOnly();
     const legendPanel = document.getElementById('chartLegendPanel');
     const downloadTotal = document.getElementById('chartLegendTotalDownload');
-    const downloadItem = document.querySelector('#chartLegendPanel .chart-legend-item[data-chart-dataset="1"]');
     const divider = document.querySelector('#chartLegendPanel .chart-legend-divider');
     const downloadPieGroup = document.querySelector('#chartPieLayout .chart-pie-group--download');
     const pieLayout = document.getElementById('chartPieLayout');
     if (legendPanel) legendPanel.classList.toggle('chart-legend-panel--upload-only', uploadOnly);
     if (downloadTotal) downloadTotal.hidden = uploadOnly;
-    if (downloadItem) downloadItem.hidden = uploadOnly;
     if (divider) divider.hidden = uploadOnly;
     if (downloadPieGroup) downloadPieGroup.hidden = uploadOnly;
     if (pieLayout) pieLayout.classList.toggle('chart-pie-layout--upload-only', uploadOnly);
     if (uploadOnly) {
-        chartDatasetVisibility = [chartDatasetVisibility[0] !== false];
+        chartDatasetVisibility = [
+            chartDatasetVisibility[0] !== false,
+            chartDatasetVisibility[1] !== false,
+        ];
     }
+    syncChartLegendLabels();
 }
 
 function getChartInstanceStorageKey(platform = getChartPlatform()) {
@@ -90,6 +140,7 @@ const EVENT_EMBY_INSTANCE_KEY = 'qb-up-limit-event-instance-emby';
 const SYSLOG_QB_INSTANCE_KEY = 'qb-up-limit-syslog-instance-qb';
 const SYSLOG_EMBY_INSTANCE_KEY = 'qb-up-limit-syslog-instance-emby';
 const EMBY_EVENT_PLAYBACK_USER_KEY = 'qb-up-limit-emby-event-playback-user';
+const EMBY_EVENT_LOG_TYPE_KEY = 'qb-up-limit-emby-event-log-type';
 const VALID_TABS = new Set(['devices', 'stats', 'events', 'syslogs']);
 let cachedInstances = [];
 let lastCardsStructureKey = '';
@@ -281,7 +332,7 @@ let chartXTickStep = 1;
 let chartXTickMeasureCtx = null;
 
 const REFRESH_INTERVAL_MIN = 1;
-const REFRESH_INTERVAL_MAX = 30;
+const REFRESH_INTERVAL_MAX = 10;
 
 const REFRESH_COLLECT_MAP = {
     1: 5, 2: 10, 3: 15, 4: 20, 5: 25, 6: 30, 7: 35, 8: 40, 9: 45, 10: 50,
@@ -445,7 +496,7 @@ function bindGlobalRefreshIntervalInput(refreshInput, collectInput, initialRefre
             return true;
         }
         if (showMessage) {
-            showToast('页面刷新间隔须为 1-30 的整数');
+            showToast('页面刷新间隔须为 1-10 的整数');
         }
         applyValidRefresh(lastValid);
         return false;
@@ -979,7 +1030,26 @@ function applyStatusPatchesToCards(flags = {}) {
     });
 }
 
-async function refreshLiveMetrics(silent = false) {
+function shouldPollQbLive() {
+    if (typeof getDeviceViewMode === 'function' && getDeviceViewMode() === 'merge') {
+        return true;
+    }
+    const filter = typeof getDeviceTypeFilter === 'function' ? getDeviceTypeFilter() : 'qb';
+    return filter !== 'emby';
+}
+
+function shouldPollEmbyLive() {
+    if (typeof isEmbyFeatureEnabled !== 'function' || !isEmbyFeatureEnabled()) {
+        return false;
+    }
+    if (typeof getDeviceViewMode === 'function' && getDeviceViewMode() === 'merge') {
+        return true;
+    }
+    const filter = typeof getDeviceTypeFilter === 'function' ? getDeviceTypeFilter() : 'qb';
+    return filter === 'emby';
+}
+
+async function refreshQbLiveMetrics(silent = false) {
     try {
         const response = await axios.get('/api/status/live');
         if (!response.data.success) return;
@@ -1005,9 +1075,13 @@ async function refreshLiveMetrics(silent = false) {
             showToast('实时指标刷新失败', 'error');
         }
     }
-    if (typeof isEmbyFeatureEnabled === 'function'
-        && isEmbyFeatureEnabled()
-        && typeof refreshEmbyLiveMetrics === 'function') {
+}
+
+async function refreshLiveMetrics(silent = false) {
+    if (shouldPollQbLive()) {
+        await refreshQbLiveMetrics(silent);
+    }
+    if (shouldPollEmbyLive() && typeof refreshEmbyLiveMetrics === 'function') {
         await refreshEmbyLiveMetrics(silent);
     }
     secondsUntilRefresh = autoRefreshInterval;
@@ -1059,50 +1133,67 @@ async function refreshStatusAfterSync() {
     }
 }
 
+const TRAFFIC_UNIT_LABELS = ['KB', 'MB', 'GB', 'TB'];
+
+function formatTrafficNumber(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '0';
+    const abs = Math.abs(n);
+    if (abs >= 100) return n.toFixed(0);
+    if (abs >= 10) return n.toFixed(1);
+    return n.toFixed(2);
+}
+
+/** 按进制自动选择 KB/MB/GB/TB，保留有效小数，避免小流量被四舍五入为 0。 */
+function formatTrafficAuto(bytes, { base = 1024 } = {}) {
+    const n = Math.max(0, Number(bytes) || 0);
+    if (n <= 0) return { value: '0', unit: 'KB' };
+    const tb = n / (base ** 4);
+    if (tb >= 1) return { value: formatTrafficNumber(tb), unit: 'TB' };
+    const gb = n / (base ** 3);
+    if (gb >= 1) return { value: formatTrafficNumber(gb), unit: 'GB' };
+    const mb = n / (base ** 2);
+    if (mb >= 1) return { value: formatTrafficNumber(mb), unit: 'MB' };
+    const kb = n / base;
+    return { value: formatTrafficNumber(kb), unit: 'KB' };
+}
+
+function formatTrafficAutoText(bytes, options = {}) {
+    const { value, unit } = formatTrafficAuto(bytes, options);
+    return `${value} ${unit}`;
+}
+
+function getChartTrafficBase() {
+    return isEmbyChartUploadOnly() ? 1000 : 1024;
+}
+
+function formatChartTrafficText(bytes) {
+    return formatTrafficAutoText(bytes, { base: getChartTrafficBase() });
+}
+
+function formatEmbyTrafficText(bytes) {
+    return formatTrafficAutoText(bytes, { base: 1000 });
+}
+
 function formatTraffic(bytes) {
-    const tb = bytes / (1024 ** 4);
-    if (tb >= 1) {
-        return { value: tb.toFixed(2), unit: 'TB' };
-    }
-    const gb = bytes / (1024 ** 3);
-    if (gb >= 1) {
-        return { value: gb.toFixed(2), unit: 'GB' };
-    }
-    const mb = bytes / (1024 ** 2);
-    return { value: mb.toFixed(2), unit: 'MB' };
+    return formatTrafficAuto(bytes, { base: 1024 });
 }
 
 function formatChartLegendTotalFromBytes(bytes) {
-    const { value, unit } = formatTraffic(Number(bytes) || 0);
-    return `${value} ${unit}`;
+    return formatChartTrafficText(bytes);
 }
 
 function formatChartLegendTotalFromGb(gb) {
     return formatChartLegendTotalFromBytes((Number(gb) || 0) * (1024 ** 3));
 }
 
-/** 卡片流量展示：<1MB→KB，≥1MB→MB，≥1GB→GB，≥1TB→TB */
+/** 卡片流量展示：<1MB→KB，≥1MB→MB，≥1GB→GB，≥1TB→TB（1024 进制，qB 等） */
 function formatCardTraffic(bytes) {
-    const n = Number(bytes) || 0;
-    const tb = n / (1024 ** 4);
-    if (tb >= 1) {
-        return { value: tb.toFixed(2), unit: 'TB' };
-    }
-    const gb = n / (1024 ** 3);
-    if (gb >= 1) {
-        return { value: gb.toFixed(2), unit: 'GB' };
-    }
-    const mb = n / (1024 ** 2);
-    if (mb >= 1) {
-        return { value: mb.toFixed(2), unit: 'MB' };
-    }
-    const kb = n / 1024;
-    return { value: kb.toFixed(2), unit: 'KB' };
+    return formatTrafficAuto(bytes, { base: 1024 });
 }
 
 function formatCardTrafficText(bytes) {
-    const t = formatCardTraffic(bytes);
-    return `${t.value} ${t.unit}`;
+    return formatTrafficAutoText(bytes, { base: 1024 });
 }
 
 function getRecentDeltaWindowSeconds(inst) {
@@ -1448,7 +1539,10 @@ function aggregateChartStatsRows(rowsList, period) {
     const map = new Map();
     rowsList.forEach(rows => {
         (rows || []).forEach(row => {
-            const key = String(getChartRowLabel(row, period));
+            let key = String(getChartRowLabel(row, period));
+            if (period === 'hourly') {
+                key = normalizeHourlyChartKey(key);
+            }
             const existing = map.get(key);
             if (existing) {
                 existing.total_bytes = (existing.total_bytes || 0) + (row.total_bytes || 0);
@@ -1456,6 +1550,7 @@ function aggregateChartStatsRows(rowsList, period) {
             } else {
                 map.set(key, {
                     ...row,
+                    ...(period === 'hourly' ? { hour: key } : {}),
                     total_bytes: row.total_bytes || 0,
                     backfilled_bytes: row.backfilled_bytes || 0,
                 });
@@ -1485,10 +1580,14 @@ async function fetchChartDirectionData(instanceName, platform, period, params, d
             if (!res.data.success) return null;
             return normalizePlaybackStatsPayload(res.data.data, period, playbackUser);
         }
-        const base = `/api/emby/stats/${encodeURIComponent(instanceName)}/${period}`;
-        const res = await axios.get(base, { params: { ...params, direction } });
+        const res = await axios.get(
+            `/api/emby/playback-stats/${encodeURIComponent(instanceName)}/${period}`,
+            { params: { ...params, user: CHART_PLAYBACK_ALL_USERS_VALUE } },
+        );
         if (!res.data.success) return null;
-        return res.data.data;
+        return normalizePlaybackStatsPayload(
+            res.data.data, period, CHART_PLAYBACK_ALL_USERS_VALUE,
+        );
     }
     const base = `/api/stats/${encodeURIComponent(instanceName)}/${period}`;
     const res = await axios.get(base, { params: { ...params, direction } });
@@ -3512,8 +3611,83 @@ function refreshChartXTickStep(barCount, chartWidth, labels) {
     }
 }
 
-function bytesToChartGb(bytes) {
-    return +((bytes || 0) / 1073741824).toFixed(1);
+const CHART_TRAFFIC_BASE = { qb: 1024, emby: 1000 };
+
+function getChartTrafficBaseValue() {
+    return isEmbyChartUploadOnly() ? CHART_TRAFFIC_BASE.emby : CHART_TRAFFIC_BASE.qb;
+}
+
+/** 根据数据最大值选择图表 Y 轴展示单位（KB/MB/GB/TB） */
+function resolveChartTrafficScale(maxBytes) {
+    const base = getChartTrafficBaseValue();
+    const { unit } = formatTrafficAuto(maxBytes, { base });
+    const unitIndex = TRAFFIC_UNIT_LABELS.indexOf(unit);
+    const exponent = unitIndex >= 0 ? unitIndex + 1 : 2;
+    return { divisor: base ** exponent, unit };
+}
+
+function bytesToChartScale(bytes, scale = currentChartTrafficScale) {
+    return (Number(bytes) || 0) / scale.divisor;
+}
+
+function formatHourlyDbKey(date) {
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+        + `${pad(date.getHours())}:00:00`;
+}
+
+/** 与后端 hour 字段一致：YYYY-MM-DD HH:MM（16 字符） */
+function normalizeHourlyChartKey(label) {
+    const s = String(label ?? '').trim();
+    if (!s) return '';
+    const match = s.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{1,2}):(\d{2})/);
+    if (!match) return s.slice(0, 16);
+    const hour = match[2].padStart(2, '0');
+    return `${match[1]} ${hour}:${match[3]}`;
+}
+
+function formatHourlyChartKey(date) {
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+        + `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function maxChartByteValue(...arrays) {
+    let max = 0;
+    arrays.forEach((arr) => {
+        (arr || []).forEach((value) => {
+            const n = Number(value) || 0;
+            if (n > max) max = n;
+        });
+    });
+    return max;
+}
+
+/** 小时图表：补齐起止范围内无数据的小时（值为 0），避免「今天」仅显示有数据的稀疏刻度。 */
+function fillHourlyChartGaps(rows, startDate, endDate) {
+    if (!startDate || !endDate || !Array.isArray(rows)) return rows || [];
+    const map = new Map();
+    rows.forEach((row) => {
+        const key = normalizeHourlyChartKey(getChartRowLabel(row, 'hourly'));
+        if (key) map.set(key, row);
+    });
+    const filled = [];
+    const cur = new Date(startDate);
+    cur.setMinutes(0, 0, 0);
+    const end = new Date(endDate);
+    end.setMinutes(0, 0, 0);
+    while (cur.getTime() <= end.getTime()) {
+        const key = formatHourlyChartKey(cur);
+        filled.push(map.get(key) || {
+            hour: key,
+            total_bytes: 0,
+            backfilled_bytes: 0,
+            playback_bytes: 0,
+            browse_bytes: 0,
+        });
+        cur.setHours(cur.getHours() + 1);
+    }
+    return filled;
 }
 
 function getChartRowLabel(row, period) {
@@ -3720,7 +3894,10 @@ function mergeUploadDownloadStats(uploadData, downloadData, period) {
     const cycleStartMap = new Map();
 
     const ingestRow = (row) => {
-        const key = String(getChartRowLabel(row, period));
+        let key = String(getChartRowLabel(row, period));
+        if (period === 'hourly') {
+            key = normalizeHourlyChartKey(key);
+        }
         if (period === 'cycle' && row.cycle_start) {
             cycleStartMap.set(key, String(row.cycle_start));
         }
@@ -3759,15 +3936,32 @@ function mergeUploadDownloadStats(uploadData, downloadData, period) {
         cycleStart: cycleStartMap.get(label),
     }));
 
+    const uploadBytes = rawLabels.map(label => upMap.get(label) || 0);
+    const downloadBytes = rawLabels.map(label => dlMap.get(label) || 0);
+    const backfillUploadBytes = rawLabels.map(label => upBackfillMap.get(label) || 0);
+    const backfillDownloadBytes = rawLabels.map(label => dlBackfillMap.get(label) || 0);
+    const maxBytes = maxChartByteValue(
+        uploadBytes,
+        downloadBytes,
+        backfillUploadBytes,
+        backfillDownloadBytes,
+    );
+    const chartTrafficScale = resolveChartTrafficScale(maxBytes);
+
     return {
         labels,
         rawLabels,
         tooltipLabels,
         dateGroups,
-        uploadValues: rawLabels.map(label => bytesToChartGb(upMap.get(label))),
-        downloadValues: rawLabels.map(label => bytesToChartGb(dlMap.get(label))),
-        backfillUploadValues: rawLabels.map(label => bytesToChartGb(upBackfillMap.get(label) || 0)),
-        backfillDownloadValues: rawLabels.map(label => bytesToChartGb(dlBackfillMap.get(label) || 0)),
+        uploadBytes,
+        downloadBytes,
+        backfillUploadBytes,
+        backfillDownloadBytes,
+        chartTrafficScale,
+        uploadValues: uploadBytes.map(b => bytesToChartScale(b, chartTrafficScale)),
+        downloadValues: downloadBytes.map(b => bytesToChartScale(b, chartTrafficScale)),
+        backfillUploadValues: backfillUploadBytes.map(b => bytesToChartScale(b, chartTrafficScale)),
+        backfillDownloadValues: backfillDownloadBytes.map(b => bytesToChartScale(b, chartTrafficScale)),
     };
 }
 
@@ -4259,6 +4453,9 @@ async function bootstrapPersistedTabControls() {
         await ensureEmbyDataLoaded();
     }
     await syncChartPlatformUi();
+    if (typeof reconcileEmbyEventLogType === 'function') {
+        reconcileEmbyEventLogType();
+    }
     syncChartTypeToggle();
     syncChartLegendBackfillHint();
     syncChartRangeInputs();
@@ -4316,6 +4513,7 @@ function persistChartControls() {
     }
     if (embyEventLogTypeEl) {
         state.embyEventLogType = embyEventLogTypeEl.value || 'playback';
+        sessionStorage.setItem(EMBY_EVENT_LOG_TYPE_KEY, state.embyEventLogType);
     }
     if (embyEventPlaybackUserEl) {
         state.embyEventPlaybackUser = embyEventPlaybackUserEl.value || '';
@@ -4389,6 +4587,13 @@ function restoreChartControls() {
     if (state.embyEventLogType) {
         const logTypeEl = document.getElementById('embyEventLogType');
         if (logTypeEl) logTypeEl.value = state.embyEventLogType;
+        sessionStorage.setItem(EMBY_EVENT_LOG_TYPE_KEY, state.embyEventLogType);
+    } else {
+        const persistedLogType = sessionStorage.getItem(EMBY_EVENT_LOG_TYPE_KEY);
+        if (persistedLogType) {
+            const logTypeEl = document.getElementById('embyEventLogType');
+            if (logTypeEl) logTypeEl.value = persistedLogType;
+        }
     }
     if (state.embyEventPlaybackUser != null) {
         sessionStorage.setItem(EMBY_EVENT_PLAYBACK_USER_KEY, state.embyEventPlaybackUser);
@@ -4689,7 +4894,7 @@ function syncChartRangeQuickButtons() {
 }
 
 function resetChartDatasetVisibility() {
-    chartDatasetVisibility = isEmbyChartUploadOnly() ? [true] : [true, true];
+    chartDatasetVisibility = [true, true];
     document.querySelectorAll('#chartLegendPanel .chart-legend-item[data-chart-dataset]').forEach(btn => {
         const idx = parseInt(btn.dataset.chartDataset, 10);
         if (btn.hidden) return;
@@ -4900,7 +5105,14 @@ function syncChartLegendBackfillHint() {
     const containerEl = document.getElementById('chartContainer');
     const chartVisible = containerEl && !containerEl.hidden;
     const type = chartViewType;
-    if (barHint) barHint.hidden = !chartVisible || type !== 'bar';
+    if (barHint) {
+        barHint.hidden = !chartVisible || type !== 'bar';
+        if (!barHint.hidden) {
+            barHint.textContent = getChartPlatform() === 'emby'
+                ? '柱状图斜线区域为用户「选片」流量'
+                : '柱状图斜线区域为设备重新上线后补录的流量';
+        }
+    }
     if (lineHint) lineHint.hidden = !chartVisible || type !== 'line';
     if (pieHint) pieHint.hidden = !chartVisible || type !== 'pie';
 }
@@ -5004,13 +5216,16 @@ const backfillBarHatchPlugin = {
         const meta = chart.$backfillMeta;
         if (!meta) return;
         const { ctx } = chart;
-        const uploadBackfill = meta.backfillUploadValues || [];
-        const downloadBackfill = meta.backfillDownloadValues || [];
+        const uploadBackfill = meta.backfillUploadBytes || [];
+        const downloadBackfill = meta.backfillDownloadBytes || [];
+        const uploadTotals = meta.uploadBytes || [];
+        const downloadTotals = meta.downloadBytes || [];
         const hatchColors = [
             'rgba(37, 99, 235, 0.88)',
             'rgba(16, 185, 129, 0.88)',
         ];
         const backfillSets = [uploadBackfill, downloadBackfill];
+        const totalSets = [uploadTotals, downloadTotals];
 
         ctx.save();
         [0, 1].forEach((datasetIndex) => {
@@ -5018,12 +5233,13 @@ const backfillBarHatchPlugin = {
             if (dsMeta.hidden) return;
             const pattern = createBarHatchPattern(hatchColors[datasetIndex]);
             const backfillData = backfillSets[datasetIndex];
+            const totalData = totalSets[datasetIndex];
             dsMeta.data.forEach((bar, index) => {
-                const total = Number(chart.data.datasets[datasetIndex].data[index]) || 0;
-                const backfill = Number(backfillData[index]) || 0;
-                if (backfill <= 0 || total <= 0 || bar?.y == null) return;
+                const totalBytes = Number(totalData[index]) || 0;
+                const backfillBytes = Number(backfillData[index]) || 0;
+                if (backfillBytes <= 0 || totalBytes <= 0 || bar?.y == null) return;
                 const barHeight = bar.base - bar.y;
-                const hatchHeight = barHeight * (backfill / total);
+                const hatchHeight = barHeight * (backfillBytes / totalBytes);
                 if (hatchHeight <= 0) return;
                 ctx.fillStyle = pattern;
                 ctx.fillRect(bar.x - bar.width / 2, bar.y, bar.width, hatchHeight);
@@ -5120,6 +5336,51 @@ function sumChartBytesFromRows(rows) {
     return (rows || []).reduce((sum, row) => sum + (Number(row?.total_bytes) || 0), 0);
 }
 
+function sumEmbyBrowseUploadBytesFromRows(rows) {
+    return (rows || []).reduce((sum, row) => sum + (Number(row?.backfilled_bytes) || 0), 0);
+}
+
+function buildChartLegendTotals(uploadData, downloadData, merged = null) {
+    if (merged && isEmbyChartUploadOnly()) {
+        const { uploadBytes, backfillUploadBytes } = merged;
+        const sessionUploadBytes = (uploadBytes || []).reduce(
+            (sum, total, i) => sum + Math.max(0, (Number(total) || 0) - (Number(backfillUploadBytes?.[i]) || 0)),
+            0,
+        );
+        const browseUploadBytes = (backfillUploadBytes || []).reduce(
+            (sum, value) => sum + (Number(value) || 0),
+            0,
+        );
+        return {
+            uploadBytes: sumChartBytesFromRows(uploadData),
+            sessionUploadBytes,
+            browseUploadBytes,
+            downloadBytes: sumChartBytesFromRows(downloadData),
+        };
+    }
+    return {
+        uploadBytes: sumChartBytesFromRows(uploadData),
+        sessionUploadBytes: 0,
+        browseUploadBytes: 0,
+        downloadBytes: sumChartBytesFromRows(downloadData),
+    };
+}
+
+function resolveChartLegendUploadTotalBytes() {
+    if (!lastChartLegendTotals) return 0;
+    if (!isEmbyChartUploadOnly()) {
+        return lastChartLegendTotals.uploadBytes ?? 0;
+    }
+    let total = 0;
+    if (chartDatasetVisibility[0] !== false) {
+        total += lastChartLegendTotals.sessionUploadBytes ?? 0;
+    }
+    if (chartDatasetVisibility[1] !== false) {
+        total += lastChartLegendTotals.browseUploadBytes ?? 0;
+    }
+    return total;
+}
+
 function syncChartLegendTotals() {
     const uploadOnly = isEmbyChartUploadOnly();
     if (lastChartLegendTotals) {
@@ -5127,7 +5388,7 @@ function syncChartLegendTotals() {
         const downloadValueEl = document.querySelector('#chartLegendTotalDownload .chart-legend-total-value');
         if (uploadValueEl) {
             uploadValueEl.textContent = formatChartLegendTotalFromBytes(
-                lastChartLegendTotals.uploadBytes ?? 0,
+                resolveChartLegendUploadTotalBytes(),
             );
         }
         if (downloadValueEl && !uploadOnly) {
@@ -5140,6 +5401,12 @@ function syncChartLegendTotals() {
         const idx = parseInt(el.dataset.chartDataset, 10);
         if (uploadOnly && idx === 1) {
             el.hidden = true;
+            return;
+        }
+        if (uploadOnly && idx === 0) {
+            const anyVisible = chartDatasetVisibility[0] !== false
+                || chartDatasetVisibility[1] !== false;
+            el.hidden = !anyVisible;
             return;
         }
         const visible = chartDatasetVisibility[idx] !== false;
@@ -5185,12 +5452,13 @@ function syncChartLegendPanel() {
     syncChartLegendTotals();
 }
 
-function buildChartScales(period, chartType = 'bar', labelCount = 0) {
+function buildChartScales(period, chartType = 'bar', labelCount = 0, options = {}) {
     const isHourly = period === 'hourly';
     const isLine = chartType === 'line';
+    const stacked = !!options.stacked;
     return {
         x: {
-            stacked: false,
+            stacked,
             title: { display: false },
             ticks: {
                 maxRotation: isLine ? 0 : (isHourly ? 0 : 45),
@@ -5223,7 +5491,7 @@ function buildChartScales(period, chartType = 'bar', labelCount = 0) {
             },
         },
         y: {
-            stacked: false,
+            stacked,
             beginAtZero: true,
             grace: isLine ? LINE_CHART_Y_GRACE : '10%',
             ticks: { display: false },
@@ -5253,10 +5521,7 @@ function isMobileChartCompactYAxis() {
 function formatChartYAxisLabel(value) {
     const n = Number(value);
     if (!Number.isFinite(n)) return '0';
-    if (isMobileChartCompactYAxis()) {
-        return `${Math.round(n)}`;
-    }
-    return `${n.toFixed(1)} GB`;
+    return formatTrafficNumber(n);
 }
 
 function positionChartYAxisUnit(chart, canvasOffsetTop) {
@@ -5275,10 +5540,14 @@ function positionChartYAxisUnit(chart, canvasOffsetTop) {
 function syncChartYAxisUnit() {
     const unitEl = document.getElementById('chartYAxisUnit');
     const layout = document.getElementById('chartBarLineLayout');
-    const compact = isMobileChartCompactYAxis()
-        && trafficChart
-        && chartViewType !== 'pie';
-    if (unitEl) unitEl.hidden = !compact;
+    const showUnit = Boolean(trafficChart) && chartViewType !== 'pie';
+    const compact = isMobileChartCompactYAxis() && showUnit;
+    if (unitEl) {
+        unitEl.hidden = !showUnit;
+        if (currentChartTrafficScale?.unit) {
+            unitEl.textContent = `(${currentChartTrafficScale.unit})`;
+        }
+    }
     if (layout) layout.classList.toggle('chart-layout--compact-y', compact);
 }
 
@@ -5308,7 +5577,7 @@ function renderYAxisLabels() {
         return `<span class="chart-y-axis-label" style="top:${top}px">${label}</span>`;
     }).join('');
     syncChartYAxisUnit();
-    if (isMobileChartCompactYAxis()) {
+    if (chartViewType !== 'pie') {
         positionChartYAxisUnit(chart, canvasOffsetTop);
     }
 }
@@ -6136,7 +6405,7 @@ function showChartNoDataInRange(instanceName) {
     syncChartLegendPanelLayout(true);
     if (xTitleEl) xTitleEl.textContent = '';
     syncChartInstanceTitle(instanceName);
-    lastChartLegendTotals = { uploadBytes: 0, downloadBytes: 0 };
+    lastChartLegendTotals = { uploadBytes: 0, sessionUploadBytes: 0, browseUploadBytes: 0, downloadBytes: 0 };
     syncChartLegendTotals();
     clearYAxisLabels();
     teardownChartScrollLayout();
@@ -6204,12 +6473,23 @@ async function updateChart(silent = false) {
         const ok = results.filter(Boolean);
         if (!ok.length) return;
 
-        const uploadData = isAllDevices
+        let uploadData = isAllDevices
             ? aggregateChartStatsRows(ok.map(r => r.uploadData), period)
             : ok[0].uploadData;
-        const downloadData = isAllDevices
+        let downloadData = isAllDevices
             ? aggregateChartStatsRows(ok.map(r => r.downloadData), period)
             : ok[0].downloadData;
+
+        if (period === 'hourly' && shouldUseChartRangeParams()) {
+            const rangeStart = readChartRangeDateInput('start', period);
+            const rangeEnd = readChartRangeDateInput('end', period);
+            if (rangeStart && rangeEnd) {
+                const nowHour = getChartRangeNow(period);
+                const gapEnd = rangeEnd.getTime() > nowHour.getTime() ? nowHour : rangeEnd;
+                uploadData = fillHourlyChartGaps(uploadData, rangeStart, gapEnd);
+                downloadData = fillHourlyChartGaps(downloadData, rangeStart, gapEnd);
+            }
+        }
 
         lastChartPayload = {
             uploadData,
@@ -6227,10 +6507,13 @@ async function updateChart(silent = false) {
     }
 }
 
-function buildChartDatasets(uploadValues, downloadValues, chartType = 'bar') {
+function buildChartDatasets(uploadValues, downloadValues, chartType = 'bar', options = {}) {
+    const embySplit = !!options.embySplitUpload;
+    const uploadLabel = embySplit ? '会话上传' : '上行';
+    const secondLabel = embySplit ? '选片上传' : '下行';
     const uploadDataset = chartType === 'line'
         ? {
-            label: '上行',
+            label: uploadLabel,
             data: uploadValues,
             borderColor: 'rgba(37, 99, 235, 0.92)',
             backgroundColor: 'rgba(37, 99, 235, 0.10)',
@@ -6243,41 +6526,43 @@ function buildChartDatasets(uploadValues, downloadValues, chartType = 'bar') {
             ...LINE_CHART_DATASET_STYLE,
         }
         : {
-            label: '上行',
+            label: uploadLabel,
             data: uploadValues,
             backgroundColor: 'rgba(37, 99, 235, 0.88)',
             borderColor: 'rgba(37, 99, 235, 1)',
             borderWidth: 0,
             borderRadius: 0,
             borderSkipped: false,
+            ...(embySplit ? { stack: 'upload' } : {}),
         };
-    if (isEmbyChartUploadOnly()) {
-        return [uploadDataset];
-    }
-    const downloadDataset = chartType === 'line'
+    const secondDataset = chartType === 'line'
         ? {
-            label: '下行',
+            label: secondLabel,
             data: downloadValues,
-            borderColor: 'rgba(16, 185, 129, 0.92)',
-            backgroundColor: 'rgba(16, 185, 129, 0.08)',
+            borderColor: embySplit ? 'rgba(37, 99, 235, 0.55)' : 'rgba(16, 185, 129, 0.92)',
+            backgroundColor: embySplit ? 'rgba(37, 99, 235, 0.06)' : 'rgba(16, 185, 129, 0.08)',
+            borderDash: embySplit ? [5, 4] : undefined,
             pointBackgroundColor: '#ffffff',
-            pointBorderColor: 'rgba(16, 185, 129, 1)',
+            pointBorderColor: embySplit ? 'rgba(37, 99, 235, 0.72)' : 'rgba(16, 185, 129, 1)',
             pointBorderWidth: 2,
             pointHoverBackgroundColor: '#ffffff',
-            pointHoverBorderColor: 'rgba(16, 185, 129, 1)',
+            pointHoverBorderColor: embySplit ? 'rgba(37, 99, 235, 0.72)' : 'rgba(16, 185, 129, 1)',
             pointHoverBorderWidth: 2,
             ...LINE_CHART_DATASET_STYLE,
         }
         : {
-            label: '下行',
+            label: secondLabel,
             data: downloadValues,
-            backgroundColor: 'rgba(16, 185, 129, 0.88)',
-            borderColor: 'rgba(16, 185, 129, 1)',
+            backgroundColor: embySplit
+                ? createBarHatchPattern('rgba(37, 99, 235, 0.88)')
+                : 'rgba(16, 185, 129, 0.88)',
+            borderColor: embySplit ? 'rgba(37, 99, 235, 1)' : 'rgba(16, 185, 129, 1)',
             borderWidth: 0,
             borderRadius: 0,
             borderSkipped: false,
+            ...(embySplit ? { stack: 'upload' } : {}),
         };
-    return [uploadDataset, downloadDataset];
+    return [uploadDataset, secondDataset];
 }
 
 function buildChartTooltipCallbacks(backfillMeta, tooltipLabels) {
@@ -6290,18 +6575,29 @@ function buildChartTooltipCallbacks(backfillMeta, tooltipLabels) {
         label(ctxTip) {
             const i = ctxTip.dataIndex;
             const isUpload = ctxTip.datasetIndex === 0;
+            const totalBytes = isUpload
+                ? (backfillMeta.uploadBytes?.[i] || 0)
+                : (backfillMeta.downloadBytes?.[i] || 0);
+            const backfillBytes = isUpload
+                ? (backfillMeta.backfillUploadBytes?.[i] || 0)
+                : (backfillMeta.backfillDownloadBytes?.[i] || 0);
+            if (isEmbyChartUploadOnly()) {
+                if (ctxTip.datasetIndex !== getFirstVisibleChartDatasetIndex()) return '';
+                const uploadTotalBytes = backfillMeta.uploadBytes?.[i] || 0;
+                const browseBytes = backfillMeta.backfillUploadBytes?.[i] || 0;
+                return formatEmbyUploadTooltipLines(uploadTotalBytes, browseBytes, {
+                    showSession: isChartTooltipItemVisible(0),
+                    showBrowse: isChartTooltipItemVisible(1),
+                });
+            }
             const name = isUpload ? '上行' : '下行';
-            const total = Number(ctxTip.parsed.y) || 0;
-            const backfill = isUpload
-                ? (backfillMeta.backfillUploadValues[i] || 0)
-                : (backfillMeta.backfillDownloadValues[i] || 0);
-            if (backfill > 0.00005) {
+            if (backfillBytes > 0) {
                 return [
-                    `总${name}：${total.toFixed(1)} GB`,
-                    `补 · ${backfill.toFixed(1)} GB`,
+                    `总${name}：${formatChartTrafficText(totalBytes)}`,
+                    `补 · ${formatChartTrafficText(backfillBytes)}`,
                 ];
             }
-            return [`${name}：${total.toFixed(1)} GB`];
+            return [`${name}：${formatChartTrafficText(totalBytes)}`];
         },
     };
 }
@@ -6310,7 +6606,7 @@ const BRACKET_PERIODS = new Set(['hourly', 'daily', 'weekly', 'monthly']);
 
 function getChartPlugins(period, dateGroups, chartType = 'bar', labelCount = 0) {
     const plugins = [yAxisLabelsPlugin, chartCrosshairPlugin];
-    if (chartType === 'bar' && getChartPlatform() !== 'emby') {
+    if (chartType === 'bar' && !isEmbyChartUploadOnly()) {
         plugins.unshift(backfillBarHatchPlugin);
     }
     if (BRACKET_PERIODS.has(period) && dateGroups?.length) {
@@ -6404,7 +6700,7 @@ function buildPieSliceColors(values, isUpload) {
     return { colors, hoverColors };
 }
 
-function createPieAnnotationPlugin(labels, tooltipLabels, isUpload, period, rawLabels, values, metrics, valueUnit = 'GB') {
+function createPieAnnotationPlugin(labels, tooltipLabels, isUpload, period, rawLabels, values, byteValues, metrics) {
     const PIE_PAD = metrics.piePad;
     const R_EXTRA = metrics.rExtra;
     const GAP     = metrics.gap;
@@ -6426,7 +6722,7 @@ function createPieAnnotationPlugin(labels, tooltipLabels, isUpload, period, rawL
     const lineColor  = isUpload ? 'rgba(37,99,235,0.75)' : 'rgba(5,150,105,0.75)';
     const FONT_V     = metrics.fontValue;
     const FONT_SM    = metrics.fontSm;
-    const valueText  = `${maxVal.toFixed(1)} ${valueUnit}`;
+    const valueText = formatChartTrafficText(byteValues?.[maxIdx] || 0);
 
     const textLines = [{ text: valueText, font: FONT_V, color: mainColor }];
     if (period === 'hourly') {
@@ -6541,19 +6837,19 @@ function createPieAnnotationPlugin(labels, tooltipLabels, isUpload, period, rawL
     };
 }
 
-function createPieCenterPlugin(isUpload, values, valueUnit = 'GB') {
+function createPieCenterPlugin(isUpload, byteValues) {
     // Precompute static text (runs once at chart creation)
-    const vals         = values || [];
-    const total        = vals.reduce((s, v) => s + (v || 0), 0);
+    const vals = byteValues || [];
+    const totalBytes = vals.reduce((s, v) => s + (v || 0), 0);
     const nonZeroCount = vals.filter(v => (v || 0) > 0).length;
-    const totalText    = `${total.toFixed(1)} ${valueUnit}`;
+    const totalText = formatChartTrafficText(totalBytes);
     const countText    = `${nonZeroCount} 时段`;
     const mainColor    = isUpload ? '#1e3a8a' : '#064e3b';
 
     return {
         id: `pieCenterText_${isUpload ? 'up' : 'dl'}`,
         afterDatasetsDraw(chart) {
-            if (total <= 0) return;
+            if (totalBytes <= 0) return;
             const { ctx } = chart;
             const meta = chart.getDatasetMeta(0);
             const arc  = meta.data[0];
@@ -6583,10 +6879,10 @@ function mountTrafficPieCharts({
     labels,
     rawLabels,
     tooltipLabels,
-    uploadValues,
-    downloadValues,
-    backfillUploadValues = [],
-    backfillDownloadValues = [],
+    uploadBytes,
+    downloadBytes,
+    backfillUploadBytes = [],
+    backfillDownloadBytes = [],
     period,
     animate = false,
     upCanvasId,
@@ -6595,7 +6891,7 @@ function mountTrafficPieCharts({
     const upCtx = document.getElementById(upCanvasId)?.getContext('2d');
     if (!upCtx) return null;
 
-    const { colors: upColors, hoverColors: upHoverColors } = buildPieSliceColors(uploadValues, true);
+    const { colors: upColors, hoverColors: upHoverColors } = buildPieSliceColors(uploadBytes, true);
     const pieMetrics = getPieLayoutMetrics();
     const pieHoverOffset = isMobileTouchDevice() ? 0 : 7;
     const makePieOptions = (isUpload) => ({
@@ -6614,18 +6910,26 @@ function mountTrafficPieCharts({
                     },
                     label(ctx) {
                         const i = ctx.dataIndex;
+                        const totalBytes = isUpload
+                            ? (uploadBytes[i] || 0)
+                            : (downloadBytes[i] || 0);
+                        const backfillBytes = isUpload
+                            ? (backfillUploadBytes[i] || 0)
+                            : (backfillDownloadBytes[i] || 0);
+                        if (isUpload && isEmbyChartUploadOnly()) {
+                            return formatEmbyUploadTooltipLines(totalBytes, backfillBytes, {
+                                showSession: isChartTooltipItemVisible(0),
+                                showBrowse: isChartTooltipItemVisible(1),
+                            });
+                        }
                         const name = isUpload ? '上行' : '下行';
-                        const total = ctx.parsed;
-                        const backfill = isUpload
-                            ? (backfillUploadValues[i] || 0)
-                            : (backfillDownloadValues[i] || 0);
-                        if (backfill > 0.00005) {
+                        if (backfillBytes > 0) {
                             return [
-                                ` 总${name}：${total.toFixed(2)} GB`,
-                                ` 补 · ${backfill.toFixed(2)} GB`,
+                                ` 总${name}：${formatChartTrafficText(totalBytes)}`,
+                                ` 补 · ${formatChartTrafficText(backfillBytes)}`,
                             ];
                         }
-                        return ` ${name}：${total.toFixed(2)} GB`;
+                        return ` ${name}：${formatChartTrafficText(totalBytes)}`;
                     },
                 },
             },
@@ -6635,13 +6939,13 @@ function mountTrafficPieCharts({
     const upChart = new Chart(upCtx, {
         type: 'doughnut',
         plugins: [
-            createPieAnnotationPlugin(labels, tooltipLabels, true, period, rawLabels, uploadValues, pieMetrics),
-            createPieCenterPlugin(true, uploadValues),
+            createPieAnnotationPlugin(labels, tooltipLabels, true, period, rawLabels, uploadBytes, uploadBytes, pieMetrics),
+            createPieCenterPlugin(true, uploadBytes),
         ],
         data: {
             labels,
             datasets: [{
-                data: uploadValues,
+                data: uploadBytes,
                 backgroundColor: upColors,
                 hoverBackgroundColor: upHoverColors,
                 borderColor: '#ffffff',
@@ -6661,18 +6965,18 @@ function mountTrafficPieCharts({
     if (!dlCtx) {
         return { upChart, dlChart: null };
     }
-    const { colors: dlColors, hoverColors: dlHoverColors } = buildPieSliceColors(downloadValues, false);
+    const { colors: dlColors, hoverColors: dlHoverColors } = buildPieSliceColors(downloadBytes, false);
 
     const dlChart = new Chart(dlCtx, {
         type: 'doughnut',
         plugins: [
-            createPieAnnotationPlugin(labels, tooltipLabels, false, period, rawLabels, downloadValues, pieMetrics),
-            createPieCenterPlugin(false, downloadValues),
+            createPieAnnotationPlugin(labels, tooltipLabels, false, period, rawLabels, downloadBytes, downloadBytes, pieMetrics),
+            createPieCenterPlugin(false, downloadBytes),
         ],
         data: {
             labels,
             datasets: [{
-                data: downloadValues,
+                data: downloadBytes,
                 backgroundColor: dlColors,
                 hoverBackgroundColor: dlHoverColors,
                 borderColor: '#ffffff',
@@ -6699,8 +7003,9 @@ function scheduleTrafficPieChartResize(upChart, dlChart) {
 
 function renderPieChart(uploadData, downloadData, period, instanceName, animate = false) {
     const merged = mergeUploadDownloadStats(uploadData, downloadData, period);
-    const { labels, rawLabels, tooltipLabels, uploadValues, downloadValues,
-            backfillUploadValues, backfillDownloadValues } = merged;
+    const { labels, rawLabels, tooltipLabels, uploadBytes, downloadBytes,
+            backfillUploadBytes, backfillDownloadBytes, chartTrafficScale } = merged;
+    currentChartTrafficScale = chartTrafficScale;
 
     if (!labels.length) {
         showChartNoDataInRange(instanceName);
@@ -6712,20 +7017,17 @@ function renderPieChart(uploadData, downloadData, period, instanceName, animate 
     syncChartLegendPlatformUi();
     syncChartInstanceTitle(instanceName);
 
-    lastChartLegendTotals = {
-        uploadBytes: sumChartBytesFromRows(uploadData),
-        downloadBytes: sumChartBytesFromRows(downloadData),
-    };
+    lastChartLegendTotals = buildChartLegendTotals(uploadData, downloadData, merged);
     syncChartLegendTotals();
 
     const charts = mountTrafficPieCharts({
         labels,
         rawLabels,
         tooltipLabels,
-        uploadValues,
-        downloadValues,
-        backfillUploadValues,
-        backfillDownloadValues,
+        uploadBytes,
+        downloadBytes,
+        backfillUploadBytes,
+        backfillDownloadBytes,
         period,
         animate,
         upCanvasId: 'trafficPieUpChart',
@@ -6753,21 +7055,37 @@ function renderChart(uploadData, downloadData, period, instanceName, animate = f
     const merged = mergeUploadDownloadStats(uploadData, downloadData, period);
     const {
         labels, uploadValues, downloadValues, dateGroups,
-        backfillUploadValues, backfillDownloadValues, tooltipLabels,
+        uploadBytes, downloadBytes,
+        backfillUploadBytes, backfillDownloadBytes, tooltipLabels,
+        chartTrafficScale,
     } = merged;
+    currentChartTrafficScale = chartTrafficScale;
 
     if (!labels.length) {
         showChartNoDataInRange(instanceName);
         return;
     }
 
-    lastChartLegendTotals = {
-        uploadBytes: sumChartBytesFromRows(uploadData),
-        downloadBytes: sumChartBytesFromRows(downloadData),
+    lastChartLegendTotals = buildChartLegendTotals(uploadData, downloadData, merged);
+    const backfillMeta = {
+        uploadBytes,
+        downloadBytes,
+        backfillUploadBytes,
+        backfillDownloadBytes,
     };
-    const backfillMeta = { backfillUploadValues, backfillDownloadValues };
     const chartType = chartViewType;
-    const datasets = buildChartDatasets(uploadValues, downloadValues, chartType);
+    const embyUploadOnly = isEmbyChartUploadOnly();
+    let datasets;
+    if (embyUploadOnly) {
+        const sessionUploadBytes = uploadBytes.map((total, i) => (
+            Math.max(0, total - (backfillUploadBytes[i] || 0))
+        ));
+        const sessionUploadValues = sessionUploadBytes.map(b => bytesToChartScale(b, chartTrafficScale));
+        const browseUploadValues = backfillUploadBytes.map(b => bytesToChartScale(b, chartTrafficScale));
+        datasets = buildChartDatasets(sessionUploadValues, browseUploadValues, chartType, { embySplitUpload: true });
+    } else {
+        datasets = buildChartDatasets(uploadValues, downloadValues, chartType);
+    }
     const xTitle = CHART_X_LABELS[period] || '时间';
     const tooltipCallbacks = buildChartTooltipCallbacks(backfillMeta, tooltipLabels);
     const hasBracket = BRACKET_PERIODS.has(period);
@@ -6806,10 +7124,15 @@ function renderChart(uploadData, downloadData, period, instanceName, animate = f
             tooltip: {
                 mode: 'index',
                 intersect: false,
+                filter(tooltipItem) {
+                    return isChartTooltipItemVisible(tooltipItem.datasetIndex);
+                },
                 callbacks: tooltipCallbacks,
             },
         },
-        scales: buildChartScales(period, chartType, labels.length),
+        scales: buildChartScales(period, chartType, labels.length, {
+            stacked: embyUploadOnly && chartType === 'bar',
+        }),
     };
     if (chartType === 'bar') {
         chartOptions.datasets = { bar: CHART_BAR_GROUP_OPTIONS };
@@ -8628,10 +8951,10 @@ function renderGlobalSettingsForm(g) {
                 <h3>采集刷新与数据保存</h3>
                 <div class="form-field">
                     <label>页面刷新间隔
-                        <input type="number" id="globalRefreshInterval" min="1" max="30" step="1"
+                        <input type="number" id="globalRefreshInterval" min="1" max="10" step="1"
                                data-number-stepper value="${g.refresh_interval ?? 1}" />
                     </label>
-                    <p class="form-hint form-hint--field">默认1，1-30 秒整数，控制 Web 自动刷新与前N秒流量展示</p>
+                    <p class="form-hint form-hint--field">默认1，1-10 秒整数，控制 Web 自动刷新流量展示</p>
                 </div>
                 <div class="form-field">
                     <label>数据采集间隔
@@ -8686,8 +9009,7 @@ function renderGlobalSettingsForm(g) {
                             <input type="checkbox" id="globalEmbyEnabled" ${g.emby_enabled ? 'checked' : ''} ${g.emby_feature_locked ? 'disabled' : ''} />
                             <span>开启 Emby 监控功能</span>
                         </label>
-                        <p class="form-hint form-hint--field">默认关闭，通过读取 docker.sock 与 Emby-API 配合，可实现同步监控 Emby 的播放会话与外网流量数据。只做排除局域网流量后的大致估算，不保证准确性。</p>
-                        <p class="form-hint form-hint--field">开启前提：Docker部署Emby，并映射docker.sock至本容器/var/run/docker.sock:ro</p>
+                        <p class="form-hint form-hint--field">开启可实现同步监控 Emby 的播放会话与外网流量数据。<br>数据来源：Lucky-API(准确) / docker 容器接口（估算）</p>
                         ${g.emby_feature_locked ? '<p class="form-hint form-hint--field form-hint--warning">当前仍有 Emby 设备，无法关闭此功能。</p>' : ''}
                     </div>
                     <div id="globalEmbyDefaultViewWrap" class="form-field" ${g.emby_enabled ? '' : 'hidden'} aria-hidden="${g.emby_enabled ? 'false' : 'true'}">
@@ -9044,7 +9366,7 @@ async function saveGlobalSettings() {
     const web_password_confirm = document.getElementById('globalWebPasswordConfirm').value;
 
     if (refresh_interval === null) {
-        showToast('页面刷新间隔须为 1-30 的整数');
+        showToast('页面刷新间隔须为 1-10 的整数');
         refreshInput?.focus();
         return;
     }

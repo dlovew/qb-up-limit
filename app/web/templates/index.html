@@ -181,6 +181,7 @@
                         <div id="mergeDevicesPopover" class="merge-devices-popover" role="dialog" aria-label="合并显示设备选择" hidden></div>
                     </div>
                 </div>
+                <div id="navbarContextSwitchHome" class="navbar-context-switch-home">
                 <div id="platformTypeSwitch" class="device-view-switch" role="group" aria-label="设备类型" hidden>
                     <div class="device-view-segments">
                         <button type="button" class="device-view-btn" data-platform-type="qb" aria-pressed="false" onclick="onNavbarPlatformTypeSwitch('qb')" title="qB 设备">
@@ -216,6 +217,7 @@
                         <span class="device-view-segment-indicator" aria-hidden="true"></span>
                     </div>
                 </div>
+                </div>
             </nav>
             <script src="/static/js/nav-boot.js?v=2025062030"></script>
         </div>
@@ -243,7 +245,12 @@
                 <div class="chart-section-header">
                     <div class="chart-filter-panel">
                         <div class="chart-filter-head">
-                            <div class="log-filter-head-main">
+                            <div class="panel-filter-head-left">
+                                <div class="panel-filter-head-toolbar">
+                                    <div id="statsPanelSwitchSlot" class="panel-context-switch-slot" hidden aria-hidden="true"></div>
+                                </div>
+                            </div>
+                            <div class="log-filter-head-main log-filter-head-main--trailing">
                                 <h2 class="chart-section-title">流量图表</h2>
                                 <button type="button" class="log-filter-head-refresh-btn" onclick="refreshTrafficChart()" aria-label="刷新" title="刷新">
                                     <svg class="log-filter-head-refresh-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -251,13 +258,6 @@
                                         <path d="M3.6 6.4A4.4 4.4 0 0 1 10.8 4.2L13 3M12.4 9.6A4.4 4.4 0 0 1 5.2 11.8L3 13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
                                     </svg>
                                 </button>
-                            </div>
-                            <div class="chart-filter-head-right">
-                                <div class="chart-hint-area">
-                                    <p id="chartBackfillHint" class="chart-backfill-hint" hidden>柱状图斜线区域为设备重新上线后补录的流量</p>
-                                    <p id="chartPieHint" class="chart-backfill-hint" hidden>饼状图时段过多影响阅读性，建议缩小时段</p>
-                                    <p id="chartZoomHint" class="chart-backfill-hint" hidden>支持鼠标滚轮/双指缩放、拖拽横向滚动查看详情</p>
-                                </div>
                             </div>
                         </div>
                         <div class="chart-filter-body">
@@ -324,10 +324,17 @@
                                 <div id="chartRangeQuickWrap" class="chart-range-quick">
                                     <div id="chartRangeQuickButtons" class="chart-range-quick-buttons" role="group" aria-label="快捷时间选择"></div>
                                 </div>
-                                <div class="chart-type-switch" role="group" aria-label="图表类型">
-                                    <button type="button" class="chart-type-btn active" data-chart-type="bar" aria-pressed="true" onclick="onChartTypeChange('bar')">柱状图</button>
-                                    <button type="button" class="chart-type-btn" data-chart-type="line" aria-pressed="false" onclick="onChartTypeChange('line')">曲线图</button>
-                                    <button type="button" class="chart-type-btn" data-chart-type="pie" aria-pressed="false" onclick="onChartTypeChange('pie')">饼状图</button>
+                                <div class="chart-type-switch-stack">
+                                    <div class="chart-type-switch" role="group" aria-label="图表类型">
+                                        <button type="button" class="chart-type-btn active" data-chart-type="bar" aria-pressed="true" onclick="onChartTypeChange('bar')">柱状图</button>
+                                        <button type="button" class="chart-type-btn" data-chart-type="line" aria-pressed="false" onclick="onChartTypeChange('line')">曲线图</button>
+                                        <button type="button" class="chart-type-btn" data-chart-type="pie" aria-pressed="false" onclick="onChartTypeChange('pie')">饼状图</button>
+                                    </div>
+                                    <div class="chart-hint-area">
+                                        <p id="chartBackfillHint" class="chart-backfill-hint" hidden>柱状图斜线区域为设备重新上线后补录的流量</p>
+                                        <p id="chartPieHint" class="chart-backfill-hint" hidden>饼状图时段过多影响阅读性，建议缩小时段</p>
+                                        <p id="chartZoomHint" class="chart-backfill-hint" hidden>支持鼠标滚轮/双指缩放、拖拽横向滚动查看详情</p>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -376,7 +383,7 @@
                             <div class="chart-y-axis-panel">
                                 <div class="chart-y-axis-slot">
                                     <div id="chartYAxisLabels" class="chart-y-axis-labels"></div>
-                                    <div id="chartYAxisUnit" class="chart-y-axis-unit" hidden>(GB)</div>
+                                    <div id="chartYAxisUnit" class="chart-y-axis-unit" hidden></div>
                                 </div>
                                 <div class="chart-scrollbar-gap" aria-hidden="true"></div>
                             </div>
@@ -432,7 +439,12 @@
             <div class="events-section">
                 <div class="log-filter-panel">
                     <div class="log-filter-head">
-                        <div class="log-filter-head-main">
+                        <div class="panel-filter-head-left">
+                            <div class="panel-filter-head-toolbar">
+                                <div id="eventsPanelSwitchSlot" class="panel-context-switch-slot" hidden aria-hidden="true"></div>
+                            </div>
+                        </div>
+                        <div class="log-filter-head-main log-filter-head-main--trailing">
                             <h2 class="log-section-title">事件日志</h2>
                             <button type="button" class="log-filter-head-refresh-btn" onclick="refreshEventsLog()" aria-label="刷新" title="刷新">
                                 <svg class="log-filter-head-refresh-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -461,11 +473,14 @@
                             <label class="chart-control" data-platform-panel="emby" hidden aria-hidden="true">
                                 <span class="chart-control-label">日志类型</span>
                                 <select id="embyEventLogType" onchange="onEmbyEventLogTypeChange()">
-                                    <option value="playback" selected>新版日志</option>
+                                    <option value="playback" selected>播放记录</option>
+                                    <option value="browse">选片记录</option>
+                                    <option value="playback_browse">播选合并</option>
                                     <option value="activity">原始日志</option>
                                 </select>
                             </label>
                         </div>
+                        <p id="embyBrowseLogHint" class="emby-browse-log-hint" hidden aria-hidden="true"></p>
                     </div>
                 </div>
                 <div class="platform-panel platform-panel--qb" data-platform-panel="qb">
@@ -481,7 +496,12 @@
             <div class="syslogs-section">
                 <div class="log-filter-panel">
                     <div class="log-filter-head">
-                        <div class="log-filter-head-main">
+                        <div class="panel-filter-head-left">
+                            <div class="panel-filter-head-toolbar">
+                                <div id="syslogsPanelSwitchSlot" class="panel-context-switch-slot" hidden aria-hidden="true"></div>
+                            </div>
+                        </div>
+                        <div class="log-filter-head-main log-filter-head-main--trailing">
                             <h2 class="log-section-title">系统日志</h2>
                             <button type="button" class="log-filter-head-refresh-btn" onclick="refreshSystemLogs()" aria-label="刷新" title="刷新">
                                 <svg class="log-filter-head-refresh-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -510,6 +530,7 @@
                                 <span class="chart-control-label">日志级别</span>
                                 <select id="syslogLevel" onchange="onSyslogLevelChange()">
                                     <option value="">全部</option>
+                                    <option value="DEBUG">DEBUG</option>
                                     <option value="INFO">INFO</option>
                                     <option value="WARNING">WARNING</option>
                                     <option value="ERROR">ERROR</option>

@@ -3,8 +3,11 @@ import sys
 import logging
 from logging.handlers import RotatingFileHandler
 
+_LOG_LEVEL_NAME = os.environ.get('APP_LOG_LEVEL', 'INFO').upper()
+_LOG_LEVEL = getattr(logging, _LOG_LEVEL_NAME, logging.INFO)
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=_LOG_LEVEL,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[logging.StreamHandler(sys.stdout)]
@@ -14,6 +17,7 @@ file_handler = RotatingFileHandler(
     '/data/app.log', encoding='utf-8',
     maxBytes=10 * 1024 * 1024, backupCount=3
 )
+file_handler.setLevel(_LOG_LEVEL)
 file_handler.setFormatter(logging.Formatter(
     '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'

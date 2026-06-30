@@ -16,6 +16,7 @@ DATA_KEY_PATH = '/data/.data_key'
 WEB_AUTH_PATH = '/data/.web_auth'
 QB_SECRETS_PATH = '/data/.qb_secrets'
 EMBY_SECRETS_PATH = '/data/.emby_secrets'
+LUCKY_SECRETS_PATH = '/data/.lucky_secrets'
 
 DEFAULT_WEB_USER = 'admin'
 DEFAULT_WEB_PASS = 'adminadmin'
@@ -215,3 +216,52 @@ def rename_emby_api_key(old_name: str, new_name: str) -> None:
             return
         secrets[new_name] = secrets.pop(old_name)
         _save_emby_secrets(secrets)
+        rename_lucky_open_token(old_name, new_name)
+
+
+def _load_lucky_secrets() -> dict:
+    return _read_json(LUCKY_SECRETS_PATH, {})
+
+
+def _save_lucky_secrets(secrets: dict) -> None:
+    _write_json(LUCKY_SECRETS_PATH, secrets)
+
+
+def get_lucky_open_token(instance_name: str) -> str:
+    if not instance_name:
+        return ''
+    token = _load_lucky_secrets().get(instance_name)
+    if not token:
+        return ''
+    return decrypt_value(token)
+
+
+def set_lucky_open_token(instance_name: str, open_token: str) -> None:
+    if not instance_name:
+        return
+    with _lock:
+        secrets = _load_lucky_secrets()
+        if open_token:
+            secrets[instance_name] = encrypt_value(open_token)
+        else:
+            secrets.pop(instance_name, None)
+        _save_lucky_secrets(secrets)
+
+
+def delete_lucky_open_token(instance_name: str) -> None:
+    set_lucky_open_token(instance_name, '')
+
+
+def has_lucky_open_token(instance_name: str) -> bool:
+    return bool(get_lucky_open_token(instance_name))
+
+
+def rename_lucky_open_token(old_name: str, new_name: str) -> None:
+    if not old_name or not new_name or old_name == new_name:
+        return
+    with _lock:
+        secrets = _load_lucky_secrets()
+        if old_name not in secrets:
+            return
+        secrets[new_name] = secrets.pop(old_name)
+        _save_lucky_secrets(secrets)

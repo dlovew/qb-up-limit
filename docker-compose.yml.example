@@ -7,9 +7,5 @@ services:
     environment:
       TZ: Asia/Shanghai
     volumes:
-      # 运行时数据：配置、数据库、密钥、日志（首次启动自动创建）
       - ./data:/data
-      # 可选：配置文件 可单独映射
-      - ./config/config.yaml:/config/config.yaml:ro
-      # 可选：Emby功能开启条件，必需采用docker运行（只读挂载 Docker Socket）
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+

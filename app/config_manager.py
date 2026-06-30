@@ -10,6 +10,11 @@ import logging
 
 from cycle import migrate_legacy_cycle, CYCLE_TYPES
 import secrets_store
+from emby_lucky import (
+    migrate_estimate_upload_flag,
+    normalize_lucky_base_url,
+    normalize_traffic_collect_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,18 +42,21 @@ DEFAULT_GLOBAL = {
     'emby_burst_priority_mode': 'seek_first',
     'emby_mode_switch_grace_seconds': 2,
     'emby_m3_wan_pool_scale': 1.0,
+    'emby_browse_upload_min_mb': 1.0,
 }
 
 EMBY_M3_WAN_POOL_SCALE_MIN = 0.5
 EMBY_M3_WAN_POOL_SCALE_MAX = 1.5
+EMBY_BROWSE_UPLOAD_MIN_MB_MIN = 0.0
+EMBY_BROWSE_UPLOAD_MIN_MB_MAX = 100.0
 
 REFRESH_INTERVAL_MIN = 1
-REFRESH_INTERVAL_MAX = 30
+REFRESH_INTERVAL_MAX = 10
 
 # qBittorrent WebUI 全局上传限速上限（KB/s）
 QB_MAX_UPLOAD_LIMIT_KBPS = 2097151
 
-# 刷新间隔(1-30) → 数据采集间隔（固定搭配表）
+# 刷新间隔(1-10) → 数据采集间隔（固定搭配表）
 REFRESH_COLLECT_MAP = {
     1: 5, 2: 10, 3: 15, 4: 20, 5: 25, 6: 30, 7: 35, 8: 40, 9: 45, 10: 50,
     11: 55, 12: 60, 13: 52, 14: 56, 15: 60, 16: 48, 17: 51, 18: 54, 19: 57,
@@ -98,7 +106,14 @@ DEFAULT_EMBY_INSTANCE = {
     'connection_timeout': INSTANCE_HTTP_TIMEOUT,
     'display_priority': 1,
     'wan_traffic_only': True,
-    'estimate_upload_enabled': True,
+    'traffic_collect_mode': '',
+    'lucky_base_url': '',
+    'lucky_verify_ssl': False,
+    'lucky_rule_key': '',
+    'lucky_sub_key': '',
+    'lucky_rule_label': '',
+    'lucky_frontend_host': '',
+    'lucky_credit_browse_traffic': False,
 }
 
 
@@ -302,7 +317,13 @@ def resolve_emby_credentials(data: dict, existing: dict = None) -> dict:
         api_key = ''
     if api_key and target_name:
         secrets_store.set_emby_api_key(target_name, api_key)
+    lucky_token = str(result.get('lucky_open_token', '') or '').strip()
+    if is_password_mask(lucky_token):
+        lucky_token = ''
+    if lucky_token and target_name:
+        secrets_store.set_lucky_open_token(target_name, lucky_token)
     result.pop('api_key', None)
+    result.pop('lucky_open_token', None)
     return result
 
 
@@ -528,6 +549,35 @@ def clamp_emby_m3_wan_pool_scale(value, *, strict: bool = False) -> float:
     return round(scale, 2)
 
 
+def clamp_emby_browse_upload_min_mb(value, *, strict: bool = False) -> float:
+    """选片流量入账阈值（MB）：单次选片段累计上传不低于该值才写入统计与日志。"""
+    try:
+        mb = float(value)
+    except (TypeError, ValueError):
+        mb = float(DEFAULT_GLOBAL['emby_browse_upload_min_mb'])
+    if strict:
+        if mb < EMBY_BROWSE_UPLOAD_MIN_MB_MIN or mb > EMBY_BROWSE_UPLOAD_MIN_MB_MAX:
+            lo = int(EMBY_BROWSE_UPLOAD_MIN_MB_MIN) if EMBY_BROWSE_UPLOAD_MIN_MB_MIN == int(EMBY_BROWSE_UPLOAD_MIN_MB_MIN) else EMBY_BROWSE_UPLOAD_MIN_MB_MIN
+            hi = int(EMBY_BROWSE_UPLOAD_MIN_MB_MAX) if EMBY_BROWSE_UPLOAD_MIN_MB_MAX == int(EMBY_BROWSE_UPLOAD_MIN_MB_MAX) else EMBY_BROWSE_UPLOAD_MIN_MB_MAX
+            raise ValueError(
+                f'选片入账阈值须在 {lo}～{hi} MB 之间',
+            )
+        return round(mb, 2)
+    mb = max(
+        EMBY_BROWSE_UPLOAD_MIN_MB_MIN,
+        min(EMBY_BROWSE_UPLOAD_MIN_MB_MAX, mb),
+    )
+    return round(mb, 2)
+
+
+def emby_browse_upload_min_bytes(global_cfg: dict = None) -> int:
+    cfg = global_cfg if isinstance(global_cfg, dict) else DEFAULT_GLOBAL
+    mb = clamp_emby_browse_upload_min_mb(
+        cfg.get('emby_browse_upload_min_mb', DEFAULT_GLOBAL['emby_browse_upload_min_mb']),
+    )
+    return int(mb * 1024 * 1024)
+
+
 def _safe_int(value, default: int) -> int:
     try:
         return int(value)
@@ -623,6 +673,10 @@ def _validate_global(global_cfg: dict, strict: bool = False,
     result['emby_mode_switch_grace_seconds'] = mode_switch_grace
     result['emby_m3_wan_pool_scale'] = clamp_emby_m3_wan_pool_scale(
         result.get('emby_m3_wan_pool_scale', DEFAULT_GLOBAL['emby_m3_wan_pool_scale']),
+        strict=strict,
+    )
+    result['emby_browse_upload_min_mb'] = clamp_emby_browse_upload_min_mb(
+        result.get('emby_browse_upload_min_mb', DEFAULT_GLOBAL['emby_browse_upload_min_mb']),
         strict=strict,
     )
     if strict and emby_instances is not None:
@@ -955,7 +1009,9 @@ def instance_only_basics_changed(existing: dict, updated: dict) -> bool:
 
 _EMBY_CONNECTION_KEYS = (
     'host', 'port', 'use_https', 'verify_ssl',
-    'container_name', 'container_id', 'estimate_upload_enabled',
+    'container_name', 'container_id', 'traffic_collect_mode',
+    'lucky_base_url', 'lucky_verify_ssl', 'lucky_rule_key', 'lucky_sub_key',
+    'lucky_rule_label', 'lucky_frontend_host', 'lucky_credit_browse_traffic',
 )
 
 
@@ -1101,7 +1157,16 @@ def _migrate_emby_instance_fields(inst: dict) -> dict:
     item['display_priority'] = max(1, min(DISPLAY_PRIORITY_MAX, priority))
     item['connection_timeout'] = INSTANCE_HTTP_TIMEOUT
     item['wan_traffic_only'] = bool(item.get('wan_traffic_only', True))
-    item['estimate_upload_enabled'] = bool(item.get('estimate_upload_enabled', True))
+    mode = migrate_estimate_upload_flag(item)
+    item['traffic_collect_mode'] = normalize_traffic_collect_mode(mode)
+    item.pop('estimate_upload_enabled', None)
+    item['lucky_base_url'] = normalize_lucky_base_url(item.get('lucky_base_url', ''))
+    item['lucky_verify_ssl'] = bool(item.get('lucky_verify_ssl', False))
+    item['lucky_rule_key'] = str(item.get('lucky_rule_key', '') or '').strip()
+    item['lucky_sub_key'] = str(item.get('lucky_sub_key', '') or '').strip()
+    item['lucky_rule_label'] = str(item.get('lucky_rule_label', '') or '').strip()
+    item['lucky_frontend_host'] = str(item.get('lucky_frontend_host', '') or '').strip()
+    item['lucky_credit_browse_traffic'] = bool(item.get('lucky_credit_browse_traffic', False))
     return item
 
 
@@ -1121,7 +1186,9 @@ def _validate_emby_instance(inst: dict, existing_names: list = None,
                               original_name: str = None,
                               require_name: bool = True,
                               require_api_key: bool = True,
-                              require_container: bool = True) -> dict:
+                              require_container: bool = True,
+                              require_lucky: bool = False,
+                              require_host: bool = True) -> dict:
     result = {**DEFAULT_EMBY_INSTANCE, **inst}
     result['name'] = str(result.get('name', '')).strip()
     host, port = _parse_host_port(
@@ -1135,7 +1202,7 @@ def _validate_emby_instance(inst: dict, existing_names: list = None,
         raise ValueError('请填写名称')
     if result['name'] and len(result['name']) > INSTANCE_NAME_MAX_LENGTH:
         raise ValueError(f'名称不能超过 {INSTANCE_NAME_MAX_LENGTH} 个字符')
-    if not result['host']:
+    if require_host and not result['host']:
         raise ValueError('请填写 Emby 地址')
     if existing_names:
         for n in existing_names:
@@ -1156,9 +1223,34 @@ def _validate_emby_instance(inst: dict, existing_names: list = None,
     result.pop('api_key', None)
     result['container_name'] = str(result.get('container_name', '') or '').strip()
     result['container_id'] = str(result.get('container_id', '') or '').strip()
-    if not result['container_name'] and not result['container_id']:
-        if require_container:
-            raise ValueError('请填写 Docker 容器名或容器 ID')
+    mode = normalize_traffic_collect_mode(migrate_estimate_upload_flag(result))
+    result['traffic_collect_mode'] = mode
+    result.pop('estimate_upload_enabled', None)
+    if mode == 'docker' and require_container:
+        if not result['container_name'] and not result['container_id']:
+            raise ValueError('Docker 采集需填写容器名或容器 ID')
+    result['lucky_base_url'] = normalize_lucky_base_url(result.get('lucky_base_url', ''))
+    result['lucky_verify_ssl'] = bool(result.get('lucky_verify_ssl', False))
+    result['lucky_rule_key'] = str(result.get('lucky_rule_key', '') or '').strip()
+    result['lucky_sub_key'] = str(result.get('lucky_sub_key', '') or '').strip()
+    result['lucky_rule_label'] = str(result.get('lucky_rule_label', '') or '').strip()
+    result['lucky_frontend_host'] = str(
+        result.get('lucky_frontend_host', '') or '',
+    ).strip()
+    result['lucky_credit_browse_traffic'] = bool(
+        result.get('lucky_credit_browse_traffic', False),
+    )
+    if mode == 'lucky' and require_lucky:
+        if not result['lucky_base_url']:
+            raise ValueError('请填写 Lucky 管理地址')
+        if not result['lucky_rule_key'] or not result['lucky_sub_key']:
+            raise ValueError('请选择 Lucky 反代规则')
+        token_name = original_name or result['name']
+        req_token = str(inst.get('lucky_open_token', '') or '').strip()
+        if is_password_mask(req_token):
+            req_token = ''
+        if not req_token and not secrets_store.get_lucky_open_token(token_name):
+            raise ValueError('请填写 Lucky OpenToken')
     try:
         priority = int(result.get('display_priority', 1))
     except (TypeError, ValueError):
@@ -1166,8 +1258,8 @@ def _validate_emby_instance(inst: dict, existing_names: list = None,
     result['display_priority'] = max(1, min(DISPLAY_PRIORITY_MAX, priority))
     result['connection_timeout'] = INSTANCE_HTTP_TIMEOUT
     result['wan_traffic_only'] = bool(result.get('wan_traffic_only', True))
-    result['estimate_upload_enabled'] = bool(result.get('estimate_upload_enabled', True))
-    for key in ('reachable', 'attempt_sync', 'apply_rules_now'):
+    for key in ('reachable', 'attempt_sync', 'apply_rules_now',
+                'lucky_open_token', 'clear_traffic_data'):
         result.pop(key, None)
     return result
 
@@ -1175,11 +1267,15 @@ def _validate_emby_instance(inst: dict, existing_names: list = None,
 def validate_emby_instance_for_test(inst: dict, test_type: str = 'connectivity') -> dict:
     require_api = test_type == 'api'
     require_container = test_type == 'docker'
+    require_lucky = test_type == 'lucky'
+    require_host = test_type not in ('lucky', 'lucky_rules', 'lucky_connect')
     result = _validate_emby_instance(
         inst,
         require_name=False,
         require_api_key=require_api,
         require_container=require_container,
+        require_lucky=require_lucky,
+        require_host=require_host,
     )
     api_key = inst.get('api_key') or ''
     if is_password_mask(api_key):
@@ -1192,6 +1288,27 @@ def validate_emby_instance_for_test(inst: dict, test_type: str = 'connectivity')
         result['api_key'] = api_key
     else:
         result['api_key'] = ''
+    lucky_token = str(inst.get('lucky_open_token', '') or '').strip()
+    if is_password_mask(lucky_token):
+        lucky_token = ''
+    if not lucky_token:
+        name = result.get('name', '')
+        if name:
+            lucky_token = secrets_store.get_lucky_open_token(name)
+    result['lucky_open_token'] = lucky_token
+    if test_type in ('lucky', 'lucky_rules'):
+        if not result.get('lucky_base_url'):
+            raise ValueError('请填写 Lucky 管理地址')
+        if not lucky_token:
+            raise ValueError('请填写 Lucky OpenToken')
+        if test_type == 'lucky':
+            if not result.get('lucky_rule_key') or not result.get('lucky_sub_key'):
+                raise ValueError('请选择 Lucky 反代规则')
+    if test_type == 'lucky_connect':
+        if not result.get('lucky_base_url'):
+            raise ValueError('请填写 Lucky 管理地址')
+        if not lucky_token:
+            raise ValueError('请填写 Lucky OpenToken')
     return result
 
 
@@ -1203,6 +1320,13 @@ def mask_emby_instance_for_api(inst: dict) -> dict:
         result['has_api_key'] = True
     else:
         result['has_api_key'] = False
+    if secrets_store.has_lucky_open_token(result.get('name', '')):
+        result['lucky_open_token'] = '******'
+        result['has_lucky_open_token'] = True
+    else:
+        result['has_lucky_open_token'] = False
+    mode = result.get('traffic_collect_mode') or ''
+    result['estimate_upload_enabled'] = mode == 'docker'
     return result
 
 
@@ -1211,7 +1335,7 @@ def add_emby_instance(inst: dict) -> dict:
     instances = config.get('emby_instances', [])
     names = [i['name'] for i in instances]
     inst = resolve_emby_credentials(inst)
-    validated = _validate_emby_instance(inst, existing_names=names)
+    validated = _validate_emby_instance(inst, existing_names=names, require_lucky=True)
     config.setdefault('emby_instances', []).append(validated)
     save_config(config)
     return validated
@@ -1227,7 +1351,7 @@ def update_emby_instance(name: str, inst: dict) -> dict:
     existing = instances[idx]
     inst = resolve_emby_credentials(inst, existing)
     validated = _validate_emby_instance(
-        inst, existing_names=names, original_name=name)
+        inst, existing_names=names, original_name=name, require_lucky=True)
     if name != validated['name']:
         secrets_store.rename_emby_api_key(name, validated['name'])
     instances[idx] = validated
@@ -1244,5 +1368,6 @@ def delete_emby_instance(name: str) -> bool:
         raise ValueError('设备不存在')
     config['emby_instances'] = new_instances
     secrets_store.delete_emby_api_key(name)
+    secrets_store.delete_lucky_open_token(name)
     save_config(config)
     return True

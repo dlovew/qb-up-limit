@@ -8,15 +8,26 @@ from typing import Dict, Optional
 from zoneinfo import ZoneInfo
 
 import config_manager
+import emby_browse_upload_stats
 import emby_traffic_db
 import playback_record_store
+import secrets_store
 import traffic_db
 import emby_playback_traffic
 import emby_traffic_tick_audit
 from emby_client import EmbyClient
 from emby_docker import DockerStatsClient
+from emby_lucky import (
+    LuckyClient,
+    calc_conn_traffic_deltas,
+    calc_ip_traffic_deltas,
+    extract_wan_ip_cumulative_traffic,
+    iter_wan_conn_statistics,
+    sum_positive,
+)
 from emby_traffic_filter import (
     apply_wan_traffic_filter,
+    is_lan_ip,
     is_wan_playback_session,
     m3_allocate_wan_pool,
     m3_session_docker_share_bps,
@@ -272,6 +283,17 @@ class EmbyInstanceWorker:
         self._m1_wan_surplus_warmup_ticks = 0
         self._verify_cumulative = {}
         self._last_tick_audit = {}
+        self._lucky_ip_baselines: Dict[str, Dict[str, int]] = {}
+        self._lucky_conn_baselines: Dict[str, Dict[str, int]] = {}
+        self._lucky_conn_rows_last: list = []
+        self._lucky_conn_deltas_last: Dict[str, int] = {}
+        self._lucky_ip_traffic_last: Dict[str, Dict[str, int]] = {}
+        self._lucky_ip_deltas_last: Dict[str, int] = {}
+        self._lucky_total_out = 0
+        self._lucky_total_in = 0
+        self._lucky_analysis_last: Optional[dict] = None
+        self._wan_client_sessions_last: list = []
+        self._live_upload_hydrated = False
 
     def start(self):
         if self._running:
@@ -320,9 +342,43 @@ class EmbyInstanceWorker:
             return None
         return self.monitor.docker.get_container_stats(ref)
 
+    def _lucky_client(self, client: EmbyClient) -> Optional[LuckyClient]:
+        token = secrets_store.get_lucky_open_token(self.name)
+        if not token or not client.lucky_base_url:
+            return None
+        return LuckyClient(
+            client.lucky_base_url,
+            open_token=token,
+            verify_ssl=client.lucky_verify_ssl,
+        )
+
+    def _lucky_wan_totals(self, res_list: list) -> tuple:
+        total_out = total_in = 0
+        for item in res_list or []:
+            if not isinstance(item, dict):
+                continue
+            ip = str(item.get('IP') or '').strip()
+            if not ip or is_lan_ip(ip):
+                continue
+            total_out += max(0, int(item.get('TrafficOut') or 0))
+            total_in += max(0, int(item.get('TrafficIn') or 0))
+        return total_out, total_in
+
+    def _fetch_lucky_access_detail(self, client: EmbyClient) -> tuple:
+        lc = self._lucky_client(client)
+        if not lc or not client.lucky_rule_key or not client.lucky_sub_key:
+            return None, False
+        data, err = lc.fetch_access_detail(
+            client.lucky_rule_key,
+            client.lucky_sub_key,
+        )
+        if err or not data:
+            return None, False
+        return data, True
+
     def _fetch_sessions(self, client: EmbyClient) -> list:
         try:
-            return client.get_normalized_sessions()
+            return client.get_wan_client_sessions()
         except Exception as e:
             logger.debug(f'[Emby:{self.name}] 获取会话失败: {e}')
             return []
@@ -678,10 +734,17 @@ class EmbyInstanceWorker:
             return []
         fetched_sessions = self._fetch_sessions(client) or []
         estimate_upload_enabled = bool(
-            getattr(client, 'estimate_upload_enabled', True),
+            getattr(client, 'upload_tracking_enabled', False),
         )
+        traffic_collect_mode = str(
+            getattr(client, 'traffic_collect_mode', '') or '',
+        ).strip().lower()
         sessions = [
-            {**s, 'estimate_upload_enabled': estimate_upload_enabled}
+            {
+                **s,
+                'estimate_upload_enabled': estimate_upload_enabled,
+                'traffic_collect_mode': traffic_collect_mode,
+            }
             if isinstance(s, dict) else s
             for s in fetched_sessions
         ]
@@ -691,6 +754,9 @@ class EmbyInstanceWorker:
                 self.name, self.monitor.config,
             )
         if inst_cfg:
+            credit_browse = bool(
+                inst_cfg.get('lucky_credit_browse_traffic', False),
+            ) and traffic_collect_mode == 'lucky'
             try:
                 _, store_snapshot = playback_record_store.tick_from_sessions(
                     self.name, sessions, api_online=api_online,
@@ -712,12 +778,6 @@ class EmbyInstanceWorker:
                 f'[Emby:{self.name}] 停止会话分摊状态清理失败: {e}',
             )
         if not fetched_sessions:
-            try:
-                emby_playback_traffic.clear_instance_live_upload_state(self.name)
-            except Exception as e:
-                logger.debug(
-                    f'[Emby:{self.name}] 无会话时分摊状态清理失败: {e}',
-                )
             self._wan_alloc_backlog_bytes = 0
             self._reset_wan_assign_ledger()
             self._reset_m1_wan_capture()
@@ -725,9 +785,13 @@ class EmbyInstanceWorker:
             self._last_tick_audit = {}
             self._mode_switch_pending_upload_bytes = 0
             self._mode_switch_pending_since_mono = None
+        self._wan_client_sessions_last = [
+            dict(s) for s in sessions if isinstance(s, dict)
+        ]
+        from emby_client import EmbyClient
         open_sessions = [
             s for s in sessions
-            if isinstance(s, dict) and bool(s.get('is_playing'))
+            if isinstance(s, dict) and EmbyClient.is_current_playback_session(s)
         ]
         self._last_sessions = open_sessions
         return open_sessions
@@ -737,14 +801,43 @@ class EmbyInstanceWorker:
         if not client:
             return
 
+        collect_mode = str(getattr(client, 'traffic_collect_mode', '') or '').strip().lower()
+        if collect_mode not in ('docker', 'lucky'):
+            collect_mode = ''
+
         was_online = self._was_online
         api_online = self._probe_api_online(client)
-        docker_stats = self._fetch_docker_stats(client) if full else None
+        has_container = bool(self._container_ref(client))
+        docker_stats = (
+            self._fetch_docker_stats(client)
+            if collect_mode == 'docker' and has_container else None
+        )
         sessions = self._sync_playback_sessions(client, api_online=api_online)
 
+        credit_browse = (
+            collect_mode == 'lucky'
+            and bool(getattr(client, 'lucky_credit_browse_traffic', False))
+        )
+        if not self._live_upload_hydrated and api_online:
+            try:
+                emby_playback_traffic.hydrate_live_upload_state(
+                    self.name,
+                    list(self._wan_client_sessions_last or sessions or []),
+                    credit_browse=credit_browse,
+                )
+            except Exception as e:
+                logger.debug(
+                    f'[Emby:{self.name}] 会话流量续传恢复失败: {e}',
+                )
+            self._live_upload_hydrated = True
+
         docker_available = self.monitor.docker.is_available()
-        has_container = bool(self._container_ref(client))
-        is_online = api_online or (docker_stats is not None)
+        lucky_available = False
+        lucky_ip_deltas: Dict[str, int] = {}
+        lucky_ip_traffic: Dict[str, Dict[str, int]] = {}
+        is_online = api_online
+        if collect_mode == 'docker':
+            is_online = api_online or (docker_stats is not None)
         recovering = not was_online and is_online
         is_backfill = False
         backfill_up = backfill_dl = 0
@@ -763,38 +856,44 @@ class EmbyInstanceWorker:
             'target_session_count': 0,
         }
 
-        if full and docker_stats and has_container:
+        if collect_mode == 'docker' and docker_stats and has_container:
             tx = docker_stats['tx_bytes']
             rx = docker_stats['rx_bytes']
-            raw_up, raw_dl = emby_traffic_db.peek_snapshot_deltas(
-                self.name,
-                tx,
-                rx,
-            )
+            raw_up = raw_dl = 0
+            if self._baseline_tx is not None and self._baseline_rx is not None:
+                raw_up = max(0, tx - self._baseline_tx) if tx >= self._baseline_tx else 0
+                raw_dl = max(0, rx - self._baseline_rx) if rx >= self._baseline_rx else 0
             filt_up, filt_dl = self._apply_traffic_filter(
                 client, raw_up, raw_dl, sessions)
             live_raw_up = raw_up
             live_raw_dl = raw_dl
-            if self._was_online and self._baseline_tx is not None and self._baseline_rx is not None:
-                live_raw_up = max(0, tx - self._baseline_tx) if tx >= self._baseline_tx else 0
-                live_raw_dl = max(0, rx - self._baseline_rx) if rx >= self._baseline_rx else 0
-            if live_raw_up == raw_up and live_raw_dl == raw_dl:
-                live_delta_up, live_delta_dl = filt_up, filt_dl
-            else:
-                live_delta_up, live_delta_dl = self._apply_traffic_filter(
-                    client, live_raw_up, live_raw_dl, sessions,
+            live_delta_up = filt_up
+            live_delta_dl = filt_dl
+            is_backfill = bool(
+                full
+                and recovering
+                and emby_traffic_db.has_docker_baseline(self.name)
+                and (raw_up > 0 or raw_dl > 0)
+            )
+            if self._baseline_tx is not None:
+                _, _, backfill_up, backfill_dl = emby_traffic_db.save_snapshot(
+                    self.name,
+                    tx,
+                    rx,
+                    record_up=filt_up,
+                    record_down=filt_dl,
+                    is_backfill=is_backfill,
                 )
-            is_backfill = (
-                recovering and emby_traffic_db.has_docker_baseline(self.name)
-            )
-            delta_up, delta_dl, backfill_up, backfill_dl = emby_traffic_db.save_snapshot(
-                self.name,
-                tx,
-                rx,
-                record_up=filt_up,
-                record_down=filt_dl,
-                is_backfill=is_backfill,
-            )
+            else:
+                emby_traffic_db.save_snapshot(
+                    self.name,
+                    tx,
+                    rx,
+                    record_up=0,
+                    record_down=0,
+                    is_backfill=False,
+                )
+                backfill_up = backfill_dl = 0
             if is_backfill and (backfill_up > 0 or backfill_dl > 0):
                 logger.info(
                     f'[Emby:{self.name}] 离线恢复补录上行='
@@ -803,23 +902,81 @@ class EmbyInstanceWorker:
                 )
             self._baseline_tx = tx
             self._baseline_rx = rx
-        elif not full and self._was_online and self._baseline_tx is not None:
-            stats = self._fetch_docker_stats(client)
-            if stats:
-                tx = stats['tx_bytes']
-                rx = stats['rx_bytes']
-                raw_up = max(0, tx - self._baseline_tx) if tx >= self._baseline_tx else 0
-                raw_dl = max(0, rx - self._baseline_rx) if rx >= self._baseline_rx else 0
-                delta_up, delta_dl = self._apply_traffic_filter(
-                    client, raw_up, raw_dl, sessions)
+        elif collect_mode == 'lucky':
+            lucky_detail = None
+            if full or self._was_online:
+                lucky_detail, lucky_available = self._fetch_lucky_access_detail(client)
+            if lucky_detail:
+                is_online = api_online or lucky_available
+                res_list = lucky_detail.get('resList') or []
+                lucky_baselines = emby_traffic_db.load_lucky_ip_baselines(self.name)
+                out_deltas, in_deltas, new_baselines = calc_ip_traffic_deltas(
+                    res_list,
+                    lucky_baselines,
+                    wan_only=True,
+                )
+                emby_traffic_db.save_lucky_ip_baselines(self.name, new_baselines)
+                self._lucky_ip_baselines = new_baselines
+                conn_baselines = emby_traffic_db.load_lucky_conn_baselines(self.name)
+                conn_out_deltas, conn_in_deltas, new_conn_baselines = (
+                    calc_conn_traffic_deltas(
+                        res_list,
+                        conn_baselines,
+                        wan_only=True,
+                    )
+                )
+                emby_traffic_db.save_lucky_conn_baselines(
+                    self.name, new_conn_baselines,
+                )
+                self._lucky_conn_baselines = new_conn_baselines
+                self._lucky_conn_rows_last = iter_wan_conn_statistics(
+                    res_list, wan_only=True,
+                )
+                self._lucky_conn_deltas_last = dict(conn_out_deltas)
+                lucky_ip_traffic = extract_wan_ip_cumulative_traffic(res_list)
+                self._lucky_ip_traffic_last = lucky_ip_traffic
+                self._lucky_ip_deltas_last = dict(out_deltas)
+                lucky_ip_deltas = out_deltas
+                raw_up = sum_positive(out_deltas)
+                raw_dl = sum_positive(in_deltas)
                 live_raw_up = raw_up
                 live_raw_dl = raw_dl
-                live_delta_up = delta_up
-                live_delta_dl = delta_dl
-                self._baseline_tx = tx
-                self._baseline_rx = rx
+                live_delta_up = raw_up
+                live_delta_dl = raw_dl
+                last_tx, last_rx = emby_traffic_db.get_instance_last_totals(self.name)
+                is_backfill = (
+                    full
+                    and recovering
+                    and emby_traffic_db.has_docker_baseline(self.name)
+                )
+                _, _, backfill_up, backfill_dl = emby_traffic_db.save_snapshot(
+                    self.name,
+                    last_tx + raw_up,
+                    last_rx + raw_dl,
+                    record_up=raw_up,
+                    record_down=raw_dl,
+                    is_backfill=is_backfill,
+                )
+                if is_backfill and (backfill_up > 0 or backfill_dl > 0):
+                    logger.info(
+                        f'[Emby:{self.name}] Lucky 离线恢复补录上行='
+                        f'{backfill_up / 1024 / 1024:.2f}MB'
+                        f'/下行={backfill_dl / 1024 / 1024:.2f}MB'
+                    )
+                total_out, total_in = self._lucky_wan_totals(res_list)
+                self._lucky_total_out = total_out
+                self._lucky_total_in = total_in
+            else:
+                if api_online:
+                    is_online = api_online
+                lucky_ip_traffic = dict(self._lucky_ip_traffic_last or {})
+                lucky_ip_deltas = dict(self._lucky_ip_deltas_last or {})
 
         mode_sessions = sessions
+        wan_alloc_sessions = (
+            list(getattr(self, '_wan_client_sessions_last', None) or [])
+            if credit_browse else mode_sessions
+        )
 
         if not is_online and self._was_online:
             logger.warning(f'[Emby:{self.name}] 连接中断，进入离线探测模式')
@@ -839,9 +996,77 @@ class EmbyInstanceWorker:
             getattr(self.monitor, 'burst_new_session_window_seconds', 8) or 8,
         )
         allocation_tick_seconds = max(1, int(self.monitor.refresh_interval or 1))
-        if full and raw_up > 0 and live_raw_up == raw_up:
+        if (
+            collect_mode != 'lucky'
+            and full
+            and raw_up > 0
+            and live_raw_up == raw_up
+        ):
             allocation_tick_seconds = max(1, int(self.monitor.collect_interval or 1))
-        if mode_code == 'M3' and wan_only_enabled:
+        if collect_mode == 'lucky':
+            conn_deltas = dict(getattr(self, '_lucky_conn_deltas_last', None) or {})
+            conn_rows = list(getattr(self, '_lucky_conn_rows_last', None) or [])
+            alloc_deltas = conn_deltas if conn_deltas else lucky_ip_deltas
+            if sessions is not None and live_delta_up > 0 and alloc_deltas:
+                try:
+                    if conn_deltas and conn_rows:
+                        part = emby_playback_traffic.accumulate_wan_upload_by_conn(
+                            self.name,
+                            wan_alloc_sessions,
+                            conn_deltas,
+                            conn_rows,
+                            tick_seconds=allocation_tick_seconds,
+                            credit_browse=credit_browse,
+                        )
+                    else:
+                        part = emby_playback_traffic.accumulate_wan_upload_by_ip(
+                            self.name,
+                            mode_sessions,
+                            lucky_ip_deltas,
+                            tick_seconds=allocation_tick_seconds,
+                        )
+                    if isinstance(part, dict):
+                        allocation_debug.update(part)
+                except Exception as e:
+                    logger.debug(
+                        f'[Emby:{self.name}] Lucky 上行分摊失败: {e}',
+                    )
+            if credit_browse:
+                lucky_analysis = None
+                try:
+                    lucky_analysis = emby_playback_traffic.get_lucky_conn_debug_snapshot(
+                        self.name,
+                        wan_alloc_sessions,
+                        conn_rows,
+                        alloc_deltas or {},
+                        credit_browse=True,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f'[Emby:{self.name}] Lucky 选片结算快照失败: {e}',
+                    )
+                if isinstance(lucky_analysis, dict):
+                    self._lucky_analysis_last = lucky_analysis
+                elif self._lucky_analysis_last is not None:
+                    lucky_analysis = self._lucky_analysis_last
+                try:
+                    import browse_upload_settler
+                    browse_upload_settler.tick(
+                        self.name,
+                        list(self._wan_client_sessions_last or []),
+                        api_online=api_online,
+                        credit_enabled=True,
+                        analysis=lucky_analysis,
+                        min_upload_bytes=getattr(
+                            self.monitor, 'browse_upload_min_bytes', None,
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f'[Emby:{self.name}] 选片流量结算失败: {e}',
+                        exc_info=True,
+                    )
+        elif collect_mode == 'docker' and mode_code == 'M3' and wan_only_enabled:
             live_delta_up = m3_allocate_wan_pool(
                 live_raw_up,
                 mode_sessions,
@@ -853,41 +1078,46 @@ class EmbyInstanceWorker:
         grace_seconds = max(0, int(getattr(
             self.monitor, 'mode_switch_grace_seconds', 0,
         ) or 0))
-        self._accumulate_wan_filter_surplus_backlog(
-            live_raw_up=live_raw_up,
-            live_delta_up=live_delta_up,
-            mode_code=mode_code,
-            prev_mode_code=self._prev_mode_code,
-            sessions=mode_sessions,
-            tick_seconds=allocation_tick_seconds,
-            is_backfill=is_backfill,
-            wan_only_enabled=wan_only_enabled,
-            grace_seconds=grace_seconds,
-            now_mono=now_mono,
-        )
-        debug_total_up, replay_upload_up = self._resolve_mode_switch_debug_total(
-            live_raw_up,
-            live_delta_up,
-            mode_code,
-            api_online=api_online,
-            wan_only_enabled=wan_only_enabled,
-            sessions=mode_sessions,
-            now_mono=now_mono,
-        )
+        if collect_mode == 'docker':
+            self._accumulate_wan_filter_surplus_backlog(
+                live_raw_up=live_raw_up,
+                live_delta_up=live_delta_up,
+                mode_code=mode_code,
+                prev_mode_code=self._prev_mode_code,
+                sessions=mode_sessions,
+                tick_seconds=allocation_tick_seconds,
+                is_backfill=is_backfill,
+                wan_only_enabled=wan_only_enabled,
+                grace_seconds=grace_seconds,
+                now_mono=now_mono,
+            )
+            debug_total_up, replay_upload_up = self._resolve_mode_switch_debug_total(
+                live_raw_up,
+                live_delta_up,
+                mode_code,
+                api_online=api_online,
+                wan_only_enabled=wan_only_enabled,
+                sessions=mode_sessions,
+                now_mono=now_mono,
+            )
+        else:
+            debug_total_up = live_raw_up
+            replay_upload_up = 0
 
         replay_alloc_up = 0
-        if replay_upload_up > 0 and mode_code != 'M0':
-            if wan_only_enabled and mode_code in ('M2', 'M3'):
-                # 待判定回放已写入 backlog，由限幅补录路径统一分摊，避免与 backlog 双通道叠加。
-                pass
-            elif wan_only_enabled:
-                replay_alloc_up, _ = self._apply_traffic_filter(
-                    client, replay_upload_up, 0, mode_sessions,
-                )
-            else:
-                replay_alloc_up = max(0, int(replay_upload_up or 0))
-            if replay_alloc_up > 0:
-                self._mode_switch_replay_alloc_total_bytes += replay_alloc_up
+        if collect_mode == 'docker':
+            if replay_upload_up > 0 and mode_code != 'M0':
+                if wan_only_enabled and mode_code in ('M2', 'M3'):
+                    # 待判定回放已写入 backlog，由限幅补录路径统一分摊，避免与 backlog 双通道叠加。
+                    pass
+                elif wan_only_enabled:
+                    replay_alloc_up, _ = self._apply_traffic_filter(
+                        client, replay_upload_up, 0, mode_sessions,
+                    )
+                else:
+                    replay_alloc_up = max(0, int(replay_upload_up or 0))
+                if replay_alloc_up > 0:
+                    self._mode_switch_replay_alloc_total_bytes += replay_alloc_up
         # 离线补录 tick 不把间隙流量分摊到当前会话（无法准确归属），但会清空本轮新增展示。
         alloc_sessions = mode_sessions if mode_sessions else (sessions or [])
         wan_backlog_applied_bytes = 0
@@ -895,7 +1125,7 @@ class EmbyInstanceWorker:
         alloc_input_up = 0
         effective_alloc_up = 0
         filter_wan_pool_up = max(0, int(live_delta_up or 0))
-        if sessions is not None:
+        if collect_mode == 'docker' and sessions is not None:
             if is_backfill:
                 alloc_input_up = 0
             elif wan_only_enabled:
@@ -1000,16 +1230,29 @@ class EmbyInstanceWorker:
                 and not can_alloc
             ):
                 self._wan_alloc_backlog_bytes += max(0, int(alloc_input_up or 0))
-        alloc_wan_up = allocation_debug.get('wan_upload_bytes')
-        if alloc_wan_up is None:
-            alloc_wan_up = allocation_debug.get('wan_pool_bytes')
-        alloc_total_up = allocation_debug.get('total_upload_bytes')
-        if alloc_total_up is None:
-            alloc_total_up = live_raw_up
-        if wan_only_enabled:
-            live_delta_up = max(0, int(alloc_wan_up or 0))
+        elif collect_mode == 'lucky':
+            alloc_wan_up = allocation_debug.get('wan_upload_bytes')
+            if alloc_wan_up is None:
+                alloc_wan_up = allocation_debug.get('wan_pool_bytes')
+            live_delta_up = max(0, int(alloc_wan_up or live_delta_up or 0))
+            filter_wan_pool_up = live_delta_up
+            effective_alloc_up = live_delta_up
+            alloc_input_up = live_delta_up
+        elif collect_mode == 'docker':
+            alloc_wan_up = allocation_debug.get('wan_upload_bytes')
+            if alloc_wan_up is None:
+                alloc_wan_up = allocation_debug.get('wan_pool_bytes')
+            alloc_total_up = allocation_debug.get('total_upload_bytes')
+            if alloc_total_up is None:
+                alloc_total_up = live_raw_up
+            if wan_only_enabled:
+                live_delta_up = max(0, int(alloc_wan_up or 0))
+            else:
+                live_delta_up = max(0, int(alloc_total_up or 0))
         else:
-            live_delta_up = max(0, int(alloc_total_up or 0))
+            live_delta_up = 0
+            live_delta_dl = 0
+            alloc_wan_up = 0
         debug_wan_up = (
             allocation_debug.get('wan_upload_bytes')
             if allocation_debug.get('wan_upload_bytes') is not None
@@ -1052,14 +1295,34 @@ class EmbyInstanceWorker:
             m1_wan_capture_bytes=max(0, int(self._m1_wan_capture_bytes or 0)),
             wan_only_enabled=wan_only_enabled,
         )
+        lucky_conn_debug: dict = {}
         try:
+            annotate_kwargs = {}
             sessions = emby_playback_traffic.annotate_live_sessions_upload(
-                self.name, sessions,
+                self.name, sessions, **annotate_kwargs,
             )
         except Exception as e:
             logger.debug(
                 f'[Emby:{self.name}] 实时会话上行调试字段附加失败: {e}',
             )
+        if collect_mode == 'lucky':
+            try:
+                verdict_sessions = list(
+                    getattr(self, '_wan_client_sessions_last', None) or [],
+                )
+                if not verdict_sessions:
+                    verdict_sessions = list(mode_sessions or [])
+                lucky_conn_debug = emby_playback_traffic.get_lucky_conn_debug_snapshot(
+                    self.name,
+                    verdict_sessions,
+                    list(getattr(self, '_lucky_conn_rows_last', None) or []),
+                    dict(getattr(self, '_lucky_conn_deltas_last', None) or {}),
+                    credit_browse=credit_browse,
+                )
+            except Exception as e:
+                logger.debug(
+                    f'[Emby:{self.name}] Lucky 连接调试快照失败: {e}',
+                )
         tick_wan_assigned = max(
             0,
             int(allocation_debug.get('wan_upload_bytes')
@@ -1104,6 +1367,8 @@ class EmbyInstanceWorker:
             is_online=is_online,
             api_online=api_online,
             docker_available=docker_available and has_container,
+            lucky_available=lucky_available if collect_mode == 'lucky' else False,
+            traffic_collect_mode=collect_mode,
             delta_up=live_delta_up,
             delta_dl=live_delta_dl,
             sessions=sessions,
@@ -1113,7 +1378,28 @@ class EmbyInstanceWorker:
                 'cumulative': dict(self._verify_cumulative or {}),
             },
             full=full,
+            lucky_ip_traffic=lucky_ip_traffic if collect_mode == 'lucky' else None,
+            lucky_ip_tick_deltas=lucky_ip_deltas if collect_mode == 'lucky' else None,
+            lucky_conn_debug=lucky_conn_debug if collect_mode == 'lucky' else None,
         )
+        if full:
+            try:
+                emby_playback_traffic.sync_live_upload_persistence(
+                    self.name,
+                    list(self._wan_client_sessions_last or sessions or []),
+                    credit_browse=credit_browse,
+                )
+            except Exception as e:
+                logger.debug(
+                    f'[Emby:{self.name}] 会话流量持久化失败: {e}',
+                )
+        if not self._wan_client_sessions_last:
+            try:
+                emby_playback_traffic.clear_instance_live_upload_state(self.name)
+            except Exception as e:
+                logger.debug(
+                    f'[Emby:{self.name}] 无会话时分摊状态清理失败: {e}',
+                )
         self._prev_mode_code = mode_code
         self._was_online = is_online
 
@@ -1136,8 +1422,16 @@ class EmbyMonitor:
 
     def _apply_global_config(self):
         self.global_cfg = config_manager.get_global_config(self.config)
-        self.collect_interval = self.global_cfg.get('collect_interval', 5)
-        self.refresh_interval = self.global_cfg.get('refresh_interval', 1)
+        try:
+            refresh = int(self.global_cfg.get('refresh_interval', 1))
+        except (TypeError, ValueError):
+            refresh = 1
+        refresh = max(
+            config_manager.REFRESH_INTERVAL_MIN,
+            min(config_manager.REFRESH_INTERVAL_MAX, refresh),
+        )
+        self.refresh_interval = refresh
+        self.collect_interval = config_manager.collect_interval_for_refresh(refresh)
         try:
             burst_new_window = int(
                 self.global_cfg.get('emby_burst_new_session_window_seconds', 8),
@@ -1163,6 +1457,9 @@ class EmbyMonitor:
         self.mode_switch_grace_seconds = max(0, min(10, mode_switch_grace))
         self.m3_wan_pool_scale = config_manager.clamp_emby_m3_wan_pool_scale(
             self.global_cfg.get('emby_m3_wan_pool_scale', 1.0),
+        )
+        self.browse_upload_min_bytes = config_manager.emby_browse_upload_min_bytes(
+            self.global_cfg,
         )
         tz_name = self.global_cfg.get('timezone', 'Asia/Shanghai')
         try:
@@ -1265,7 +1562,12 @@ class EmbyMonitor:
     def update_live_cache(self, name: str, is_online: bool, api_online: bool,
                           docker_available: bool, delta_up: int, delta_dl: int,
                           sessions: list, debug_metrics: dict, full: bool,
-                          traffic_tick_audit: dict = None):
+                          traffic_tick_audit: dict = None,
+                          lucky_available: bool = False,
+                          traffic_collect_mode: str = '',
+                          lucky_ip_traffic: dict = None,
+                          lucky_ip_tick_deltas: dict = None,
+                          lucky_conn_debug: dict = None):
         with self._live_cache_lock:
             prev = self._live_cache.get(name, {})
             prev_api_online = prev.get('api_online', False)
@@ -1285,6 +1587,8 @@ class EmbyMonitor:
                 'is_online': is_online,
                 'api_online': api_online,
                 'docker_available': docker_available,
+                'lucky_available': lucky_available,
+                'traffic_collect_mode': traffic_collect_mode or '',
                 'online_since': online_since,
                 'offline_since': offline_since,
                 'recent_delta_bytes': delta_up,
@@ -1296,6 +1600,32 @@ class EmbyMonitor:
                 'collect_generation': self._collect_generation.get(name, 0),
                 'state_generation': self._state_generation.get(name, 0),
             }
+            if lucky_ip_traffic is not None:
+                entry['lucky_ip_traffic'] = dict(lucky_ip_traffic or {})
+            elif prev.get('lucky_ip_traffic'):
+                entry['lucky_ip_traffic'] = dict(prev.get('lucky_ip_traffic') or {})
+            if lucky_ip_tick_deltas is not None:
+                entry['lucky_ip_tick_deltas'] = {
+                    str(k): max(0, int(v or 0))
+                    for k, v in (lucky_ip_tick_deltas or {}).items()
+                    if str(k).strip()
+                }
+            elif prev.get('lucky_ip_tick_deltas'):
+                entry['lucky_ip_tick_deltas'] = dict(prev.get('lucky_ip_tick_deltas') or {})
+            if lucky_conn_debug is not None:
+                entry['lucky_conn_debug'] = dict(lucky_conn_debug or {})
+            elif prev.get('lucky_conn_debug'):
+                prev_debug = prev.get('lucky_conn_debug')
+                if isinstance(prev_debug, dict):
+                    entry['lucky_conn_debug'] = dict(prev_debug)
+                elif isinstance(prev_debug, list):
+                    entry['lucky_conn_debug'] = {
+                        'version': 2,
+                        'groups': [],
+                        'rows': list(prev_debug),
+                        'emby_without_lucky': [],
+                        'total_connections': len(prev_debug or []),
+                    }
             self._live_cache[name] = entry
         if full:
             self._bump_collect_generation(name)
@@ -1315,19 +1645,33 @@ class EmbyMonitor:
             yesterday_start = today_start - timedelta(days=1)
             month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
-            today_up = emby_traffic_db.get_period_bytes(name, today_start, 'upload')
-            today_dl = emby_traffic_db.get_period_bytes(name, today_start, 'download')
-            yesterday_up = emby_traffic_db.get_period_bytes(name, yesterday_start, 'upload')
+            credit_browse = (
+                client.traffic_collect_mode == 'lucky'
+                and bool(client.lucky_credit_browse_traffic)
+            )
+            today_up = emby_browse_upload_stats.get_upload_period_bytes(
+                name, today_start, credit_browse=credit_browse,
+            )
+            today_dl = emby_traffic_db.get_period_bytes(
+                name, today_start, 'download')
+            yesterday_up = emby_browse_upload_stats.get_upload_period_bytes(
+                name, yesterday_start, credit_browse=credit_browse,
+            )
             yesterday_dl = emby_traffic_db.get_period_bytes(
                 name, yesterday_start, 'download')
             yesterday_up -= today_up
             yesterday_dl -= today_dl
             yesterday_up = max(0, yesterday_up)
             yesterday_dl = max(0, yesterday_dl)
-            month_up = emby_traffic_db.get_period_bytes(name, month_start, 'upload')
-            month_dl = emby_traffic_db.get_period_bytes(name, month_start, 'download')
+            month_up = emby_browse_upload_stats.get_upload_period_bytes(
+                name, month_start, credit_browse=credit_browse,
+            )
+            month_dl = emby_traffic_db.get_period_bytes(
+                name, month_start, 'download')
 
-            device_up = emby_traffic_db.get_total_bytes(name, 'upload')
+            device_up = emby_browse_upload_stats.get_upload_total_bytes(
+                name, credit_browse=credit_browse,
+            )
             device_dl = emby_traffic_db.get_total_bytes(name, 'download')
 
             api_online = live.get('api_online', status.get('api_online', 0) == 1)
@@ -1357,7 +1701,10 @@ class EmbyMonitor:
                 'container_id': client.container_id,
                 'display_priority': client.display_priority,
                 'wan_traffic_only': client.wan_traffic_only,
-                'estimate_upload_enabled': client.estimate_upload_enabled,
+                'traffic_collect_mode': client.traffic_collect_mode,
+                'estimate_upload_enabled': client.traffic_collect_mode == 'docker',
+                'lucky_rule_label': client.lucky_rule_label,
+                'lucky_credit_browse_traffic': client.lucky_credit_browse_traffic,
                 'is_online': live.get('is_online', status.get('is_online', 0) == 1),
                 'api_online': api_online,
                 'offline_since': offline_since,
@@ -1365,6 +1712,9 @@ class EmbyMonitor:
                 'data_start_time': data_start_time,
                 'docker_available': live.get(
                     'docker_available', status.get('docker_available', 0) == 1),
+                'lucky_available': live.get('lucky_available', False),
+                'traffic_collect_mode': live.get(
+                    'traffic_collect_mode', client.traffic_collect_mode),
                 'docker_socket_available': self.docker.is_available(),
                 'monthly_uploaded_bytes': month_up,
                 'monthly_downloaded_bytes': month_dl,
@@ -1379,6 +1729,8 @@ class EmbyMonitor:
                     'recent_delta_download_bytes', 0),
                 'session_count': live.get('session_count', 0),
                 'sessions': live.get('sessions') or [],
+                'lucky_ip_traffic': live.get('lucky_ip_traffic') or {},
+                'lucky_ip_tick_deltas': live.get('lucky_ip_tick_deltas') or {},
                 'traffic_tick_audit': live.get('traffic_tick_audit') or {},
                 'collect_interval': self.collect_interval,
                 'refresh_interval': self.refresh_interval,
@@ -1440,8 +1792,28 @@ class EmbyMonitor:
             if not config_manager.get_emby_instance(instance_name, self.config):
                 raise ValueError('设备不存在')
         emby_traffic_db.reset_instance_traffic(instance_name)
+        emby_traffic_db.clear_lucky_ip_baselines(instance_name)
+        try:
+            emby_playback_traffic.clear_persisted_live_upload_state(instance_name)
+        except Exception:
+            pass
+        try:
+            import browse_upload_settler
+            browse_upload_settler.clear_instance(instance_name)
+        except Exception:
+            pass
         worker = self._workers.get(instance_name)
         if worker:
+            worker._live_upload_hydrated = False
+            worker._lucky_ip_baselines = {}
+            worker._lucky_conn_baselines = {}
+            worker._lucky_conn_rows_last = []
+            worker._lucky_conn_deltas_last = {}
+            worker._lucky_ip_traffic_last = {}
+            worker._lucky_ip_deltas_last = {}
+            worker._wan_client_sessions_last = []
+            worker._lucky_total_out = 0
+            worker._lucky_total_in = 0
             client = None
             with self._config_lock:
                 client = self.clients.get(instance_name)

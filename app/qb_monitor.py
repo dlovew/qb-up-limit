@@ -93,6 +93,13 @@ class QBittorrentClient:
         self._reconnect_delay = 60
         self._last_connect_error = ''
         self._api_lock = threading.RLock()
+        self._session_announced = False
+
+    def _announce_session(self, message: str) -> None:
+        if self._session_announced:
+            return
+        self._session_announced = True
+        logger.info(message)
 
     @staticmethod
     def _resolve_password(config: dict) -> str:
@@ -106,8 +113,8 @@ class QBittorrentClient:
         api_host, use_https, hostname = _parse_host_config(self.host, self.use_https)
         proxy_headers = _build_reverse_proxy_headers(hostname, self.port) if use_https else {}
         timeout = (self.connection_timeout, self.read_timeout)
-        if not probe:
-            logger.info(
+        if not probe and not self._session_announced:
+            logger.debug(
                 f"[{self.name}] 初始化连接: {api_host}:{self.port} "
                 f"(SSL验证: {'是' if self.verify_ssl else '否'}, "
                 f"反代头: {'是' if proxy_headers else '否'})"
@@ -157,7 +164,11 @@ class QBittorrentClient:
         version = self._client.app.version
         self._connected = True
         self._last_connect_attempt = 0
-        logger.info(f"[{self.name}] ✓ 无需认证，qB版本: {version}")
+        api_host, _, _ = _parse_host_config(self.host, self.use_https)
+        self._announce_session(
+            f"[{self.name}] 已连接 {api_host}:{self.port} "
+            f"无需认证 qB={version}"
+        )
         return True
 
     def connect(self, probe: bool = False) -> bool:
@@ -187,20 +198,20 @@ class QBittorrentClient:
                 self._auth_log_in()
                 self._connected = True
                 self._last_connect_attempt = 0
-                logger.info(f"[{self.name}] ✓ 账号密码登录成功")
+                self._announce_session(f"[{self.name}] 账号密码登录成功")
                 return True
 
             try:
                 return self._connect_without_auth()
             except Exception as no_auth_err:
-                logger.info(
+                logger.debug(
                     f"[{self.name}] 免登未成功 ({str(no_auth_err)[:80]})，尝试账号密码登录"
                 )
                 self._client = self._make_client(probe=probe)
                 self._auth_log_in()
                 self._connected = True
                 self._last_connect_attempt = 0
-                logger.info(f"[{self.name}] ✓ 账号密码登录成功")
+                self._announce_session(f"[{self.name}] 账号密码登录成功")
                 return True
 
         except qbittorrentapi.exceptions.LoginFailed as e:
@@ -240,6 +251,7 @@ class QBittorrentClient:
     def _disconnect_unlocked(self):
         self._connected = False
         self._client = None
+        self._session_announced = False
 
     def fetch_for_collection(self, prefer_probe: bool = False) -> Optional[Dict]:
         """采集专用：在线优先正式连接；离线探测时优先快速探测再正式连接"""

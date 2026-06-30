@@ -14,6 +14,7 @@ from qb_monitor import QBittorrentClient
 logger = logging.getLogger(__name__)
 
 _COORDINATOR_INTERVAL = 60
+_COLLECT_LOG_INTERVAL = 300  # 采集摘要日志间隔（秒）
 
 
 def clamp_interval(seconds: int) -> int:
@@ -68,9 +69,12 @@ class InstanceWorker:
     def wake(self):
         self._wake.set()
 
-    def _sleep_interval(self):
+    def _sleep_interval(self, tick_elapsed_seconds: float = 0.0):
         interval = clamp_interval(self.monitor.refresh_interval)
-        self._wake.wait(timeout=interval)
+        wait_seconds = max(
+            0.0, float(interval) - max(0.0, float(tick_elapsed_seconds or 0.0)),
+        )
+        self._wake.wait(timeout=wait_seconds)
         self._wake.clear()
 
     def _ticks_per_full(self) -> int:
@@ -132,6 +136,7 @@ class InstanceWorker:
 
     def _loop(self):
         while self._running and self.monitor._running:
+            tick_started = time.monotonic()
             try:
                 if self._should_run_full_tick():
                     self._tick()
@@ -141,7 +146,8 @@ class InstanceWorker:
                 self._light_ticks += 1
             except Exception as e:
                 logger.error(f"[{self.name}] 采集循环异常: {e}", exc_info=True)
-            self._sleep_interval()
+            tick_elapsed = time.monotonic() - tick_started
+            self._sleep_interval(tick_elapsed)
 
     def _light_tick(self):
         """轻量探测：仅更新瞬时增量与限速展示，不落库、不跑达量逻辑"""
@@ -230,11 +236,20 @@ class TrafficMonitor:
         self._live_cache_lock = threading.Lock()
         self._collect_generation: Dict[str, int] = {}
         self._state_generation: Dict[str, int] = {}
+        self._collect_log_state: Dict[str, dict] = {}
 
     def _apply_global_config(self):
         self.global_cfg = config_manager.get_global_config(self.config)
-        self.collect_interval = self.global_cfg.get('collect_interval', 5)
-        self.refresh_interval = self.global_cfg.get('refresh_interval', 1)
+        try:
+            refresh = int(self.global_cfg.get('refresh_interval', 1))
+        except (TypeError, ValueError):
+            refresh = 1
+        refresh = max(
+            config_manager.REFRESH_INTERVAL_MIN,
+            min(config_manager.REFRESH_INTERVAL_MAX, refresh),
+        )
+        self.refresh_interval = refresh
+        self.collect_interval = config_manager.collect_interval_for_refresh(refresh)
         tz_name = self.global_cfg.get('timezone', 'Asia/Shanghai')
         try:
             self.timezone = ZoneInfo(tz_name)
@@ -771,15 +786,62 @@ class TrafficMonitor:
         self._bump_collect_generation(name)
         self._bump_state_generation(name)
 
+        self._maybe_log_collect_summary(
+            name, info, cycle_upload, cycle_download, cyc,
+            is_quota_limited, limit_kbps,
+            delta_up, delta_dl, backfill_up, backfill_dl, is_backfill,
+        )
+
+    def _collect_log_bucket(self, name: str) -> dict:
+        state = self._collect_log_state.get(name)
+        if state is None:
+            state = {
+                'window_start': time.monotonic(),
+                'ticks': 0,
+                'delta_up': 0,
+                'delta_dl': 0,
+                'backfill_up': 0,
+                'backfill_dl': 0,
+            }
+            self._collect_log_state[name] = state
+        return state
+
+    def _maybe_log_collect_summary(
+        self, name: str, info: dict,
+        cycle_upload: int, cycle_download: int, cyc: dict,
+        is_quota_limited: bool, limit_kbps: int,
+        delta_up: int, delta_dl: int,
+        backfill_up: int, backfill_dl: int, is_backfill: bool,
+    ):
+        state = self._collect_log_bucket(name)
+        state['ticks'] += 1
+        state['delta_up'] += max(0, int(delta_up or 0))
+        state['delta_dl'] += max(0, int(delta_dl or 0))
+        if is_backfill:
+            state['backfill_up'] += max(0, int(backfill_up or 0))
+            state['backfill_dl'] += max(0, int(backfill_dl or 0))
+
+        now_mono = time.monotonic()
+        elapsed = now_mono - float(state['window_start'])
+        has_backfill = is_backfill and (backfill_up > 0 or backfill_dl > 0)
+        if not has_backfill and elapsed < _COLLECT_LOG_INTERVAL:
+            return
+
+        window_label = (
+            f'{elapsed:.0f}s' if elapsed < 60 else f'{elapsed / 60:.0f}min'
+        )
         backfill_note = ''
-        if is_backfill and (backfill_up > 0 or backfill_dl > 0):
+        if state['backfill_up'] > 0 or state['backfill_dl'] > 0:
             backfill_note = (
-                f", 补录上行={backfill_up / 1024 / 1024:.2f}MB"
-                f"/下行={backfill_dl / 1024 / 1024:.2f}MB"
+                f", 补录上行={state['backfill_up'] / 1024 / 1024:.2f}MB"
+                f"/下行={state['backfill_dl'] / 1024 / 1024:.2f}MB"
             )
         logger.info(
-            f"[{name}] 采集: 上传会话={info['session_uploaded'] / 1024 / 1024:.2f}MB, "
-            f"上传增量={delta_up / 1024 / 1024:.2f}MB, "
+            f"[{name}] 采集摘要({window_label}): "
+            f"采样={state['ticks']}次, "
+            f"上传增量合计={state['delta_up'] / 1024 / 1024:.2f}MB, "
+            f"下载增量合计={state['delta_dl'] / 1024 / 1024:.2f}MB, "
+            f"上传会话={info['session_uploaded'] / 1024 / 1024:.2f}MB, "
             f"周期总上传={cycle_upload / 1024 / 1024 / 1024:.2f}GB "
             f"({cyc['range_label']}), "
             f"周期下载={cycle_download / 1024 / 1024 / 1024:.2f}GB, "
@@ -787,6 +849,12 @@ class TrafficMonitor:
             f"{f' ({limit_kbps} KB/s)' if is_quota_limited else ''}"
             f"{backfill_note}"
         )
+        state['window_start'] = now_mono
+        state['ticks'] = 0
+        state['delta_up'] = 0
+        state['delta_dl'] = 0
+        state['backfill_up'] = 0
+        state['backfill_dl'] = 0
 
     def _check_daily_cleanup(self):
         now = self._now()

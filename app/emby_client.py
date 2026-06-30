@@ -123,6 +123,40 @@ def _parse_host(host: str, use_https: bool) -> tuple:
     return f'{scheme}://{hostname}', use_https, hostname
 
 
+_SERVER_PLAYBACK_BROWSE_MARKERS = (
+    'videoplayback',
+    'started playing',
+    'stopped playing',
+    'paused playing',
+    'resumed playing',
+    'finished playing',
+    'is playing',
+    '开始播放',
+    '停止播放',
+    '暂停播放',
+    '继续播放',
+    '结束播放',
+    '正在播放',
+    '上开始播放',
+    '上停止播放',
+    '上结束播放',
+    '上暂停播放',
+    '上继续播放',
+    '上选片',
+    '上播放',
+    'browsing',
+    'is viewing',
+)
+
+
+def is_playback_browse_server_log_message(message: str) -> bool:
+    """Emby 服务器日志中的播放/选片活动行（不进入系统日志）。"""
+    msg = str(message or '').strip().casefold()
+    if not msg:
+        return False
+    return any(marker in msg for marker in _SERVER_PLAYBACK_BROWSE_MARKERS)
+
+
 class EmbyClient:
     """Emby API 封装 — 仅 GET 请求"""
 
@@ -141,7 +175,23 @@ class EmbyClient:
         except (TypeError, ValueError):
             self.display_priority = 500
         self.wan_traffic_only = bool(config.get('wan_traffic_only', True))
-        self.estimate_upload_enabled = bool(config.get('estimate_upload_enabled', True))
+        self.traffic_collect_mode = str(config.get('traffic_collect_mode') or '').strip().lower()
+        if self.traffic_collect_mode not in ('docker', 'lucky'):
+            self.traffic_collect_mode = ''
+        self.lucky_base_url = str(config.get('lucky_base_url') or '').strip()
+        self.lucky_verify_ssl = bool(config.get('lucky_verify_ssl', False))
+        self.lucky_rule_key = str(config.get('lucky_rule_key') or '').strip()
+        self.lucky_sub_key = str(config.get('lucky_sub_key') or '').strip()
+        self.lucky_rule_label = str(config.get('lucky_rule_label') or '').strip()
+        self.lucky_frontend_host = str(config.get('lucky_frontend_host') or '').strip()
+        self.lucky_credit_browse_traffic = bool(
+            config.get('lucky_credit_browse_traffic', False),
+        )
+        self.estimate_upload_enabled = self.traffic_collect_mode == 'docker'
+
+    @property
+    def upload_tracking_enabled(self) -> bool:
+        return self.traffic_collect_mode in ('docker', 'lucky')
 
     def update_config(self, config: dict):
         self.__init__(config)
@@ -395,6 +445,59 @@ class EmbyClient:
             return True
         play_method = str(play_state.get('PlayMethod') or '').strip()
         return bool(play_method)
+
+    @staticmethod
+    def session_has_now_playing_media(session: dict) -> bool:
+        """会话是否挂着正在观看的媒资（含暂停）。"""
+        if not isinstance(session, dict):
+            return False
+        if str(session.get('item_id') or '').strip():
+            return True
+        if str(session.get('title') or '').strip():
+            return True
+        if str(session.get('series_name') or '').strip():
+            return True
+        now_playing = session.get('NowPlayingItem') or {}
+        if isinstance(now_playing, dict):
+            if str(now_playing.get('Id') or '').strip():
+                return True
+            if str(now_playing.get('Name') or '').strip():
+                return True
+        return False
+
+    @staticmethod
+    def is_current_playback_session(session: dict) -> bool:
+        """与设备卡片「当前播放会话」口径一致：有媒资且仍在播或暂停。"""
+        if not isinstance(session, dict):
+            return False
+        if session.get('NowPlayingItem') or session.get('PlayState'):
+            prepared = EmbyClient.normalize_session(session)
+        else:
+            prepared = session
+        if not EmbyClient.session_has_now_playing_media(prepared):
+            return False
+        if bool(prepared.get('is_paused')):
+            return True
+        if bool(prepared.get('is_playing')):
+            return True
+        if bool(prepared.get('transcoding')):
+            return True
+        if session.get('TranscodingInfo'):
+            return True
+        return False
+
+    @staticmethod
+    def is_active_playback_stream(session: dict) -> bool:
+        """正在推流播放（非选片/暂停）——选片累加器不得再写入。"""
+        if not isinstance(session, dict):
+            return False
+        if session.get('NowPlayingItem') or session.get('PlayState'):
+            prepared = EmbyClient.normalize_session(session)
+        else:
+            prepared = session
+        if str(prepared.get('session_mode') or '').strip() != 'playing':
+            return False
+        return EmbyClient.session_has_now_playing_media(prepared)
 
     @staticmethod
     def is_live_playback_session(session: dict) -> bool:
@@ -1018,9 +1121,31 @@ class EmbyClient:
         return result
 
     @staticmethod
+    def _session_mode(now_playing: dict, viewing: dict, play_state: dict,
+                      transcoding: dict) -> str:
+        is_actively_playing = EmbyClient._session_is_actively_playing(
+            now_playing, play_state, transcoding,
+        )
+        if is_actively_playing and not bool(play_state.get('IsPaused')):
+            return 'playing'
+        # IsPaused 优先于 NowViewingItem：外网暂停后 Lucky 连接仍归属该播放会话。
+        if now_playing and bool(play_state.get('IsPaused')):
+            return 'paused'
+        if viewing:
+            return 'viewing'
+        if now_playing:
+            return 'paused'
+        return 'connected'
+
+    @staticmethod
     def normalize_session(session: dict) -> dict:
         play_state = session.get('PlayState') or {}
         now_playing = session.get('NowPlayingItem') or {}
+        viewing = session.get('NowViewingItem') or {}
+        if not isinstance(now_playing, dict):
+            now_playing = {}
+        if not isinstance(viewing, dict):
+            viewing = {}
         transcoding = session.get('TranscodingInfo') or {}
         play_method = play_state.get('PlayMethod') or ''
         if not play_method and transcoding:
@@ -1042,9 +1167,19 @@ class EmbyClient:
         parent_idx = now_playing.get('ParentIndexNumber')
         item_type = now_playing.get('Type') or ''
         episode_label = EmbyClient.format_episode_label(item_type, parent_idx, idx)
+        viewing_idx = viewing.get('IndexNumber')
+        viewing_parent_idx = viewing.get('ParentIndexNumber')
+        viewing_type = viewing.get('Type') or ''
+        viewing_episode_label = EmbyClient.format_episode_label(
+            viewing_type, viewing_parent_idx, viewing_idx,
+        )
+        session_mode = EmbyClient._session_mode(
+            now_playing, viewing, play_state, transcoding,
+        )
 
         return {
             'id': session.get('Id') or '',
+            'session_mode': session_mode,
             'is_playing': EmbyClient._session_is_actively_playing(
                 now_playing, play_state, transcoding,
             ),
@@ -1099,7 +1234,23 @@ class EmbyClient:
             'current_cpu': transcoding.get('CurrentCpuUsage'),
             'average_cpu': transcoding.get('AverageCpuUsage'),
             'last_activity_date': session.get('LastActivityDate') or '',
+            'viewing_item_id': viewing.get('Id') or '',
+            'viewing_item_type': viewing_type,
+            'viewing_title': viewing.get('Name') or '',
+            'viewing_series_name': viewing.get('SeriesName') or '',
+            'viewing_episode_label': viewing_episode_label,
         }
+
+    def get_wan_client_sessions(self) -> List[dict]:
+        """外网在线客户端（含选片/暂停/播放），供 Lucky 连接匹配。"""
+        result: List[dict] = []
+        for raw in self.get_sessions():
+            if not isinstance(raw, dict):
+                continue
+            session = self.normalize_session(raw)
+            if session.get('is_remote'):
+                result.append(session)
+        return result
 
     def send_session_playing_command(self, session_id: str, command: str) -> dict:
         command = (command or '').strip()

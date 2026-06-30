@@ -181,10 +181,10 @@ function formatEmbyBrowseUploadMinMbLabel(mb = null) {
 function buildEmbyBrowseLogHintText(mb = null) {
     const value = Number(mb ?? getEmbyBrowseUploadMinMb());
     if (!Number.isFinite(value) || value <= 0) {
-        return '选片时产生的上传流量均会计入，用户浏览已缓存的数据不会计入';
+        return '选片时产生的上传流量均会计入，用户浏览已缓存的数据不计入';
     }
     const label = formatEmbyBrowseUploadMinMbLabel(mb);
-    return `选片流量 > ${label} 才入账，用户浏览已缓存的数据不会计入`;
+    return `选片流量 > ${label} 计入，用户浏览已缓存的数据不计入`;
 }
 
 function syncEmbyBrowseLogHintText() {
@@ -738,8 +738,7 @@ function buildEmbyTrafficDataHint(inst) {
     if (mode === 'docker') {
         return '按外网用户统计（docker估算模式），不统计局域网流量';
     }
-    const browseLabel = inst?.lucky_credit_browse_traffic ? '含选片流量' : '不含选片流量';
-    return `按外网用户统计（${browseLabel}），不统计局域网流量`;
+    return '按外网用户统计，不统计局域网流量';
 }
 
 function parseEmbyEndpointIp(remoteEndpoint) {
@@ -754,6 +753,39 @@ function parseEmbyEndpointIp(remoteEndpoint) {
     }
     if (ep.includes(':') && !ep.includes('.')) return ep;
     return ep;
+}
+
+function isEmbyLanIp(ipStr) {
+    const ip = String(ipStr || '').trim().replace(/^\[|\]$/g, '');
+    if (!ip) return true;
+    if (/^10\./.test(ip)) return true;
+    if (/^192\.168\./.test(ip)) return true;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) return true;
+    if (/^127\./.test(ip) || ip === '127.0.0.1') return true;
+    if (/^169\.254\./.test(ip)) return true;
+    if (/^0\./.test(ip)) return true;
+    if (ip === '::1') return true;
+    if (/^fe80:/i.test(ip)) return true;
+    if (/^f[cd]/i.test(ip)) return true;
+    return false;
+}
+
+function resolveEmbyEventRecordIsRemote(rec) {
+    if (!rec) return false;
+    if (typeof rec.is_remote === 'boolean') return rec.is_remote;
+    const endpoint = rec.remote_endpoint || rec.client_ip || '';
+    const ip = parseEmbyEndpointIp(endpoint);
+    if (!ip) return false;
+    return !isEmbyLanIp(ip);
+}
+
+function isEmbyEventExcludeLanEnabled() {
+    return !!document.getElementById('embyEventExcludeLan')?.checked;
+}
+
+function filterEmbyEventRecordsExcludeLan(records) {
+    if (!isEmbyEventExcludeLanEnabled()) return records || [];
+    return (records || []).filter((rec) => resolveEmbyEventRecordIsRemote(rec));
 }
 
 function getLuckyTrafficBytesForSession(inst, session) {
@@ -4656,17 +4688,19 @@ function refreshEmbyEventPlaybackUsers(records) {
 }
 
 function filterPlaybackRecordsByUser(records) {
+    let filtered = filterEmbyEventRecordsExcludeLan(records);
     const user = getEmbyEventPlaybackUser();
-    if (!user) return records || [];
-    return (records || []).filter((rec) => String(rec.user_name || '').trim() === user);
+    if (!user) return filtered;
+    return filtered.filter((rec) => String(rec.user_name || '').trim() === user);
 }
 
 function filterBrowseRecordsByUser(records) {
     const user = getEmbyEventPlaybackUser();
     const minBytes = getEmbyBrowseUploadMinBytes();
-    const eligible = (records || []).filter(
+    let eligible = (records || []).filter(
         (rec) => (parseInt(rec.estimated_upload_bytes, 10) || 0) >= minBytes,
     );
+    eligible = filterEmbyEventRecordsExcludeLan(eligible);
     if (!user) return eligible;
     return eligible.filter((rec) => String(rec.user_name || '').trim() === user);
 }
@@ -4684,7 +4718,20 @@ function onEmbyEventLogTypeChange() {
 
 function onEmbyEventPlaybackUserChange() {
     if (typeof persistChartControls === 'function') persistChartControls();
+    rerenderEmbyEventLogsFromCache();
+}
+
+function onEmbyEventExcludeLanChange() {
+    if (typeof persistChartControls === 'function') persistChartControls();
+    rerenderEmbyEventLogsFromCache();
+}
+
+function rerenderEmbyEventLogsFromCache() {
     const logType = getEmbyEventLogType();
+    if (logType === 'activity') {
+        renderEmbyActivityEvents();
+        return;
+    }
     if (logType === 'browse') {
         renderBrowseRecords();
         return;
@@ -4692,7 +4739,6 @@ function onEmbyEventPlaybackUserChange() {
     if (logType === 'playback_browse') {
         renderPlaybackRecords();
         renderBrowseRecords();
-        refreshEmbyEventPlaybackUsersFromCaches();
         return;
     }
     renderPlaybackRecords();
@@ -4816,6 +4862,8 @@ async function loadEmbyPlaybackRecords(silent = false) {
     }
 }
 
+let _lastEmbyActivityEvents = [];
+
 async function loadEmbyActivityLog(silent = false) {
     const list = document.getElementById('embyEventsList');
     if (!list) return;
@@ -4877,11 +4925,18 @@ function renderEmbyActivityEventCard(event) {
 function renderEmbyActivityEvents(events) {
     const list = document.getElementById('embyEventsList');
     if (!list) return;
-    if (!events.length) {
-        list.innerHTML = '<div class="empty-tip">暂无原始日志</div>';
+    if (events !== undefined) {
+        _lastEmbyActivityEvents = events || [];
+    }
+    const filtered = filterEmbyEventRecordsExcludeLan(_lastEmbyActivityEvents);
+    if (!filtered.length) {
+        const tip = _lastEmbyActivityEvents.length && isEmbyEventExcludeLanEnabled()
+            ? '暂无匹配的外网原始日志'
+            : '暂无原始日志';
+        list.innerHTML = `<div class="empty-tip">${tip}</div>`;
         return;
     }
-    list.innerHTML = events.map(renderEmbyActivityEventCard).join('');
+    list.innerHTML = filtered.map(renderEmbyActivityEventCard).join('');
     ensureEmbyEventIpToggle();
 }
 
@@ -4996,7 +5051,8 @@ function buildEmbyEventNetworkBadgeHtml(event) {
     const ip = event.client_ip || event.remote_endpoint || '';
     if (!ip) return '';
     const badgeLabel = event.is_remote ? '外网' : '局域网';
-    return `<span class="emby-session-badge emby-event-badge--network">${badgeLabel}</span>`;
+    const networkKind = event.is_remote ? 'wan' : 'lan';
+    return `<span class="emby-session-badge emby-event-badge--network emby-event-badge--network-${networkKind}">${badgeLabel}</span>`;
 }
 
 function buildEmbyEventNetworkHtml(event) {
@@ -5753,8 +5809,8 @@ function renderPlaybackRecords(records) {
     }
     const filtered = filterPlaybackRecordsByUser(_lastPlaybackRecords);
     if (!filtered.length) {
-        const tip = _lastPlaybackRecords.length && getEmbyEventPlaybackUser()
-            ? '该用户暂无播放记录'
+        const tip = _lastPlaybackRecords.length && (getEmbyEventPlaybackUser() || isEmbyEventExcludeLanEnabled())
+            ? (getEmbyEventPlaybackUser() ? '该用户暂无播放记录' : '暂无匹配的外网播放记录')
             : '暂无播放记录';
         list.innerHTML = `<div class="empty-tip">${tip}</div>`;
         ensureEmbyLogPlayingTicker();
@@ -5876,8 +5932,8 @@ function renderBrowseRecords(records) {
     }
     const filtered = filterBrowseRecordsByUser(_lastBrowseRecords);
     if (!filtered.length) {
-        const tip = _lastBrowseRecords.length && getEmbyEventPlaybackUser()
-            ? '该用户暂无选片记录'
+        const tip = _lastBrowseRecords.length && (getEmbyEventPlaybackUser() || isEmbyEventExcludeLanEnabled())
+            ? (getEmbyEventPlaybackUser() ? '该用户暂无选片记录' : '暂无匹配的外网选片记录')
             : '暂无选片记录';
         list.innerHTML = `<div class="empty-tip">${tip}</div>`;
         return;

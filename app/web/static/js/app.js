@@ -141,6 +141,7 @@ const SYSLOG_QB_INSTANCE_KEY = 'qb-up-limit-syslog-instance-qb';
 const SYSLOG_EMBY_INSTANCE_KEY = 'qb-up-limit-syslog-instance-emby';
 const EMBY_EVENT_PLAYBACK_USER_KEY = 'qb-up-limit-emby-event-playback-user';
 const EMBY_EVENT_LOG_TYPE_KEY = 'qb-up-limit-emby-event-log-type';
+const EMBY_EVENT_EXCLUDE_LAN_KEY = 'qb-up-limit-emby-event-exclude-lan';
 const VALID_TABS = new Set(['devices', 'stats', 'events', 'syslogs']);
 let cachedInstances = [];
 let lastCardsStructureKey = '';
@@ -4446,6 +4447,7 @@ function applyChartRangeState(period, state) {
 
 async function bootstrapPersistedTabControls() {
     restoreChartControls();
+    restoreEmbyEventExcludeLanCheckbox();
     if (typeof syncDeviceTypeFilterControls === 'function') {
         syncDeviceTypeFilterControls();
     }
@@ -4518,6 +4520,14 @@ function persistChartControls() {
     if (embyEventPlaybackUserEl) {
         state.embyEventPlaybackUser = embyEventPlaybackUserEl.value || '';
         sessionStorage.setItem(EMBY_EVENT_PLAYBACK_USER_KEY, state.embyEventPlaybackUser);
+    }
+    const embyEventExcludeLanEl = document.getElementById('embyEventExcludeLan');
+    if (embyEventExcludeLanEl) {
+        state.embyEventExcludeLan = !!embyEventExcludeLanEl.checked;
+        sessionStorage.setItem(
+            EMBY_EVENT_EXCLUDE_LAN_KEY,
+            state.embyEventExcludeLan ? '1' : '0',
+        );
     }
     if (syslogQbEl) {
         state.syslogInstanceQb = syslogQbEl.value || '';
@@ -4598,12 +4608,31 @@ function restoreChartControls() {
     if (state.embyEventPlaybackUser != null) {
         sessionStorage.setItem(EMBY_EVENT_PLAYBACK_USER_KEY, state.embyEventPlaybackUser);
     }
+    restoreEmbyEventExcludeLanCheckbox(state);
     if (state.syslogInstanceQb != null) {
         sessionStorage.setItem(SYSLOG_QB_INSTANCE_KEY, state.syslogInstanceQb);
     }
     if (state.syslogInstanceEmby != null) {
         sessionStorage.setItem(SYSLOG_EMBY_INSTANCE_KEY, state.syslogInstanceEmby);
     }
+}
+
+function restoreEmbyEventExcludeLanCheckbox(chartState = null) {
+    const excludeLanEl = document.getElementById('embyEventExcludeLan');
+    if (!excludeLanEl) return;
+    let checked = sessionStorage.getItem(EMBY_EVENT_EXCLUDE_LAN_KEY) === '1';
+    const state = chartState || (() => {
+        try {
+            const raw = sessionStorage.getItem(CHART_CONTROLS_STORAGE_KEY);
+            return raw ? JSON.parse(raw) : null;
+        } catch {
+            return null;
+        }
+    })();
+    if (state && 'embyEventExcludeLan' in state) {
+        checked = !!state.embyEventExcludeLan;
+    }
+    excludeLanEl.checked = checked;
 }
 
 function hasChartRangeInputValues(period) {

@@ -479,6 +479,12 @@
                                     <option value="activity">原始日志</option>
                                 </select>
                             </label>
+                            <label class="chart-control chart-control--checkbox" data-platform-panel="emby" data-emby-exclude-lan-filter hidden aria-hidden="true">
+                                <span class="log-filter-checkbox">
+                                    <input type="checkbox" id="embyEventExcludeLan" onchange="onEmbyEventExcludeLanChange()" />
+                                    <span>排除局域网</span>
+                                </span>
+                            </label>
                         </div>
                         <p id="embyBrowseLogHint" class="emby-browse-log-hint" hidden aria-hidden="true"></p>
                     </div>

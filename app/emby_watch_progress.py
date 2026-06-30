@@ -10,8 +10,10 @@ from emby_client import EmbyClient
 WATCH_LOCK_SECONDS = 30
 WATCH_EFFECTIVE_SECONDS = 300
 SEEK_BACKWARD_TOLERANCE = 8
-SEEK_FORWARD_MIN_DELTA = 9
+SEEK_FORWARD_MIN_DELTA = 25
 SEEK_FORWARD_GAP_TOLERANCE = 12
+PLAYBACK_RATE_MIN = 0.25
+PLAYBACK_RATE_MAX = 16.0
 SEEK_GAP_ELAPSED_MIN = 3.0
 SEEK_COOLDOWN_SECONDS = 2.5
 STALL_GRACE_SECONDS = 8
@@ -205,16 +207,29 @@ class SessionWatchState:
         self.continuous_seconds = 0.0
         self.stall_seconds = 0.0
 
-    def _is_seek(self, last_pos: int, pos: int, elapsed: float, now_mono: float) -> bool:
+    @staticmethod
+    def _normalize_playback_rate(value) -> float:
+        rate = EmbyClient._normalize_playback_rate(value)
+        return max(PLAYBACK_RATE_MIN, min(PLAYBACK_RATE_MAX, rate))
+
+    @staticmethod
+    def _expected_progress_delta(elapsed: float, playback_rate: float) -> float:
+        rate = SessionWatchState._normalize_playback_rate(playback_rate)
+        return max(0.0, float(elapsed or 0.0)) * rate
+
+    def _is_seek(self, last_pos: int, pos: int, elapsed: float, now_mono: float,
+                 playback_rate: float = 1.0) -> bool:
         if self.last_seek_mono is not None:
             if (now_mono - self.last_seek_mono) < SEEK_COOLDOWN_SECONDS:
                 return False
         delta = pos - last_pos
         if delta <= -SEEK_BACKWARD_TOLERANCE:
             return True
-        if delta >= SEEK_FORWARD_MIN_DELTA:
+        expected = self._expected_progress_delta(elapsed, playback_rate)
+        if delta >= expected + SEEK_FORWARD_MIN_DELTA:
             return True
-        if elapsed >= SEEK_GAP_ELAPSED_MIN and delta > elapsed + SEEK_FORWARD_GAP_TOLERANCE:
+        if (elapsed >= SEEK_GAP_ELAPSED_MIN
+                and delta > expected + SEEK_FORWARD_GAP_TOLERANCE):
             return True
         return False
 
@@ -247,7 +262,12 @@ class SessionWatchState:
             self.last_position = position
             return
 
-        if self._is_seek(last_pos, position, elapsed, now):
+        playback_rate = self._normalize_playback_rate(
+            session.get('playback_rate')
+            if session.get('playback_rate') is not None
+            else (session.get('PlayState') or {}).get('PlaybackRate'),
+        )
+        if self._is_seek(last_pos, position, elapsed, now, playback_rate):
             self._record_seek(last_pos, position)
             self._reset_segment(position)
             self.last_position = position

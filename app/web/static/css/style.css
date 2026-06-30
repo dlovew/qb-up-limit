@@ -6847,6 +6847,35 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
     min-width: 118px;
 }
 
+.log-filter-row--selects .chart-control--checkbox {
+    flex: 0 0 auto;
+    min-width: 0;
+    padding: 0 10px;
+}
+
+.log-filter-checkbox {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: var(--chart-input-height, 36px);
+    font-size: 13px;
+    font-weight: 400;
+    color: var(--text-secondary);
+    cursor: pointer;
+    margin: 0;
+    white-space: nowrap;
+    user-select: none;
+}
+
+.log-filter-checkbox input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    margin: 0;
+    accent-color: var(--primary-color);
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
 .log-filter-refresh-btn {
     align-self: center;
     min-height: 36px;
@@ -7064,8 +7093,13 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
     color: #be185d;
 }
 
-.emby-event-badge--network {
+.emby-event-badge--network.emby-event-badge--network-wan {
     color: #c2410c;
+}
+
+.emby-event-badge--network.emby-event-badge--network-lan,
+.emby-event-badge--upload {
+    color: #0891b2;
 }
 
 .emby-event-badge--episode {
@@ -7074,10 +7108,6 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
 
 .emby-event-badge--year {
     color: var(--text-secondary);
-}
-
-.emby-event-badge--upload {
-    color: #0891b2;
 }
 
 .emby-event-badge--watch-meta {
@@ -10309,6 +10339,7 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
     .events-section .log-filter-row--selects .chart-control:has(#eventInstance),
     .events-section .log-filter-row--selects .chart-control:has(#embyEventInstance),
     .events-section .log-filter-row--selects .chart-control:has(#embyEventLogType),
+    .events-section .log-filter-row--selects .chart-control--checkbox,
     .syslogs-section .log-filter-row--selects .chart-control:has(#syslogInstance),
     .syslogs-section .log-filter-row--selects .chart-control:has(#embySyslogInstance),
     .syslogs-section .log-filter-row--selects .chart-control:has(#syslogLevel) {

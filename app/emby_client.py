@@ -837,6 +837,16 @@ class EmbyClient:
             return 0
 
     @staticmethod
+    def _normalize_playback_rate(value) -> float:
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            return 1.0
+        if rate <= 0 or rate > 16:
+            return 1.0
+        return rate
+
+    @staticmethod
     def extract_production_year(item: dict) -> Optional[int]:
         if not item:
             return None
@@ -1194,6 +1204,9 @@ class EmbyClient:
             'protocol': session.get('Protocol') or transcoding.get('SubProtocol') or '',
             'play_method': play_method,
             'is_paused': bool(play_state.get('IsPaused')),
+            'playback_rate': EmbyClient._normalize_playback_rate(
+                play_state.get('PlaybackRate'),
+            ),
             'position_ticks': position_ticks,
             'position_seconds': EmbyClient._ticks_to_seconds(position_ticks),
             'runtime_ticks': runtime_ticks,

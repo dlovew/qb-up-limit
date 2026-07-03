@@ -367,6 +367,42 @@ def _sync_device_user_switch_settlement(
         _settle_outgoing_device_user(name, old_sid, prev_uid, prev_prof)
 
 
+def _redirect_or_settle_browse_playback_start(
+    instance_name: str,
+    sid: str,
+    session: dict,
+    sessions: list,
+    analysis: Optional[dict],
+    *,
+    prev_mode: str = '',
+    now_mono: Optional[float] = None,
+) -> None:
+    """开播时结算真选片；连播切集空窗则把选片桶转回播放桶。"""
+    import emby_continuous_playback
+    import emby_playback_traffic
+
+    name = (instance_name or '').strip()
+    now_mono = time.monotonic() if now_mono is None else float(now_mono)
+    meta = _meta_from_session(session)
+    if not emby_continuous_playback.should_settle_browse_on_playback_start(
+        name, session, prev_mode, now_mono=now_mono,
+    ):
+        moved = emby_playback_traffic.transfer_browse_bytes_to_play_for_session(
+            name, session,
+        )
+        if moved > 0:
+            _clear_browse_pending_key(name, sid, meta)
+        return
+    if not _has_browse_bytes(name, sid, meta):
+        return
+    if meta.get('user_name'):
+        emby_playback_traffic.remember_browse_session_meta(name, sid, meta)
+    _clear_browse_pending_key(name, sid)
+    _settle_browse_session(
+        name, sid, meta, settle_reason='playback_started',
+    )
+
+
 def _sync_emby_browse_transitions(
     instance_name: str,
     sessions: list,
@@ -394,18 +430,12 @@ def _sync_emby_browse_transitions(
     for sid, session in by_sid.items():
         mode = str(session.get('session_mode') or '').strip()
         prev_mode = str(prev_modes.get(sid) or '').strip()
-        if (
-            prev_mode in ('viewing', 'connected')
-            and mode in ('playing', 'paused')
-            and _has_browse_bytes(name, sid, _meta_from_session(session))
-        ):
-            meta = _meta_from_session(session)
-            if meta.get('user_name'):
-                import emby_playback_traffic
-                emby_playback_traffic.remember_browse_session_meta(name, sid, meta)
-            _clear_browse_pending_key(name, sid)
-            _settle_browse_session(
-                name, sid, meta, settle_reason='playback_started',
+        if mode in ('playing', 'paused') and prev_mode in ('viewing', 'connected'):
+            if not _has_browse_bytes(name, sid, _meta_from_session(session)):
+                continue
+            _redirect_or_settle_browse_playback_start(
+                name, sid, session, sessions, analysis,
+                prev_mode=prev_mode, now_mono=now_mono,
             )
 
     with _lock:
@@ -877,9 +907,9 @@ def sync_browse_credit_from_analysis(
             mode = str(session.get('session_mode') or '').strip()
             if mode in ('playing', 'paused'):
                 gaps.pop(key, None)
-                meta = _resolve_meta(name, sid, sessions, analysis)
-                _settle_browse_session(
-                    name, sid, meta, settle_reason='playback_started',
+                _redirect_or_settle_browse_playback_start(
+                    name, sid, session, sessions, analysis,
+                    now_mono=now_mono,
                 )
                 continue
             if key not in gaps:
@@ -902,9 +932,9 @@ def sync_browse_credit_from_analysis(
             mode = str(session.get('session_mode') or '').strip()
             if mode in ('playing', 'paused'):
                 gaps.pop(key, None)
-                meta = _resolve_meta(name, sid, sessions, analysis)
-                _settle_browse_session(
-                    name, sid, meta, settle_reason='playback_started',
+                _redirect_or_settle_browse_playback_start(
+                    name, sid, session, sessions, analysis,
+                    now_mono=now_mono,
                 )
                 continue
             if now_mono - float(since) < BROWSE_CONN_END_GRACE_SECONDS:
@@ -1029,6 +1059,9 @@ def tick(
             name, sessions, analysis, now_mono=now_mono,
         )
 
+    import emby_continuous_playback
+    emby_continuous_playback.tick(name, sessions, now_mono=now_mono)
+
 
 def flush_instance(instance_name: str, *, settle_reason: str = 'instance_reset') -> None:
     name = (instance_name or '').strip()
@@ -1051,6 +1084,51 @@ def flush_instance(instance_name: str, *, settle_reason: str = 'instance_reset')
         _settle_browse_session(name, sid, meta, settle_reason=settle_reason)
 
 
+def purge_user(
+    instance_name: str,
+    user_name: str,
+    *,
+    user_ids: list = None,
+) -> None:
+    """Emby 用户删除后，清理选片结算器内该用户的跟踪状态。"""
+    from emby_lucky_verdict import persist_key_belongs_to_user
+
+    name = (instance_name or '').strip()
+    user_fold = str(user_name or '').strip().casefold()
+    if not name or not user_fold:
+        return
+    uid_set = {
+        str(uid or '').strip()
+        for uid in (user_ids or [])
+        if str(uid or '').strip()
+    }
+
+    def _meta_matches(meta: dict) -> bool:
+        if not isinstance(meta, dict):
+            return False
+        meta_name = str(meta.get('user_name') or '').strip().casefold()
+        meta_uid = str(meta.get('user_id') or '').strip()
+        return meta_name == user_fold or (meta_uid and meta_uid in uid_set)
+
+    with _lock:
+        meta_map = _browse_key_meta.get(name) or {}
+        for key, meta in list(meta_map.items()):
+            if _meta_matches(meta):
+                meta_map.pop(key, None)
+                (_active_browse_keys.get(name) or set()).discard(key)
+                (_browse_key_gap_since.get(name) or {}).pop(key, None)
+                (_orphan_bucket_since.get(name) or {}).pop(key, None)
+        for sid, uid in list((_last_session_users.get(name) or {}).items()):
+            if uid in uid_set:
+                (_last_session_users.get(name) or {}).pop(sid, None)
+        for sid, profile in list((_last_session_profiles.get(name) or {}).items()):
+            if _meta_matches(profile):
+                (_last_session_profiles.get(name) or {}).pop(sid, None)
+        for dev_key, profile in list((_last_device_profiles.get(name) or {}).items()):
+            if _meta_matches(profile):
+                (_last_device_profiles.get(name) or {}).pop(dev_key, None)
+
+
 def clear_instance(instance_name: str, *, flush: bool = True) -> None:
     name = (instance_name or '').strip()
     if not name:
@@ -1068,3 +1146,5 @@ def clear_instance(instance_name: str, *, flush: bool = True) -> None:
         _orphan_bucket_since.pop(name, None)
         _offline_since.pop(name, None)
         _next_segment_id.pop(name, None)
+    import emby_continuous_playback
+    emby_continuous_playback.clear_instance(name)

@@ -694,6 +694,7 @@ document.addEventListener('DOMContentLoaded', async function() {
     if (typeof updateEmbyHeaderStats === 'function') updateEmbyHeaderStats([]);
     ensureHourSelectOptions(document.getElementById('chartRangeStartHour'));
     ensureHourSelectOptions(document.getElementById('chartRangeEndHour'));
+    initPlaybackUserSearchableSelects();
     setupChartRangeStartFocus();
     setupChartLegendPanel();
     setupChartFullscreen();
@@ -759,7 +760,7 @@ function switchTab(tab) {
         loadEvents();
     } else if (tab === 'syslogs') {
         if (typeof loadSyslogsForCurrentType === 'function') {
-            loadSyslogsForCurrentType();
+            loadSyslogsForCurrentType(false, true);
         } else {
             loadSystemLogs();
         }
@@ -915,12 +916,12 @@ async function refreshAll(forceRender = false, silent = false) {
             await loadEmbyEvents(silent);
         }
         if (currentTab === 'syslogs' && typeof loadSyslogsForCurrentType === 'function') {
-            await loadSyslogsForCurrentType(silent);
+            await loadSyslogsForCurrentType(silent, true);
         }
     } else {
         if (currentTab === 'events') await loadEvents(silent);
         if (currentTab === 'syslogs' && typeof loadSyslogsForCurrentType === 'function') {
-            await loadSyslogsForCurrentType(silent);
+            await loadSyslogsForCurrentType(silent, true);
         }
     }
     if (currentTab === 'stats' && document.getElementById('chartInstance')?.value
@@ -1687,14 +1688,83 @@ function getChartPlaybackUserDisplayLabel(value) {
     return String(value ?? '').trim() || CHART_PLAYBACK_ALL_USERS_LABEL;
 }
 
-function buildChartPlaybackUserSelectOptions() {
+function applyChartPlaybackUserOptions(userNames, prev) {
     const select = document.getElementById('chartPlaybackUser');
     if (!select) return;
+    const chosen = prev != null
+        ? migrateChartPlaybackUserValue(prev)
+        : migrateChartPlaybackUserValue(select.value);
     select.innerHTML = '';
     const allUsersOpt = document.createElement('option');
     allUsersOpt.value = CHART_PLAYBACK_ALL_USERS_VALUE;
     allUsersOpt.textContent = CHART_PLAYBACK_ALL_USERS_LABEL;
     select.appendChild(allUsersOpt);
+    const seen = new Set();
+    (userNames || []).forEach((userName) => {
+        const name = String(userName || '').trim();
+        if (!name || seen.has(name)) return;
+        seen.add(name);
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        select.appendChild(opt);
+    });
+    if (chosen && isChartPlaybackUserQuery(chosen) && !seen.has(chosen)) {
+        const opt = document.createElement('option');
+        opt.value = chosen;
+        opt.textContent = chosen;
+        select.appendChild(opt);
+    }
+    if ([...select.options].some((o) => o.value === chosen)) {
+        select.value = chosen;
+        chartRestoredPlaybackUser = chosen;
+    } else {
+        select.value = CHART_PLAYBACK_ALL_USERS_VALUE;
+        chartRestoredPlaybackUser = CHART_PLAYBACK_ALL_USERS_VALUE;
+    }
+}
+
+function buildChartPlaybackUserSelectOptions() {
+    applyChartPlaybackUserOptions([], null);
+}
+
+function initPlaybackUserSearchableSelects() {
+    if (!window.SearchableSelect) return;
+    const sharedConfig = {
+        searchPlaceholder: '搜索用户…',
+        searchAriaLabel: '搜索用户',
+        minOptionsForSearch: 1,
+    };
+    const chartUser = document.getElementById('chartPlaybackUser');
+    if (chartUser && !chartUser.dataset.searchableReady) {
+        SearchableSelect.init(chartUser, {
+            ...sharedConfig,
+            pinnedValues: [CHART_PLAYBACK_ALL_USERS_VALUE],
+        });
+        chartUser.dataset.searchableReady = '1';
+    }
+    const eventUser = document.getElementById('embyEventPlaybackUser');
+    if (eventUser && !eventUser.dataset.searchableReady) {
+        SearchableSelect.init(eventUser, {
+            ...sharedConfig,
+            pinnedValues: [''],
+        });
+        eventUser.dataset.searchableReady = '1';
+    }
+}
+
+function syncChartPlaybackUserSearchable() {
+    const select = document.getElementById('chartPlaybackUser');
+    if (select && window.SearchableSelect) {
+        SearchableSelect.sync(select);
+    }
+}
+
+function syncEmbyEventPlaybackUserSearchable() {
+    const select = document.getElementById('embyEventPlaybackUser');
+    if (select && window.SearchableSelect) {
+        SearchableSelect.sync(select);
+    }
 }
 
 function getChartPlaybackUserTitleSuffix() {
@@ -2042,8 +2112,8 @@ function buildInstanceChartButtonHtml(service, instanceName, options = {}) {
 function buildInstanceEventLogButtonHtml(service, instanceName, options = {}) {
     const { showLabel = false } = options;
     const safeName = escapeHtml(instanceName || '');
-    const title = safeName ? `查看 ${safeName} 事件日志` : '查看事件日志';
-    const labelHtml = showLabel ? '<span class="rules-header-action-label">事件</span>' : '';
+    const title = safeName ? `查看 ${safeName} 事件记录` : '查看事件记录';
+    const labelHtml = showLabel ? '<span class="rules-header-action-label">记录</span>' : '';
     return `<button type="button" class="rules-header-action-btn" data-action="open-events" data-event-service="${service}" data-event-instance="${safeName}" title="${title}" aria-label="${title}">${buildEventLogNavIconSvg()}${labelHtml}</button>`;
 }
 
@@ -3350,6 +3420,10 @@ let _chartPlaybackUsersSeq = 0;
 let _chartUpdateSeq = 0;
 let _eventsLoadSeq = 0;
 let _chartPlaybackUsersReady = false;
+let _chartPlaybackUsersInstance = '';
+let _chartPlaybackUsersCache = [];
+let _chartPlaybackUsersCacheInstance = '';
+let _chartPlaybackUsersLoadingInstance = '';
 
 function getChartPlaybackUserSelection() {
     const select = document.getElementById('chartPlaybackUser');
@@ -3373,6 +3447,7 @@ async function ensureChartPlaybackUserReady() {
     if (getChartPlatform() !== 'emby') return;
     const instance = document.getElementById('chartInstance')?.value || '';
     if (!instance || isChartAllDevicesValue(instance)) return;
+    if (_chartPlaybackUsersReady && _chartPlaybackUsersInstance === instance) return;
     if (typeof refreshChartPlaybackUsers === 'function') {
         await refreshChartPlaybackUsers();
     }
@@ -3389,67 +3464,74 @@ function syncChartInstanceSelectForPlatform() {
     }
 }
 
-async function refreshChartPlaybackUsers() {
+async function refreshChartPlaybackUsers(options = {}) {
+    const force = !!(options && options.force);
     const select = document.getElementById('chartPlaybackUser');
     if (!select) return;
-    _chartPlaybackUsersReady = false;
     const platform = getChartPlatform();
+    const instance = (document.getElementById('chartInstance')?.value || '').trim();
+
+    if (!force && platform === 'emby' && instance && !isChartAllDevicesValue(instance)
+        && _chartPlaybackUsersReady
+        && _chartPlaybackUsersInstance === instance
+        && select.options.length > 1) {
+        return;
+    }
+    if (!force && _chartPlaybackUsersLoadingInstance === instance) {
+        return;
+    }
+
     const prev = resolveChartPlaybackUserPrev(select);
     const requestId = ++_chartPlaybackUsersSeq;
-    buildChartPlaybackUserSelectOptions();
+    _chartPlaybackUsersLoadingInstance = instance;
+    const hasCache = _chartPlaybackUsersCacheInstance === instance && _chartPlaybackUsersCache.length > 0;
 
-    const applyPrevSelection = () => {
-        if ([...select.options].some((o) => o.value === prev)) {
-            select.value = prev;
-            chartRestoredPlaybackUser = prev;
-        }
-    };
-
-    const finishPlaybackUsersRefresh = () => {
+    const finishPlaybackUsersRefresh = (userNames) => {
         if (requestId !== _chartPlaybackUsersSeq) return;
-        const instance = document.getElementById('chartInstance')?.value || '';
-        if (platform === 'emby' && instance && !isChartAllDevicesValue(instance)) {
-            applyPrevSelection();
-        }
+        applyChartPlaybackUserOptions(userNames, prev);
         _chartPlaybackUsersReady = true;
+        _chartPlaybackUsersInstance = instance;
+        if (platform === 'emby' && instance && !isChartAllDevicesValue(instance)) {
+            _chartPlaybackUsersCache = [...(userNames || [])];
+            _chartPlaybackUsersCacheInstance = instance;
+        } else {
+            _chartPlaybackUsersCache = [];
+            _chartPlaybackUsersCacheInstance = '';
+        }
+        if (_chartPlaybackUsersLoadingInstance === instance) {
+            _chartPlaybackUsersLoadingInstance = '';
+        }
+        syncChartPlaybackUserSearchable();
         syncChartPlaybackUserPeriodOptions();
     };
 
-    if (platform !== 'emby') {
-        finishPlaybackUsersRefresh();
+    if (platform !== 'emby' || !instance || isChartAllDevicesValue(instance)) {
+        finishPlaybackUsersRefresh([]);
         return;
     }
-    const instance = document.getElementById('chartInstance')?.value || '';
-    if (!instance || isChartAllDevicesValue(instance)) {
-        finishPlaybackUsersRefresh();
-        return;
+
+    if (hasCache && !force) {
+        applyChartPlaybackUserOptions(_chartPlaybackUsersCache, prev);
+        syncChartPlaybackUserSearchable();
+    } else if (!hasCache) {
+        applyChartPlaybackUserOptions([], prev);
+        syncChartPlaybackUserSearchable();
     }
+
     try {
         const res = await axios.get('/api/emby/playback-users', { params: { instance } });
         if (requestId !== _chartPlaybackUsersSeq) return;
-        if (res.data.success) {
-            const seen = new Set();
-            (res.data.data || []).forEach((userName) => {
-                const name = String(userName || '').trim();
-                if (!name || seen.has(name)) return;
-                seen.add(name);
-                const opt = document.createElement('option');
-                opt.value = name;
-                opt.textContent = name;
-                select.appendChild(opt);
-            });
-            if (prev && isChartPlaybackUserQuery(prev) && !seen.has(prev)) {
-                const opt = document.createElement('option');
-                opt.value = prev;
-                opt.textContent = prev;
-                select.appendChild(opt);
-            }
+        if (res.data?.success) {
+            const users = (res.data.data || [])
+                .map((userName) => String(userName || '').trim())
+                .filter(Boolean);
+            finishPlaybackUsersRefresh(users);
+            return;
         }
     } catch (e) {
-        /* 用户列表加载失败时仍可用全部用户汇总 */
-    } finally {
-        finishPlaybackUsersRefresh();
+        /* 用户列表加载失败时仍可用缓存或全部用户汇总 */
     }
+    finishPlaybackUsersRefresh(hasCache ? _chartPlaybackUsersCache : []);
 }
 
 function syncChartPlaybackUserPeriodOptions() {
@@ -3552,7 +3634,7 @@ function updateInstanceSelects(instances) {
         const syslogChanged = prevSyslog !== nextSyslog;
         syslogSel.value = nextSyslog;
         if (syslogChanged && currentTab === 'syslogs' && typeof loadSyslogsForCurrentType === 'function') {
-            loadSyslogsForCurrentType(true);
+            loadSyslogsForCurrentType(true, true);
         }
         if (syslogSel.value) {
             sessionStorage.setItem(SYSLOG_QB_INSTANCE_KEY, syslogSel.value);
@@ -7231,7 +7313,7 @@ async function loadEvents(silent = false) {
     } catch (e) {
         if (requestId !== _eventsLoadSeq) return;
         if (!silent) {
-            showToast('事件日志加载失败', 'error');
+            showToast('事件记录加载失败', 'error');
         }
     }
 }
@@ -7273,16 +7355,388 @@ function renderEvents(events) {
     }).join('');
 }
 
+const SYSLOG_INITIAL_LIMIT = 300;
+const SYSLOG_LOAD_MORE_STEP = 200;
+const SYSLOG_LOAD_DEBOUNCE_MS = 200;
+const SYSLOG_SCROLL_BOTTOM_THRESHOLD = 48;
+const SYSLOG_LEVEL_LABELS = {
+    DEBUG: '调试',
+    INFO: '信息',
+    WARNING: '警告',
+    ERROR: '错误',
+    CRITICAL: '严重',
+};
+const SYSLOG_LOGGER_LABELS = {
+    __main__: '主程序',
+    main: '主程序',
+    scheduler: '调度器',
+    speed_limiter: '限速器',
+    qb_monitor: 'qB 监控',
+    config_manager: '配置管理',
+    traffic_db: '流量数据库',
+    emby_scheduler: 'Emby 调度器',
+    emby_traffic_db: 'Emby 流量数据库',
+    emby_client: 'Emby 客户端',
+    emby_playback_traffic: 'Emby 播放流量',
+    emby_docker: 'Emby Docker',
+    emby_lucky: 'Lucky 客户端',
+    emby_user_sync: 'Emby 用户同步',
+    emby_continuous_playback: 'Emby 连播',
+    emby_traffic_filter: 'Emby 流量过滤',
+    playback_record_store: '播放记录',
+    playback_upload_repair: '播放上行修复',
+    browse_upload_settler: '选片结算',
+    secrets_store: '密钥存储',
+    user_prefs_store: '用户偏好',
+    'web.server': 'Web 服务',
+    'web.auth': 'Web 认证',
+    urllib3: '网络库',
+    'urllib3.connectionpool': '网络连接池',
+    werkzeug: 'Web 框架',
+};
+const SYSLOG_LOGGER_PREFIX_LABELS = [
+    ['urllib3', '网络库'],
+    ['werkzeug', 'Web 框架'],
+];
+const SYSLOG_MESSAGE_REPLACEMENTS = [
+    [/reason=account_superseded/g, '原因=账号被取代'],
+    [/reason=user_switch/g, '原因=用户切换'],
+    [/reason=playback_started/g, '原因=开始播放'],
+    [/reason=disconnect/g, '原因=断开连接'],
+    [/reason=browse_conn_end/g, '原因=选片连接结束'],
+    [/reason=orphan_bucket/g, '原因=孤儿桶'],
+    [/reason=timeout_offline/g, '原因=超时离线'],
+    [/reason=instance_reset/g, '原因=实例重置'],
+    [/reason=emby_confirmed_stop/g, '原因=Emby 确认停止'],
+    [/reason=grace_expired/g, '原因=宽限期结束'],
+    [/reason=item_change/g, '原因=切换条目'],
+    [/\[Playback:/g, '[播放:'],
+    [/\[Browse:/g, '[选片:'],
+    [/\brid=/g, '记录='],
+    [/\bsid=/g, '会话='],
+    [/\breason=/g, '原因='],
+    [/\bbytes=/g, '字节='],
+    [/\bkeys=/g, '键='],
+    [/\bgrace=/g, '宽限='],
+    [/\buser=/g, '用户='],
+    [/\bkey=/g, '键='],
+    [/\bSIGTERM\b/g, '终止信号'],
+    [/\bSIGINT\b/g, '中断信号'],
+    [/\bSIGHUP\b/g, '挂起信号'],
+    [/incremental_vacuum/g, '增量整理'],
+    [/保留 WAN/g, '保留外网'],
+    [/\bWAN\b/g, '外网'],
+    [/KB\/s/g, 'KB/秒'],
+    [/config\.yaml/g, '配置文件'],
+    [/Waitress/g, 'Waitress'],
+    [/Flask/g, 'Flask'],
+    [/Asia\/Shanghai/g, '亚洲/上海'],
+    [/SSL验证/g, 'SSL 验证'],
+    [/无需认证 qB=/g, '无需认证 qB 版本='],
+    [/登录响应非 Ok\./g, '登录响应非常规'],
+    [/API \/([^\s]+) 错误/g, '接口 /$1 错误'],
+    [/exc_info/g, '异常堆栈'],
+];
+const _syslogListState = new Map();
+let _syslogLoadTimer = null;
+
+function _localizeSyslogLevel(level, log) {
+    if (log && log.level_display) return log.level_display;
+    return SYSLOG_LEVEL_LABELS[level] || level || '';
+}
+
+function _localizeNetworkErrors(text) {
+    let msg = String(text || '');
+    if (!msg) return '';
+    msg = msg.replace(
+        /HTTPSConnectionPool\(host='([^']+)', port=(\d+)\)/g,
+        'HTTPS 连接池（主机 $1，端口 $2）',
+    );
+    msg = msg.replace(
+        /HTTPConnectionPool\(host='([^']+)', port=(\d+)\)/g,
+        'HTTP 连接池（主机 $1，端口 $2）',
+    );
+    msg = msg.replace(
+        /Read timed out\. \(read timeout=([\d.]+)\)/g,
+        '读取超时（读超时 $1 秒）',
+    );
+    msg = msg.replace(
+        /Connect timed out\.? \(connect timeout=([\d.]+)\)/g,
+        '连接超时（连接超时 $1 秒）',
+    );
+    const replacements = [
+        ['ReadTimeoutError', '读取超时'],
+        ['ConnectTimeoutError', '连接超时'],
+        ['NewConnectionError', '新建连接失败'],
+        ['ConnectionError', '连接错误'],
+        ['Read timed out', '读取超时'],
+        ['Connect timed out', '连接超时'],
+        ['Connection refused', '连接被拒绝'],
+        ['Connection reset by peer', '连接被对方重置'],
+        ['Name or service not known', '无法解析主机名'],
+        ['Max retries exceeded', '超过最大重试次数'],
+        ['after connection broken by', '连接中断于'],
+        ['Caused by', '原因'],
+    ];
+    replacements.forEach(([src, dst]) => {
+        msg = msg.split(src).join(dst);
+    });
+    msg = msg.replace(/读取超时\("/g, '读取超时（');
+    msg = msg.replace(/连接超时\("/g, '连接超时（');
+    msg = msg.replace(/"\)/g, '）');
+    msg = msg.replace(/\btotal=/g, '总次数=');
+    msg = msg.replace(/\bconnect=/g, '连接=');
+    msg = msg.replace(/\bread=/g, '读取=');
+    msg = msg.replace(/\bredirect=/g, '重定向=');
+    msg = msg.replace(/\bstatus=/g, '状态=');
+    msg = msg.replace(/\bNone\b/g, '无');
+    return msg;
+}
+
+function _localizeUrllib3Message(message) {
+    const text = String(message || '');
+    if (!text) return '';
+    const retryMatch = text.match(
+        /^Retrying \(Retry\((.+?)\)\) after connection broken by '(.+)': (.+)$/
+    );
+    if (retryMatch) {
+        const [, retryCfg, err, path] = retryMatch;
+        return `正在重试（${_localizeNetworkErrors(retryCfg)}），连接中断：${_localizeNetworkErrors(err)}，请求：${path}`;
+    }
+    if (/ConnectionPool|TimeoutError|retries exceeded/.test(text)) {
+        return _localizeNetworkErrors(text);
+    }
+    return text;
+}
+
+function _localizeSyslogLogger(logger, log) {
+    if (log && log.logger_display) return log.logger_display;
+    const name = String(logger || '').trim();
+    if (!name) return '';
+    if (SYSLOG_LOGGER_LABELS[name]) return SYSLOG_LOGGER_LABELS[name];
+    for (const [prefix, label] of SYSLOG_LOGGER_PREFIX_LABELS) {
+        if (name === prefix || name.startsWith(`${prefix}.`)) {
+            return label;
+        }
+    }
+    return name;
+}
+
+function _localizeSyslogMessage(message, log) {
+    if (log && log.message_display) return log.message_display;
+    let text = _localizeUrllib3Message(message);
+    if (!text) return '';
+    SYSLOG_MESSAGE_REPLACEMENTS.forEach(([pattern, replacement]) => {
+        text = text.replace(pattern, replacement);
+    });
+    return text;
+}
+
+function _getSyslogListState(containerId) {
+    if (!_syslogListState.has(containerId)) {
+        _syslogListState.set(containerId, {
+            logs: [],
+            hasMore: false,
+            loading: false,
+            loadingMore: false,
+            atBottom: false,
+            service: '',
+            instance: '',
+            level: '',
+            requestKey: '',
+        });
+    }
+    return _syslogListState.get(containerId);
+}
+
+function _resetSyslogListState(containerId) {
+    _syslogListState.delete(containerId);
+}
+
+function _syslogRequestKey(service, instance, level) {
+    return `${service || ''}\u0000${instance || ''}\u0000${level || ''}`;
+}
+
+function _buildSyslogItemHtml(log) {
+    const levelClass = {
+        DEBUG: 'syslog-debug',
+        INFO: 'syslog-info',
+        WARNING: 'syslog-warning',
+        ERROR: 'syslog-error',
+        CRITICAL: 'syslog-error',
+    };
+    const levelLabel = _localizeSyslogLevel(log.level, log);
+    const loggerLabel = _localizeSyslogLogger(log.logger, log);
+    const messageLabel = _localizeSyslogMessage(log.message, log);
+    return `
+        <div class="syslog-item ${levelClass[log.level] || ''}">
+            <div class="syslog-meta">
+                <span class="syslog-time">${escapeHtml(log.time)}</span>
+                <span class="syslog-level">${escapeHtml(levelLabel)}</span>
+                <span class="syslog-logger">${escapeHtml(loggerLabel)}</span>
+            </div>
+            <div class="syslog-message">${escapeHtml(messageLabel)}</div>
+        </div>`;
+}
+
+function _renderSyslogListFooter(state) {
+    if (state.loadingMore) {
+        return '<div class="syslog-load-more-tip">正在加载更早日志…</div>';
+    }
+    if (state.hasMore) {
+        return '<div class="syslog-load-more-tip">滚到底部加载 200 条更早日志</div>';
+    }
+    if (state.logs.length > SYSLOG_INITIAL_LIMIT) {
+        return '<div class="syslog-load-more-tip syslog-load-more-tip--end">没有更多了</div>';
+    }
+    return '';
+}
+
+function _paintSyslogList(containerId, state) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    if (!state.logs.length) {
+        container.innerHTML = '<div class="empty-tip">暂无系统日志</div>';
+        return;
+    }
+    const itemsHtml = state.logs.map((log) => _buildSyslogItemHtml(log)).join('');
+    container.innerHTML = itemsHtml + _renderSyslogListFooter(state);
+}
+
+function renderSystemLogs(logs, containerId = 'syslogsList', options = {}) {
+    const state = _getSyslogListState(containerId);
+    if (options.rerender) {
+        if (typeof options.hasMore === 'boolean') {
+            state.hasMore = options.hasMore;
+        }
+        _paintSyslogList(containerId, state);
+        return;
+    }
+    const nextLogs = Array.isArray(logs) ? logs : [];
+    if (!options.append) {
+        state.logs = [...nextLogs].reverse();
+    } else if (nextLogs.length) {
+        state.logs = [...state.logs, ...nextLogs];
+    }
+    if (typeof options.hasMore === 'boolean') {
+        state.hasMore = options.hasMore;
+    }
+    _paintSyslogList(containerId, state);
+}
+
+function _scrollSyslogListToTop(container) {
+    if (!container) return;
+    requestAnimationFrame(() => {
+        container.scrollTop = 0;
+    });
+}
+
+function _bindSyslogScrollLoad(containerId) {
+    const container = document.getElementById(containerId);
+    if (!container || container.dataset.syslogScrollBound === '1') return;
+    container.dataset.syslogScrollBound = '1';
+    container.addEventListener('scroll', () => {
+        _onSyslogListScroll(containerId);
+    }, { passive: true });
+}
+
+function _isSyslogNearBottom(container) {
+    if (!container) return false;
+    const remaining = container.scrollHeight - container.scrollTop - container.clientHeight;
+    return remaining <= SYSLOG_SCROLL_BOTTOM_THRESHOLD;
+}
+
+function _onSyslogListScroll(containerId) {
+    const container = document.getElementById(containerId);
+    const state = _getSyslogListState(containerId);
+    if (!container || state.loading || state.loadingMore) return;
+    const nearBottom = _isSyslogNearBottom(container);
+    if (nearBottom && !state.atBottom && state.hasMore) {
+        loadMoreSystemLogs(containerId);
+    }
+    state.atBottom = nearBottom;
+}
+
+async function loadMoreSystemLogs(containerId) {
+    const state = _getSyslogListState(containerId);
+    if (!state.hasMore || state.loading || state.loadingMore || !state.logs.length) return;
+    const oldest = state.logs[state.logs.length - 1];
+    state.loadingMore = true;
+    state.atBottom = true;
+    renderSystemLogs(null, containerId, { rerender: true, hasMore: state.hasMore });
+    try {
+        const params = new URLSearchParams({
+            limit: String(SYSLOG_LOAD_MORE_STEP),
+            service: state.service,
+            before_time: oldest.time,
+            before_logger: oldest.logger,
+            before_message: oldest.message,
+        });
+        if (state.instance) params.set('instance', state.instance);
+        if (state.level) params.set('level', state.level);
+        const res = await axios.get(`/api/system-logs?${params}`);
+        if (res.data.success) {
+            const older = res.data.data || [];
+            state.hasMore = !!res.data.has_more;
+            if (older.length) {
+                renderSystemLogs(older, containerId, {
+                    append: true,
+                    hasMore: state.hasMore,
+                });
+            } else {
+                state.hasMore = false;
+                renderSystemLogs(null, containerId, { rerender: true, hasMore: false });
+            }
+        }
+    } catch (e) {
+        showToast('加载更早日志失败', 'error');
+    } finally {
+        state.loadingMore = false;
+        const listEl = document.getElementById(containerId);
+        if (listEl && state.logs.length) {
+            renderSystemLogs(null, containerId, { rerender: true, hasMore: state.hasMore });
+        }
+    }
+}
+
+function _cancelSyslogLoadDebounce() {
+    if (_syslogLoadTimer) {
+        clearTimeout(_syslogLoadTimer);
+        _syslogLoadTimer = null;
+    }
+}
+
+function _scheduleSyslogLoad(task, immediate = false) {
+    if (immediate) {
+        _cancelSyslogLoadDebounce();
+        return task();
+    }
+    _cancelSyslogLoadDebounce();
+    return new Promise((resolve) => {
+        _syslogLoadTimer = setTimeout(async () => {
+            _syslogLoadTimer = null;
+            await task();
+            resolve();
+        }, SYSLOG_LOAD_DEBOUNCE_MS);
+    });
+}
+
 async function loadSystemLogs(silent = false) {
-    await fetchServiceSystemLogs('qb', 'syslogInstance', 'syslogsList', silent);
+    return _scheduleSyslogLoad(
+        () => fetchServiceSystemLogs('qb', 'syslogInstance', 'syslogsList', silent),
+    );
 }
 
 async function loadAppSystemLogs(silent = false) {
-    await fetchServiceSystemLogs('system', null, 'appSyslogsList', silent);
+    return _scheduleSyslogLoad(
+        () => fetchServiceSystemLogs('system', null, 'appSyslogsList', silent),
+    );
 }
 
 async function loadEmbySystemLogs(silent = false) {
-    await fetchServiceSystemLogs('emby', 'embySyslogInstance', 'embySyslogsList', silent);
+    return _scheduleSyslogLoad(
+        () => fetchServiceSystemLogs('emby', 'embySyslogInstance', 'embySyslogsList', silent),
+    );
 }
 
 async function fetchServiceSystemLogs(service, instanceSelectId, containerId, silent = false) {
@@ -7290,36 +7744,63 @@ async function fetchServiceSystemLogs(service, instanceSelectId, containerId, si
         ? (document.getElementById(instanceSelectId)?.value || '')
         : '';
     if (instanceSelectId && !instance) {
+        _resetSyslogListState(containerId);
         const container = document.getElementById(containerId);
         if (container) container.innerHTML = '<div class="empty-tip">暂无设备</div>';
         return;
     }
     const level = document.getElementById('syslogLevel')?.value || '';
+    _resetSyslogListState(containerId);
+    _bindSyslogScrollLoad(containerId);
+    const state = _getSyslogListState(containerId);
+    const requestKey = _syslogRequestKey(service, instance, level);
+    state.loading = true;
+    state.service = service;
+    state.instance = instance;
+    state.level = level;
+    state.requestKey = requestKey;
     try {
-        const params = new URLSearchParams({ limit: '1000', service });
+        const params = new URLSearchParams({
+            limit: String(SYSLOG_INITIAL_LIMIT),
+            service,
+        });
         if (instance) params.set('instance', instance);
         if (level) params.set('level', level);
         const res = await axios.get(`/api/system-logs?${params}`);
-        if (res.data.success) renderSystemLogs(res.data.data, containerId);
+        if (state.requestKey !== requestKey) return;
+        if (res.data.success) {
+            state.hasMore = !!res.data.has_more;
+            renderSystemLogs(res.data.data || [], containerId, { hasMore: state.hasMore });
+            _scrollSyslogListToTop(document.getElementById(containerId));
+        }
     } catch (e) {
+        if (state.requestKey !== requestKey) return;
         if (!silent) {
             showToast('系统日志加载失败', 'error');
+        }
+    } finally {
+        if (state.requestKey === requestKey) {
+            state.loading = false;
         }
     }
 }
 
-async function loadSyslogsForCurrentType(silent = false) {
-    if (typeof persistChartControls === 'function') persistChartControls();
-    const syslogType = typeof getSyslogTypeFilter === 'function'
-        ? getSyslogTypeFilter()
-        : (document.getElementById('syslogDeviceType')?.value || 'system');
-    if (syslogType === 'emby') {
-        return loadEmbySystemLogs(silent);
-    }
-    if (syslogType === 'qb') {
-        return loadSystemLogs(silent);
-    }
-    return loadAppSystemLogs(silent);
+async function loadSyslogsForCurrentType(silent = false, immediate = false) {
+    return _scheduleSyslogLoad(async () => {
+        if (typeof persistChartControls === 'function') persistChartControls();
+        const syslogType = typeof getSyslogTypeFilter === 'function'
+            ? getSyslogTypeFilter()
+            : (document.getElementById('syslogDeviceType')?.value || 'system');
+        if (syslogType === 'emby') {
+            await fetchServiceSystemLogs('emby', 'embySyslogInstance', 'embySyslogsList', silent);
+            return;
+        }
+        if (syslogType === 'qb') {
+            await fetchServiceSystemLogs('qb', 'syslogInstance', 'syslogsList', silent);
+            return;
+        }
+        await fetchServiceSystemLogs('system', null, 'appSyslogsList', silent);
+    }, immediate);
 }
 
 function onSyslogTypeChange() {
@@ -7338,31 +7819,6 @@ function onSyslogTypeChange() {
 
 function onSyslogLevelChange() {
     loadSyslogsForCurrentType();
-}
-
-function renderSystemLogs(logs, containerId = 'syslogsList') {
-    const container = document.getElementById(containerId);
-    if (!container) return;
-    if (!logs.length) {
-        container.innerHTML = '<div class="empty-tip">暂无系统日志</div>';
-        return;
-    }
-    const levelClass = {
-        DEBUG: 'syslog-debug',
-        INFO: 'syslog-info',
-        WARNING: 'syslog-warning',
-        ERROR: 'syslog-error',
-        CRITICAL: 'syslog-error',
-    };
-    container.innerHTML = logs.map(log => `
-        <div class="syslog-item ${levelClass[log.level] || ''}">
-            <div class="syslog-meta">
-                <span class="syslog-time">${escapeHtml(log.time)}</span>
-                <span class="syslog-level">${escapeHtml(log.level)}</span>
-                <span class="syslog-logger">${escapeHtml(log.logger)}</span>
-            </div>
-            <div class="syslog-message">${escapeHtml(log.message)}</div>
-        </div>`).join('');
 }
 
 function cycleResetAnchor(cycle, fallback = 1) {

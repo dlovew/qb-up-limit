@@ -1510,7 +1510,7 @@ async function refreshEventsLog() {
 async function refreshSystemLogs() {
     await runFilterHeadRefresh('syslogs', async () => {
         if (typeof loadSyslogsForCurrentType === 'function') {
-            await loadSyslogsForCurrentType();
+            await loadSyslogsForCurrentType(false, true);
         }
     });
 }
@@ -1563,16 +1563,8 @@ function loadUnifiedTabContent(tab, platform) {
         if (typeof syncSyslogFilterUi === 'function') {
             syncSyslogFilterUi();
         }
-        const load = () => {
-            if (typeof loadSyslogsForCurrentType === 'function') {
-                loadSyslogsForCurrentType();
-            }
-        };
-        const syslogType = getSyslogTypeFilter();
-        if (syslogType === 'emby' && typeof ensureEmbyDataLoaded === 'function') {
-            ensureEmbyDataLoaded(true).then(load);
-        } else {
-            load();
+        if (typeof loadSyslogsForCurrentType === 'function') {
+            loadSyslogsForCurrentType(false, true);
         }
         return;
     }

@@ -15,6 +15,7 @@ import secrets_store
 import traffic_db
 import emby_playback_traffic
 import emby_traffic_tick_audit
+import emby_user_sync
 from emby_client import EmbyClient
 from emby_docker import DockerStatsClient
 from emby_lucky import (
@@ -1015,6 +1016,21 @@ class EmbyInstanceWorker:
             conn_deltas = dict(getattr(self, '_lucky_conn_deltas_last', None) or {})
             conn_rows = list(getattr(self, '_lucky_conn_rows_last', None) or [])
             alloc_deltas = conn_deltas if conn_deltas else lucky_ip_deltas
+            if credit_browse:
+                try:
+                    import emby_continuous_playback
+                    emby_continuous_playback.tick(
+                        self.name,
+                        list(self._wan_client_sessions_last or []),
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f'[Emby:{self.name}] 连播上下文更新失败: {e}',
+                    )
+            # 边界顺序保障：playback_record_store.tick_from_sessions（上文，
+            # 会在换集/结案时先把累加器结转进旧分段）必须在下方 Lucky 分摊
+            # 之前执行，这样换集 tick 的新增量只会计入新分段，旧分段已完整
+            # 结转，边界误差被限制在至多一个 tick 内。
             if sessions is not None and live_delta_up > 0 and alloc_deltas:
                 try:
                     if conn_deltas and conn_rows:
@@ -1025,6 +1041,7 @@ class EmbyInstanceWorker:
                             conn_rows,
                             tick_seconds=allocation_tick_seconds,
                             credit_browse=credit_browse,
+                            ip_deltas=lucky_ip_deltas,
                         )
                     else:
                         part = emby_playback_traffic.accumulate_wan_upload_by_ip(
@@ -1401,6 +1418,13 @@ class EmbyInstanceWorker:
                 logger.debug(
                     f'[Emby:{self.name}] 会话流量持久化失败: {e}',
                 )
+            if api_online:
+                try:
+                    emby_user_sync.sync_deleted_users(self.name, client)
+                except Exception as e:
+                    logger.debug(
+                        f'[Emby:{self.name}] 用户同步失败: {e}',
+                    )
         if not sessions:
             try:
                 emby_playback_traffic.clear_instance_live_upload_state(self.name)
@@ -1467,6 +1491,20 @@ class EmbyMonitor:
         except (TypeError, ValueError):
             mode_switch_grace = 2
         self.mode_switch_grace_seconds = max(0, min(10, mode_switch_grace))
+        try:
+            episode_switch_gap = int(
+                self.global_cfg.get('emby_episode_switch_gap_seconds', 3),
+            )
+        except (TypeError, ValueError):
+            episode_switch_gap = 3
+        self.episode_switch_gap_seconds = max(1, min(10, episode_switch_gap))
+        try:
+            import emby_continuous_playback
+            emby_continuous_playback.set_episode_switch_gap_max_seconds(
+                self.episode_switch_gap_seconds,
+            )
+        except Exception as e:
+            logger.debug(f'连播切集空窗期配置同步失败: {e}')
         self.m3_wan_pool_scale = config_manager.clamp_emby_m3_wan_pool_scale(
             self.global_cfg.get('emby_m3_wan_pool_scale', 1.0),
         )

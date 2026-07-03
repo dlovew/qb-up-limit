@@ -4,6 +4,8 @@ import signal
 import logging
 from logging.handlers import RotatingFileHandler
 
+from log_reader import resolve_app_log_path
+
 _LOG_LEVEL_NAME = os.environ.get('APP_LOG_LEVEL', 'INFO').upper()
 _LOG_LEVEL = getattr(logging, _LOG_LEVEL_NAME, logging.INFO)
 
@@ -15,7 +17,7 @@ logging.basicConfig(
 )
 
 file_handler = RotatingFileHandler(
-    '/data/app.log', encoding='utf-8',
+    str(resolve_app_log_path(for_write=True)), encoding='utf-8',
     maxBytes=10 * 1024 * 1024, backupCount=3
 )
 file_handler.setLevel(_LOG_LEVEL)

@@ -274,6 +274,34 @@ class EmbyClient:
         """兼容旧调用：等同 API 测试"""
         return self.test_api()
 
+    def get_users(self) -> List[dict]:
+        """获取服务端用户列表（需有效 API Key，建议管理员密钥）。"""
+        resp = self._request('GET', '/Users')
+        if resp is None or resp.status_code >= 400:
+            return []
+        try:
+            data = resp.json()
+        except ValueError:
+            return []
+        if not isinstance(data, list):
+            return []
+        users = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get('Name') or '').strip()
+            user_id = str(item.get('Id') or '').strip()
+            if not name:
+                continue
+            users.append({
+                'id': user_id,
+                'name': name,
+                'is_hidden': bool((item.get('Policy') or {}).get('IsHidden')),
+                'is_disabled': bool((item.get('Policy') or {}).get('IsDisabled')),
+            })
+        users.sort(key=lambda row: row['name'].casefold())
+        return users
+
     def get_sessions(self) -> List[dict]:
         resp = self._request('GET', '/Sessions')
         if resp is None or resp.status_code >= 400:
@@ -483,6 +511,9 @@ class EmbyClient:
         if bool(prepared.get('transcoding')):
             return True
         if session.get('TranscodingInfo'):
+            return True
+        # Emby Web 长暂停空窗：NowPlayingItem 仍在而 IsPlaying/IsPaused 均为 false。
+        if str(prepared.get('session_mode') or '').strip() == 'paused':
             return True
         return False
 

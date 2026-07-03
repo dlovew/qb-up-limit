@@ -295,13 +295,23 @@ class LuckyClient:
 
 
 def _lucky_traffic_delta(current: int, last: int, *, first_seen: bool) -> int:
-    """Lucky 返回 IP 级累计值：与已持久化基线求差即为本周期增量。"""
+    """Lucky 返回 IP 级累计值：与已持久化基线求差即为本周期增量。
+
+    首见（无持久化基线）时只登记基线、本周期增量取零，避免把连接建立前
+    早已存在的历史累计值一次性计入当前 tick，造成 GB 级流量尖峰漂移。
+    """
     current = max(0, int(current or 0))
     last = max(0, int(last or 0))
     if first_seen:
-        return current
+        return 0
     if last > 0 and current < last:
-        return current
+        # 计数器回退：Lucky 的 IP/连接累计 TrafficOut 会因连接进出聚合统计、
+        # 抖动等出现小幅下降。累计量下降并不代表有新上行；此前误判为“计数器
+        # 重置”并把整段累计(current)当作本 tick 增量重复计入，会造成 GB 级虚增
+        # （单 tick 把数百 MB 累计重复计给正在播放的会话）。故本 tick 记 0，
+        # 并以 current 作为新基线，后续真实增量照常累计。真实重置（归零后重新
+        # 计数）会走下方 last<=0 分支正确处理。
+        return 0
     if last <= 0:
         return current
     return max(0, current - last)

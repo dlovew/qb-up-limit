@@ -155,22 +155,20 @@ def repair_inflated_playback_upload_estimates(
             if upload <= 0:
                 stats['skipped'] += 1
                 continue
+            # 单段流量不设上限：反复重看/跳转重缓冲会真实叠加，允许超出码率×时长的理论值。
+            # 这里不再把偏高值削回 ceiling，仅在明显异常时告警便于排查归属漂移。
             ceiling = estimate_upload_ceiling_bytes(rec)
-            if not ceiling or upload <= ceiling * _INFLATED_UPLOAD_WARN_RATIO:
-                stats['skipped'] += 1
-                continue
-            old = upload
-            rec['estimated_upload_bytes'] = ceiling
-            rec.pop('live_upload_checkpoint_bytes', None)
-            stats['repaired'] += 1
-            changed = True
-            logger.info(
-                '[Playback:%s] 纠偏 inflated upload rid=%s %s -> %s (ceiling)',
-                inst,
-                rec.get('id'),
-                old,
-                ceiling,
-            )
+            if ceiling and upload > ceiling * _INFLATED_UPLOAD_WARN_RATIO:
+                logger.warning(
+                    '[Playback:%s] 外网播放上传明显偏高 rid=%s upload=%s ceiling=%s '
+                    'ratio=%.1fx（保留真实值，不设上限）',
+                    inst,
+                    rec.get('id'),
+                    upload,
+                    ceiling,
+                    upload / max(1, ceiling),
+                )
+            stats['skipped'] += 1
         if changed:
             playback_record_store._save_store(store)
 

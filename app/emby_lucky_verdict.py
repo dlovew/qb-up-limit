@@ -153,6 +153,28 @@ def user_from_persist_key(pkey: str) -> str:
     return ''
 
 
+def persist_key_belongs_to_user(
+    persist_key: str,
+    user_fold: str,
+    user_ids: set,
+) -> bool:
+    text = str(persist_key or '').strip()
+    fold = str(user_fold or '').strip().casefold()
+    if not text or not fold:
+        return False
+    if text.startswith('browse:'):
+        parts = text.split(':')
+        if len(parts) >= 3:
+            return str(parts[1] or '').strip() in (user_ids or set())
+        return False
+    bound = user_from_persist_key(text)
+    if bound and bound == fold:
+        return True
+    if text.startswith(f'{fold}|'):
+        return True
+    return False
+
+
 def _session_has_viewing_item(session: Optional[dict]) -> bool:
     if not session or not isinstance(session, dict):
         return False
@@ -167,6 +189,7 @@ def should_browse_credit_billing(
     traffic_role: str,
     *,
     credit_browse: bool,
+    instance_name: str = '',
 ) -> bool:
     """Lucky 选片流量计入开启时，判定连接是否应按选片入账。"""
     if not credit_browse or traffic_role == 'control':
@@ -177,6 +200,12 @@ def should_browse_credit_billing(
     if _session_has_viewing_item(session):
         return True
     if mode == 'connected' and traffic_role == 'browse':
+        if instance_name:
+            import emby_continuous_playback
+            if emby_continuous_playback.should_suppress_connected_browse_credit(
+                instance_name, session,
+            ):
+                return False
         return True
     return False
 
@@ -324,6 +353,22 @@ def _time_match_score(
             )
         if best_delta < 0 or recency_delta < best_delta:
             best_delta = recency_delta
+
+    if (
+        mode == 'playing'
+        and max(0, int(delta_out or 0)) >= _STREAM_TICK_BYTES
+        and activity_age is not None
+        and activity_age <= _ACTIVITY_FRESHNESS_WINDOW
+    ):
+        active_bonus = max(
+            0.0,
+            100.0 - min(activity_age, _ACTIVITY_FRESHNESS_WINDOW),
+        )
+        if active_bonus > 0:
+            score += active_bonus
+            details.append(f'播放活跃 +{int(active_bonus):.0f}')
+            if best_delta < 0 or activity_age < best_delta:
+                best_delta = activity_age
 
     if best_delta > _ACCEPT_TIME_MATCH_SECONDS and score <= 0:
         return max(0.0, 200.0 - best_delta), best_delta, details
@@ -935,6 +980,44 @@ def _assign_sessions_to_drafts(
         assigned[addr] = best_session
 
 
+def _wave_align_in_details(score_details: Optional[List[str]]) -> bool:
+    needles = (
+        '波次整体对齐',
+        '伴生保活跟随波次',
+        '波次内浏览跟随',
+        '波次时刻对齐',
+        '波次内建连',
+    )
+    for item in score_details or []:
+        text = str(item or '')
+        if any(needle in text for needle in needles):
+            return True
+    return False
+
+
+def _effective_timing_delta(
+    emby_mode: str,
+    time_delta: float,
+    activity_age_seconds: Optional[float],
+) -> float:
+    """播放中优先用会话近期活动刻画「当前仍有效」的时差。"""
+    if emby_mode != 'playing':
+        if time_delta >= 0:
+            return time_delta
+        if activity_age_seconds is not None and activity_age_seconds >= 0:
+            return activity_age_seconds
+        return time_delta
+    age = activity_age_seconds
+    if time_delta < 0:
+        return age if age is not None and age >= 0 else time_delta
+    if age is not None and age >= 0:
+        # 选片后沿用旧连接开播：建连早于 playback_started_at，但播放仍活跃
+        if time_delta > 120 and age <= _ACTIVITY_FRESHNESS_WINDOW:
+            return age
+        return min(time_delta, age)
+    return time_delta
+
+
 def _confidence_for(
     conn_role: str,
     emby_mode: str,
@@ -947,36 +1030,73 @@ def _confidence_for(
     activity_age_seconds: Optional[float] = None,
     traffic_role: str = '',
     delta_out: int = 0,
+    billing_state: str = '',
+    score_details: Optional[List[str]] = None,
+    sticky_matched: bool = False,
 ) -> str:
     if not has_emby or emby_mode == 'orphan':
         return 'low'
     if primary_conflict or ambiguous:
         return 'low'
+
+    delta = max(0, int(delta_out or 0))
+    wave_aligned = _wave_align_in_details(score_details)
+    timing = _effective_timing_delta(
+        emby_mode, time_delta, activity_age_seconds,
+    )
+
     browse_like = emby_mode in ('viewing', 'connected', 'paused')
     ongoing_browse = (
         str(traffic_role or conn_role or '').strip() == 'browse'
-        and max(0, int(delta_out or 0)) > 0
+        and delta > 0
     )
     if conn_role in ('control', 'browse') and browse_like:
         age = activity_age_seconds
-        if age is None and time_delta >= 0:
-            age = time_delta
+        if age is None and timing >= 0:
+            age = timing
         if age is not None and age >= 0:
             if ongoing_browse or age <= _BROWSE_CONFIDENCE_HIGH_AGE:
                 return 'high'
             if age <= _BROWSE_CONFIDENCE_MEDIUM_AGE:
                 return 'medium'
             return 'low'
+
     if conn_role == 'stream_primary' and emby_mode == 'playing':
-        if match_score >= 400 and time_delta >= 0 and time_delta <= 30:
+        if billing_state == 'credited' and delta > 0:
             return 'high'
-        if time_delta <= 120:
+        if sticky_matched or wave_aligned:
+            return 'high' if timing >= 0 and timing <= 120 else 'medium'
+        if match_score >= 350 and timing >= 0 and timing <= 120:
+            return 'high'
+        if delta >= _STREAM_TICK_BYTES:
+            return 'high'
+        if match_score >= 250:
+            return 'high' if timing >= 0 and timing <= 180 else 'medium'
+        if timing >= 0 and timing <= 30:
+            return 'high'
+        if timing >= 0 and timing <= 120:
             return 'medium'
         return 'low'
+
+    if conn_role == 'stream_pending' and emby_mode == 'playing':
+        if delta >= _STREAM_TICK_BYTES and match_score >= 200:
+            return 'high'
+        return 'medium'
+
+    if conn_role in ('control', 'browse') and emby_mode == 'playing':
+        if sticky_matched or wave_aligned:
+            return 'high' if timing >= 0 and timing <= 120 else 'medium'
+        if delta > 0 or (
+            activity_age_seconds is not None
+            and activity_age_seconds <= _ACTIVITY_FRESHNESS_WINDOW
+        ):
+            return 'medium'
+        return 'low'
+
     if conn_role in ('control', 'browse') and emby_mode in (
         'viewing', 'connected', 'paused',
     ):
-        if time_delta >= 0 and time_delta <= 60:
+        if timing >= 0 and timing <= 60:
             return 'high'
         return 'medium'
     if conn_role == 'stream_secondary':
@@ -1057,6 +1177,7 @@ def _analyze_ip_group(
     upload_bucket: Dict[str, int],
     browse_upload_bucket: Optional[Dict[str, int]] = None,
     credit_browse: bool = False,
+    instance_name: str = '',
 ) -> Tuple[str, List[dict]]:
     satellites = _satellite_addrs(conns)
     wave_map = _cluster_conn_waves(conns)
@@ -1150,6 +1271,7 @@ def _analyze_ip_group(
             emby_mode,
             traffic_role,
             credit_browse=credit_browse,
+            instance_name=instance_name,
         ):
             conn_role = 'control' if traffic_role == 'control' else 'browse'
             billing_state = 'browse_credited'
@@ -1203,6 +1325,12 @@ def _analyze_ip_group(
         time_delta = float(draft.get('time_delta', -1))
         best_session = draft.get('best_session') or {}
         activity_age = _session_activity_age_seconds(best_session)
+        score_details = list(draft.get('score_details') or [])
+        session_match_key = str(draft.get('session_match_key') or '').strip()
+        sticky_matched = bool(
+            session_match_key
+            and str(match_hints.get(addr) or '').strip() == session_match_key
+        )
         confidence = _confidence_for(
             conn_role,
             emby_mode,
@@ -1214,8 +1342,10 @@ def _analyze_ip_group(
             activity_age_seconds=activity_age,
             traffic_role=str(draft.get('traffic_role') or ''),
             delta_out=int(draft.get('delta_out') or 0),
+            billing_state=billing_state,
+            score_details=score_details,
+            sticky_matched=sticky_matched,
         )
-        score_details = list(draft.get('score_details') or [])
         reasons = _build_reasons(
             conn_role,
             emby_mode,
@@ -1244,7 +1374,6 @@ def _analyze_ip_group(
             emby_label = _EMBY_MODE_LABELS['orphan']
 
         display_persist = billing_persist_key or bound_key
-        session_match_key = str(draft.get('session_match_key') or '').strip()
         rows.append({
             'remote_addr': addr,
             'ip': ip,
@@ -1321,6 +1450,7 @@ def analyze_lucky_connections(
     upload_bucket: Optional[Dict[str, int]] = None,
     browse_upload_bucket: Optional[Dict[str, int]] = None,
     credit_browse: bool = False,
+    instance_name: str = '',
 ) -> dict:
     """Lucky 全部外网连接裁决（按 IP 分组）。"""
     deltas = {
@@ -1369,6 +1499,7 @@ def analyze_lucky_connections(
             upload_bucket=upload_bucket,
             browse_upload_bucket=browse_bucket,
             credit_browse=credit_browse,
+            instance_name=instance_name,
         )
         groups.append({
             'ip': ip,
@@ -1401,10 +1532,18 @@ def analyze_lucky_connections(
 
 
 def binding_targets_from_analysis(analysis: dict) -> Dict[str, str]:
-    """从裁决结果提取应写入绑定表的 RemoteAddr→persist_key。"""
+    """从裁决结果提取应写入绑定表的 RemoteAddr→persist_key。
+
+    低置信 / 模糊（多会话评分接近）的行不写粘性绑定，避免用一次不确定的
+    猜测把连接长期钉死在错误会话上，导致后续增量持续漂移。
+    """
     result: Dict[str, str] = {}
     for group in (analysis or {}).get('groups') or []:
         for row in group.get('rows') or []:
+            if row.get('ambiguous'):
+                continue
+            if str(row.get('confidence') or '') == 'low':
+                continue
             billing = str(row.get('billing_state') or '')
             addr = str(row.get('remote_addr') or '').strip()
             if billing == 'credited':

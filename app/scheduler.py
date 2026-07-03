@@ -15,7 +15,7 @@ from qb_monitor import QBittorrentClient
 logger = logging.getLogger(__name__)
 
 _COORDINATOR_INTERVAL = 60
-_COLLECT_LOG_INTERVAL = 300  # 采集摘要日志间隔（秒）
+_COLLECT_LOG_INTERVAL = 600  # 采集摘要日志间隔（秒，10 分钟）
 
 
 def clamp_interval(seconds: int) -> int:

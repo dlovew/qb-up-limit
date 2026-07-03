@@ -41,6 +41,7 @@ DEFAULT_GLOBAL = {
     'emby_burst_seek_window_seconds': 6,
     'emby_burst_priority_mode': 'seek_first',
     'emby_mode_switch_grace_seconds': 2,
+    'emby_episode_switch_gap_seconds': 3,
     'emby_m3_wan_pool_scale': 1.0,
     'emby_browse_upload_min_mb': 1.0,
 }
@@ -702,6 +703,16 @@ def _validate_global(global_cfg: dict, strict: bool = False,
     else:
         mode_switch_grace = max(0, min(10, mode_switch_grace))
     result['emby_mode_switch_grace_seconds'] = mode_switch_grace
+    episode_switch_gap = _safe_int(
+        result.get('emby_episode_switch_gap_seconds'),
+        DEFAULT_GLOBAL['emby_episode_switch_gap_seconds'],
+    )
+    if strict:
+        if episode_switch_gap < 1 or episode_switch_gap > 10:
+            raise ValueError('连播切集空窗期须在 1～10 秒之间')
+    else:
+        episode_switch_gap = max(1, min(10, episode_switch_gap))
+    result['emby_episode_switch_gap_seconds'] = episode_switch_gap
     result['emby_m3_wan_pool_scale'] = clamp_emby_m3_wan_pool_scale(
         result.get('emby_m3_wan_pool_scale', DEFAULT_GLOBAL['emby_m3_wan_pool_scale']),
         strict=strict,

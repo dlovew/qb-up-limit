@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import traffic_db
 import emby_traffic_db
+import emby_user_sync
 import playback_record_store
 import config_manager
 from scheduler import clamp_interval
@@ -25,6 +26,7 @@ from qb_monitor import (
 from web.auth import init_auth, login_user, logout_user, verify_credentials, get_session_username
 
 from emby_client import EmbyClient, is_playback_browse_server_log_message, parse_emby_log_line, DEFAULT_SESSION_MESSAGE_TIMEOUT_MS
+from syslog_localize import localize_system_log_entry
 
 logger = logging.getLogger(__name__)
 
@@ -257,9 +259,20 @@ def api_system_logs():
         level = request.args.get('level')
         instance = (request.args.get('instance') or '').strip() or None
         service = (request.args.get('service') or '').strip().lower() or None
-        limit = min(int(request.args.get('limit', 1000)), 1000)
-        logs = get_system_logs(limit=limit, level=level, instance=instance, service=service)
-        return jsonify({'success': True, 'data': logs})
+        limit = int(request.args.get('limit', 300))
+        before_time = request.args.get('before_time')
+        before_logger = request.args.get('before_logger')
+        before_message = request.args.get('before_message')
+        logs, has_more = get_system_logs(
+            limit=limit,
+            level=level,
+            instance=instance,
+            service=service,
+            before_time=before_time,
+            before_logger=before_logger,
+            before_message=before_message,
+        )
+        return jsonify({'success': True, 'data': logs, 'has_more': has_more})
     except Exception as e:
         logger.error(f"API /system-logs 错误: {e}", exc_info=True)
         return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
@@ -951,11 +964,16 @@ def _emby_debug_traffic_config_payload(global_cfg: dict = None) -> dict:
     browse_min_mb = config_manager.clamp_emby_browse_upload_min_mb(
         cfg.get('emby_browse_upload_min_mb', 1.0),
     )
+    try:
+        episode_switch_gap = int(cfg.get('emby_episode_switch_gap_seconds', 3))
+    except (TypeError, ValueError):
+        episode_switch_gap = 3
     return {
         'new_session_window_seconds': max(1, min(30, new_window)),
         'seek_window_seconds': max(1, min(30, seek_window)),
         'priority_mode': mode,
         'mode_switch_grace_seconds': max(0, min(10, mode_switch_grace)),
+        'episode_switch_gap_seconds': max(1, min(10, episode_switch_gap)),
         'm3_wan_pool_scale': m3_scale,
         'browse_upload_min_mb': browse_min_mb,
         'browse_upload_min_bytes': config_manager.emby_browse_upload_min_bytes(
@@ -1079,6 +1097,10 @@ def api_emby_debug_traffic_config_update():
             merged_global['emby_m3_wan_pool_scale'] = data.get('m3_wan_pool_scale')
         if 'browse_upload_min_mb' in data:
             merged_global['emby_browse_upload_min_mb'] = data.get('browse_upload_min_mb')
+        if 'episode_switch_gap_seconds' in data:
+            merged_global['emby_episode_switch_gap_seconds'] = data.get(
+                'episode_switch_gap_seconds',
+            )
 
         validated, full_config = config_manager.update_global(
             merged_global, base_config=monitor.config,
@@ -1280,8 +1302,12 @@ def api_emby_playback_users():
             return jsonify({'success': False, 'error': '缺少 instance 参数'}), 400
         if not config_manager.get_emby_instance(instance_name, emby_monitor.config):
             return jsonify({'success': False, 'error': '设备不存在'}), 404
-        users = emby_traffic_db.list_playback_upload_users(instance_name)
-        return jsonify({'success': True, 'data': users})
+        client, err_resp = _get_emby_client(instance_name)
+        if err_resp:
+            return err_resp
+        emby_user_sync.sync_deleted_users(instance_name, client, force=True)
+        users, source = emby_user_sync.list_instance_user_names(client, instance_name)
+        return jsonify({'success': True, 'data': users, 'source': source})
     except Exception as e:
         logger.error(f'API /emby/playback-users 错误: {e}', exc_info=True)
         return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
@@ -1474,14 +1500,14 @@ def api_emby_system_logs():
                     continue
                 if level_filter and parsed.get('level') != level_filter:
                     continue
-                lines.append({
+                lines.append(localize_system_log_entry({
                     'log_name': name,
                     'time': parsed.get('time') or '',
                     'level': parsed.get('level') or 'INFO',
                     'logger': parsed.get('logger') or '',
                     'message': parsed.get('message') or parsed.get('raw') or '',
                     'line': parsed.get('raw') or line,
-                })
+                }))
         return jsonify({'success': True, 'data': lines[:limit]})
     except Exception as e:
         logger.error(f'API /emby/system-logs 错误: {e}', exc_info=True)

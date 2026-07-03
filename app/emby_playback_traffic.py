@@ -109,6 +109,10 @@ def collect_online_persist_keys(
             prepared = EmbyClient.normalize_session(raw)
         if is_wan_playback_session(prepared):
             keys.update(_keys_for_session(prepared, credit_browse=credit_browse))
+        elif is_wan_remote_session(prepared) and EmbyClient.is_current_playback_session(
+            prepared,
+        ):
+            keys.update(_keys_for_session(prepared, credit_browse=credit_browse))
         elif credit_browse and is_wan_remote_session(prepared):
             keys.update(_keys_for_session(prepared, credit_browse=True))
     try:
@@ -558,6 +562,41 @@ def _touch_accumulator_key(name: str, key: str, now_mono: float) -> None:
     touched[key] = float(now_mono)
 
 
+def _protected_accumulator_keys(name: str) -> Set[str]:
+    """open/待确认播放段：累加器不得因暂停无增量而过期清理。"""
+    keys: Set[str] = set()
+    if not name:
+        return keys
+    try:
+        import playback_record_store
+        for sid in playback_record_store.protected_playback_session_ids(name):
+            if sid:
+                keys.add(f'sid:{sid}')
+        for key in playback_record_store.open_playing_upload_checkpoints(name):
+            if key:
+                keys.add(key)
+    except Exception:
+        pass
+    return keys
+
+
+def touch_playback_upload_keys(
+    instance_name: str,
+    subject: dict,
+    *,
+    now_mono: float = None,
+) -> None:
+    """刷新 open 播放段累加器 touch，避免长暂停被 stale 清理。"""
+    name = (instance_name or '').strip()
+    if not name or not subject:
+        return
+    now = time.monotonic() if now_mono is None else float(now_mono)
+    with _lock:
+        for key in _accumulator_key_candidates(subject):
+            if key:
+                _touch_accumulator_key(name, key, now)
+
+
 def _cleanup_stale_accumulators(name: str, now_mono: float,
                                 stale_seconds: int = _ACCUMULATOR_STALE_SECONDS) -> None:
     bucket = _upload_accumulators.get(name)
@@ -572,10 +611,14 @@ def _cleanup_stale_accumulators(name: str, now_mono: float,
         _accumulator_touch_mono[name] = touched
 
     stale_after = max(60, int(stale_seconds or _ACCUMULATOR_STALE_SECONDS))
+    protected = _protected_accumulator_keys(name)
     runtime_sessions = (_allocator_runtime.get(name) or {}).get('sessions') or {}
     tick_bucket = _live_tick_uploads.get(name)
     removed_keys: List[str] = []
     for key in list(bucket.keys()):
+        if key in protected:
+            touched[key] = now_mono
+            continue
         seen_at = float(touched.get(key) or 0.0)
         if seen_at <= 0.0:
             touched[key] = now_mono
@@ -1145,6 +1188,61 @@ def peek_browse_upload_bytes_for_sid(
     return total
 
 
+def transfer_browse_bytes_to_play_for_session(
+    instance_name: str,
+    session: dict,
+) -> int:
+    """连播切集误入选片桶的字节转回播放累加器（不生成选片记录）。"""
+    name = (instance_name or '').strip()
+    if not name or not isinstance(session, dict):
+        return 0
+    from emby_lucky_verdict import (
+        browse_persist_key_variants_for_session,
+        persist_key_for_session,
+        sid_from_browse_persist_key,
+    )
+    play_key = persist_key_for_session(session)
+    if not play_key:
+        return 0
+    sid = str(
+        session.get('emby_session_id')
+        or session.get('session_id')
+        or session.get('id')
+        or '',
+    ).strip()
+    bucket = peek_browse_upload_bucket(name)
+    keys_to_take: List[str] = []
+    seen: Set[str] = set()
+    for key in browse_persist_key_variants_for_session(session):
+        if key and key in bucket and int(bucket.get(key) or 0) > 0:
+            keys_to_take.append(key)
+            seen.add(key)
+    if sid:
+        for key, amount in bucket.items():
+            if key in seen or int(amount or 0) <= 0:
+                continue
+            if sid_from_browse_persist_key(key) == sid:
+                keys_to_take.append(key)
+                seen.add(key)
+    moved = 0
+    for key in keys_to_take:
+        part = take_accumulated_browse_upload_by_key(name, key)
+        if part is not None and int(part) > 0:
+            moved += int(part)
+    if moved <= 0:
+        return 0
+    now_mono = time.monotonic()
+    with _lock:
+        play_bucket = _upload_accumulators.setdefault(name, {})
+        play_bucket[play_key] = play_bucket.get(play_key, 0) + moved
+        _touch_accumulator_key(name, play_key, now_mono)
+    logger.info(
+        f'[Emby:{name}] 连播切集选片桶转播放 sid={sid or "?"} '
+        f'bytes={moved} play_key={play_key}',
+    )
+    return moved
+
+
 def remember_browse_session_meta(instance_name: str, sid: str, meta: dict) -> None:
     name = (instance_name or '').strip()
     sid = str(sid or '').strip()
@@ -1322,8 +1420,15 @@ def accumulate_wan_upload_by_conn(
     *,
     tick_seconds: float = None,
     credit_browse: bool = False,
+    ip_deltas: Dict[str, int] = None,
 ) -> dict:
-    """Lucky：按 ConnsStatistics 连接级增量归属到外网会话。"""
+    """Lucky：按 ConnsStatistics 连接级增量归属到外网会话。
+
+    ip_deltas 为同一 tick 的 IP 级 TrafficOut 增量（权威总量，含在两次轮询
+    之间开启又关闭、未出现在 ConnsStatistics 中的短连接）。连接级增量之和
+    通常 <= IP 级总量，二者之差即"丢失的短连接流量"，在此按 IP 补给该 IP
+    下唯一入账（正在推流）的会话，避免长视频某几段被系统性少计。
+    """
     name = (instance_name or '').strip()
     deltas = {
         str(addr).strip(): max(0, int(v or 0))
@@ -1347,6 +1452,8 @@ def accumulate_wan_upload_by_conn(
     conn_shares: Dict[str, int] = {}
     browse_shares: Dict[str, int] = {}
     unassigned_by_ip: Dict[str, int] = {}
+    conn_delta_by_ip: Dict[str, int] = {}
+    credited_by_ip: Dict[str, Dict[str, int]] = {}
 
     with _lock:
         runtime = _lucky_runtime(name)
@@ -1377,6 +1484,7 @@ def accumulate_wan_upload_by_conn(
             upload_bucket=upload_bucket,
             browse_upload_bucket=browse_bucket,
             credit_browse=credit_browse,
+            instance_name=name,
         )
         for addr, pkey in binding_targets_from_analysis(analysis).items():
             bindings[addr] = pkey
@@ -1390,14 +1498,24 @@ def accumulate_wan_upload_by_conn(
             billing = str(row.get('billing_state') or '')
             pkey = str(row.get('billing_persist_key') or '').strip()
             browse_key = str(row.get('browse_persist_key') or '').strip()
+            row_ip = str(row.get('ip') or parse_endpoint_ip(addr) or '').strip()
+            if row_ip:
+                conn_delta_by_ip[row_ip] = conn_delta_by_ip.get(row_ip, 0) + delta
             if billing == 'credited' and pkey:
                 conn_shares[pkey] = conn_shares.get(pkey, 0) + delta
+                if row_ip:
+                    bucket = credited_by_ip.setdefault(row_ip, {})
+                    bucket[pkey] = bucket.get(pkey, 0) + delta
             elif billing == 'browse_credited' and browse_key:
                 browse_sid = _browse_sid_from_key(browse_key)
                 stream_session = _session_for_sid(sessions, browse_sid)
-                if stream_session and EmbyClient.is_active_playback_stream(
-                    stream_session,
-                ):
+                route_play = False
+                if stream_session:
+                    import emby_continuous_playback
+                    route_play = emby_continuous_playback.should_route_browse_delta_to_play(
+                        name, stream_session,
+                    )
+                if route_play:
                     play_key = _persist_key_for_session(stream_session)
                     if play_key:
                         conn_shares[play_key] = (
@@ -1440,12 +1558,33 @@ def accumulate_wan_upload_by_conn(
         for key, amount in extra.items():
             conn_shares[key] = conn_shares.get(key, 0) + amount
 
+    # IP 级总量对账：把"IP 权威增量 - 连接级增量之和"的短缺补给该 IP 下
+    # 唯一入账会话（丢失的短连接流量归位）。多会话或无入账会话时不猜测，
+    # 交由 remainder 处理，避免误计。补给量以 IP 总量为界，不会双计。
+    for ip, ip_total in (ip_deltas or {}).items():
+        ip = str(ip or '').strip()
+        ip_total = max(0, int(ip_total or 0))
+        if not ip or ip_total <= 0:
+            continue
+        conn_sum = max(0, int(conn_delta_by_ip.get(ip, 0)))
+        shortfall = ip_total - conn_sum
+        if shortfall <= 0:
+            continue
+        credited_pkeys = credited_by_ip.get(ip) or {}
+        if len(credited_pkeys) != 1:
+            remainder_total += shortfall
+            continue
+        primary_pkey = next(iter(credited_pkeys))
+        conn_shares[primary_pkey] = conn_shares.get(primary_pkey, 0) + shortfall
+
     assigned_total = _apply_conn_deltas_to_accumulator(name, conn_shares)
     assigned_total += _apply_conn_deltas_to_browse_accumulator(name, browse_shares)
     _remember_browse_meta_from_analysis(name, analysis)
     remainder_total += max(0, sum(deltas.values()) - assigned_total)
 
-    total = sum(deltas.values())
+    # IP 级对账后归属量可能超过连接级增量之和（补入了短连接流量），
+    # 因此总量取二者与余量之和的较大者，避免 remainder 出现负值。
+    total = max(sum(deltas.values()), assigned_total + remainder_total)
     merged['total_upload_bytes'] = total
     merged['wan_upload_bytes'] = assigned_total
     merged['assigned_bytes'] = assigned_total
@@ -1492,6 +1631,7 @@ def get_lucky_conn_debug_snapshot(
         upload_bucket=upload_bucket,
         browse_upload_bucket=browse_bucket,
         credit_browse=credit_browse,
+        instance_name=name,
     )
     return analysis
 
@@ -1544,7 +1684,8 @@ def annotate_live_sessions_upload(
                 if upload_1s is None:
                     upload_1s = 0
 
-            session['estimated_upload_bytes_live'] = upload_live
+            upload_floor = max(0, int(session.get('estimated_upload_bytes_floor') or 0))
+            session['estimated_upload_bytes_live'] = max(upload_live, upload_floor)
             session['estimated_upload_bytes_1s_live'] = upload_1s
         result.append(session)
     return result
@@ -1599,6 +1740,54 @@ def clear_instance_live_upload_state(instance_name: str) -> None:
         _conn_info_cache.pop(name, None)
         # 选片会话 meta 不在此清空：断开宽限期内结算器仍需用户名。
     # 选片结算器跟踪状态不在此清空：无会话时正是断开/离开选片后的入库宽限期。
+
+
+def purge_user_state(
+    instance_name: str,
+    user_name: str,
+    *,
+    user_ids: list = None,
+) -> None:
+    """Emby 用户删除后，清理内存中的分摊/选片累计与连接归属。"""
+    from emby_lucky_verdict import persist_key_belongs_to_user
+
+    name = (instance_name or '').strip()
+    user_fold = str(user_name or '').strip().casefold()
+    if not name or not user_fold:
+        return
+    uid_set = {
+        str(uid or '').strip()
+        for uid in (user_ids or [])
+        if str(uid or '').strip()
+    }
+    with _lock:
+        for bucket in (_upload_accumulators.get(name) or {}).copy().items():
+            key = str(bucket[0] or '').strip()
+            if persist_key_belongs_to_user(key, user_fold, uid_set):
+                (_upload_accumulators.get(name) or {}).pop(key, None)
+        browse_bucket = _upload_accumulators.get(name) or {}
+        for key in list(browse_bucket.keys()):
+            if persist_key_belongs_to_user(str(key or '').strip(), user_fold, uid_set):
+                browse_bucket.pop(key, None)
+        tick_bucket = _live_tick_uploads.get(name) or {}
+        for key in list(tick_bucket.keys()):
+            if persist_key_belongs_to_user(str(key or '').strip(), user_fold, uid_set):
+                tick_bucket.pop(key, None)
+        bindings = _conn_bindings.get(name) or {}
+        for addr, pkey in list(bindings.items()):
+            if persist_key_belongs_to_user(str(pkey or '').strip(), user_fold, uid_set):
+                bindings.pop(addr, None)
+        hints = _conn_match_hints.get(name) or {}
+        for addr, pkey in list(hints.items()):
+            if persist_key_belongs_to_user(str(pkey or '').strip(), user_fold, uid_set):
+                hints.pop(addr, None)
+        for store in (_browse_session_meta,):
+            inst_map = store.get(name) or {}
+            for sid, meta in list(inst_map.items()):
+                meta_name = str((meta or {}).get('user_name') or '').strip().casefold()
+                meta_uid = str((meta or {}).get('user_id') or '').strip()
+                if meta_name == user_fold or (meta_uid and meta_uid in uid_set):
+                    inst_map.pop(sid, None)
 
 
 def purge_stopped_wan_live_upload_state(instance_name: str, sessions: list) -> None:

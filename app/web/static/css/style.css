@@ -2429,12 +2429,16 @@ html:not(.emby-feature-enabled) .chart-control--device-type {
     background: #dbeafe;
     font-variant-numeric: tabular-nums;
     text-align: center;
-    cursor: help;
+    cursor: pointer;
 }
 
 .emby-debug-lucky-score-badge:focus-visible {
     outline: 2px solid #93c5fd;
     outline-offset: 1px;
+}
+
+.emby-debug-lucky-score-tip {
+    cursor: pointer;
 }
 
 .emby-debug-lucky-sticky-badge {
@@ -5366,6 +5370,11 @@ button {
     box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
 }
 
+.chart-filter-row--selects .chart-control:has(.searchable-select):focus-within:not(:has(.searchable-select.is-open)) {
+    border-color: rgba(148, 163, 184, 0.35);
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
 .chart-filter-row--selects .chart-control:has(select:disabled) {
     opacity: 0.72;
     background: #f8fafc;
@@ -5435,6 +5444,182 @@ button {
     color: #94a3b8;
     cursor: not-allowed;
     background-color: transparent;
+}
+
+/* 可搜索用户下拉：尺寸与同行原生 select（width: auto）一致 */
+.searchable-select {
+    position: relative;
+    flex: 0 1 auto;
+    min-width: 0;
+    width: auto;
+}
+
+.searchable-select__native {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    border: 0;
+    clip: rect(0 0 0 0);
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+.searchable-select__trigger {
+    display: flex;
+    align-items: center;
+    width: auto;
+    min-width: 0;
+    max-width: 100%;
+    min-height: 36px;
+    height: 36px;
+    padding: 0 30px 0 10px;
+    border: none;
+    border-radius: 0;
+    background-color: transparent;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2364748b' d='M2.5 4.5 6 8l3.5-3.5'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    background-size: 12px;
+    box-shadow: none;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-primary);
+    cursor: pointer;
+    text-align: left;
+}
+
+.searchable-select__trigger:focus {
+    outline: none;
+}
+
+.searchable-select__trigger-label {
+    white-space: nowrap;
+}
+
+.searchable-select__measure {
+    position: absolute;
+    left: -9999px;
+    top: -9999px;
+    visibility: hidden;
+    white-space: nowrap;
+    pointer-events: none;
+}
+
+.chart-filter-row--selects .chart-control--user-select .searchable-select,
+.log-filter-row--selects .chart-control--user-select .searchable-select,
+.chart-filter-row--selects .chart-control--user-select .searchable-select__trigger,
+.log-filter-row--selects .chart-control--user-select .searchable-select__trigger {
+    width: 160px;
+    min-width: 160px;
+    max-width: 160px;
+}
+
+.chart-filter-row--selects .chart-control--user-select .searchable-select__trigger-label,
+.log-filter-row--selects .chart-control--user-select .searchable-select__trigger-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.searchable-select.is-disabled .searchable-select__trigger {
+    color: #94a3b8;
+    cursor: not-allowed;
+}
+
+.searchable-select__panel {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    z-index: 120;
+    display: flex;
+    flex-direction: column;
+    max-height: min(320px, 50vh);
+    background: #fff;
+    border: 1px solid rgba(148, 163, 184, 0.45);
+    border-radius: 10px;
+    box-shadow: 0 10px 28px rgba(15, 23, 42, 0.14);
+    overflow: hidden;
+}
+
+.searchable-select__panel.is-floating {
+    position: fixed;
+    top: auto;
+    left: auto;
+    right: auto;
+}
+
+.searchable-select__search-wrap {
+    flex-shrink: 0;
+    padding: 8px;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+    background: #f8fafc;
+}
+
+.searchable-select__search {
+    width: 100%;
+    min-width: 0;
+    height: 32px;
+    padding: 0 10px;
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    border-radius: 8px;
+    font-size: 13px;
+    color: var(--text-primary);
+    background: #fff;
+}
+
+.searchable-select__search:focus {
+    outline: none;
+    border-color: rgba(37, 99, 235, 0.45);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+.searchable-select__list {
+    margin: 0;
+    padding: 4px 0;
+    list-style: none;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+.searchable-select__option {
+    padding: 8px 12px;
+    font-size: 13px;
+    line-height: 1.35;
+    color: var(--text-primary);
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.searchable-select__option:hover,
+.searchable-select__option.is-active {
+    background: rgba(37, 99, 235, 0.08);
+}
+
+.searchable-select__option.is-selected {
+    color: #1d4ed8;
+    font-weight: 600;
+}
+
+.searchable-select__empty {
+    padding: 12px;
+    font-size: 12px;
+    color: #94a3b8;
+    text-align: center;
+}
+
+.chart-filter-row--selects .chart-control:has(.searchable-select.is-open) {
+    border-color: rgba(37, 99, 235, 0.45);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+.log-filter-row--selects .chart-control:has(.searchable-select.is-open) {
+    border-color: rgba(37, 99, 235, 0.45);
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
 }
 
 .chart-filter-row--range {
@@ -6643,7 +6828,7 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
     padding: 0 0 10px;
     font-size: 12px;
     line-height: 1.45;
-    color: var(--text-secondary);
+    color: #9ca3af;
     white-space: nowrap;
 }
 
@@ -7120,6 +7305,80 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
     color: #7c3aed;
 }
 
+.emby-seek-badge-wrap {
+    cursor: help;
+}
+
+.emby-seek-badge-wrap .emby-session-badge {
+    cursor: help;
+}
+
+.emby-seek-popover-entry + .emby-seek-popover-entry {
+    margin-top: 2px;
+}
+
+.emby-seek-badge-popover {
+    min-width: 240px;
+}
+
+.emby-transcode-badge-wrap .emby-session-badge {
+    cursor: pointer;
+}
+
+.emby-transcode-badge-popover {
+    min-width: 200px;
+}
+
+/* 卡片内弹层改用 fixed 定位（由 JS 计算坐标），脱离 .events-list 等 overflow
+   滚动祖先，避免被卡片/列表裁切；同时限制最大高度并内置滚动。 */
+.emby-seek-badge-popover,
+.emby-transcode-badge-popover {
+    position: fixed;
+    left: 0;
+    top: 0;
+    right: auto;
+    margin: 0;
+    max-width: min(340px, calc(100vw - 24px));
+    max-height: min(300px, 60vh);
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+    transform: none !important;
+    z-index: 2000;
+}
+
+.emby-seek-badge-popover::before,
+.emby-transcode-badge-popover::before {
+    display: none;
+}
+
+.emby-seek-badge-wrap.is-open .emby-seek-badge-popover,
+.emby-transcode-badge-wrap.is-open .emby-transcode-badge-popover {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    z-index: 2000;
+}
+
+.emby-transcode-badge-popover .badge-popover-meta {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.emby-transcode-popover-key {
+    color: #94a3b8;
+    flex-shrink: 0;
+}
+
+.emby-transcode-popover-val {
+    color: #334155;
+    font-weight: 600;
+    text-align: right;
+    word-break: break-word;
+}
+
 .emby-event-badge--watch-duration {
     color: var(--warning-color);
 }
@@ -7137,10 +7396,7 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
     color: #0891b2;
 }
 
-.emby-event-badge--episode {
-    color: var(--text-primary);
-}
-
+.emby-event-badge--episode,
 .emby-event-badge--year {
     color: var(--text-secondary);
 }
@@ -7239,36 +7495,32 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
 
 .emby-log-card--playing {
     --log-accent: #059669;
-    --emby-log-play-progress: 0%;
+    --log-card-bg: color-mix(in srgb, #059669 9%, #fff);
+    --log-progress-track: color-mix(in srgb, #059669 12%, #fff);
+    --log-progress-fill: color-mix(in srgb, #059669 28%, #fff);
+    --emby-log-play-progress-start: 0%;
+    --emby-log-play-progress-end: 0%;
+    background: var(--log-card-bg);
 }
 
 .emby-log-card--stopped {
     --log-accent: #64748b;
-    --emby-log-play-progress: 0%;
-}
-
-.emby-log-card--playing,
-.emby-log-card--stopped {
-    --emby-log-fade-start: var(--emby-log-play-progress);
-    --emby-log-fade-end: min(100%, calc(var(--emby-log-play-progress) + 10%));
-    background: linear-gradient(
-        90deg,
-        color-mix(in srgb, var(--log-accent) 13%, #fff) 0%,
-        color-mix(in srgb, var(--log-accent) 13%, #fff) var(--emby-log-fade-start),
-        #fff var(--emby-log-fade-end)
-    );
-}
-
-.emby-log-card--stopped.emby-log-card--progress-full {
-    background: linear-gradient(
-        90deg,
-        color-mix(in srgb, var(--log-accent) 13%, #fff) 0%,
-        color-mix(in srgb, var(--log-accent) 8%, #fff) 100%
-    );
+    --log-card-bg: color-mix(in srgb, #64748b 9%, #fff);
+    --log-progress-track: color-mix(in srgb, #64748b 12%, #fff);
+    --log-progress-fill: color-mix(in srgb, #64748b 24%, #fff);
+    --emby-log-play-progress-start: 0%;
+    --emby-log-play-progress-end: 0%;
+    background: var(--log-card-bg);
 }
 
 .emby-log-card--paused {
     --log-accent: #f59e0b;
+    --log-card-bg: color-mix(in srgb, #f59e0b 9%, #fff);
+    --log-progress-track: color-mix(in srgb, #f59e0b 12%, #fff);
+    --log-progress-fill: color-mix(in srgb, #f59e0b 28%, #fff);
+    --emby-log-play-progress-start: 0%;
+    --emby-log-play-progress-end: 0%;
+    background: var(--log-card-bg);
 }
 
 .emby-log-card--interrupt {
@@ -7278,11 +7530,8 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
 
 .emby-log-card--browse {
     --log-accent: #64748b;
-    background: linear-gradient(
-        135deg,
-        color-mix(in srgb, var(--log-accent) 6%, #fff) 0%,
-        #fff 42%
-    );
+    --log-card-bg: color-mix(in srgb, #64748b 9%, #fff);
+    background: var(--log-card-bg);
 }
 
 .emby-session-badge--browse {
@@ -7477,6 +7726,19 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
     border-radius: 8px;
 }
 
+.emby-log-card--playing .event-watch-meta,
+.emby-log-card--paused .event-watch-meta,
+.emby-log-card--stopped .event-watch-meta {
+    background: linear-gradient(
+        90deg,
+        var(--log-progress-track) 0%,
+        var(--log-progress-track) var(--emby-log-play-progress-start),
+        var(--log-progress-fill) var(--emby-log-play-progress-start),
+        var(--log-progress-fill) var(--emby-log-play-progress-end),
+        var(--log-progress-track) var(--emby-log-play-progress-end)
+    );
+}
+
 .emby-log-card .event-watch-meta-sep--pipe {
     color: var(--text-secondary);
     opacity: 0.45;
@@ -7552,6 +7814,18 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
 
 .syslog-item.syslog-debug {
     border-left-color: #94a3b8;
+}
+
+.syslog-load-more-tip {
+    padding: 12px 8px 4px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--text-muted, #94a3b8);
+}
+
+.syslog-load-more-tip--end {
+    color: var(--text-muted, #94a3b8);
+    opacity: 0.85;
 }
 
 .syslog-meta {
@@ -10412,11 +10686,13 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
     .stats-tab-panel .chart-filter-row--selects #chartInstance,
     .stats-tab-panel .chart-filter-row--selects #chartPeriod,
     .chart-filter-row--selects .chart-control:has(#chartInstance) select,
-    .chart-filter-row--selects .chart-control:has(#chartPlaybackUser) select,
+    .chart-filter-row--selects .chart-control--user-select .searchable-select,
+    .chart-filter-row--selects .chart-control--user-select .searchable-select__trigger,
     .log-filter-row--selects .chart-control:has(#eventInstance) select,
     .log-filter-row--selects .chart-control:has(#embyEventInstance) select,
     .log-filter-row--selects .chart-control:has(#embyEventLogType) select,
-    .log-filter-row--selects .chart-control:has(#embyEventPlaybackUser) select,
+    .log-filter-row--selects .chart-control--user-select .searchable-select,
+    .log-filter-row--selects .chart-control--user-select .searchable-select__trigger,
     .log-filter-row--selects .chart-control:has(#syslogInstance) select,
     .log-filter-row--selects .chart-control:has(#embySyslogInstance) select,
     .log-filter-row--selects .chart-control:has(#syslogLevel) select {
@@ -10426,9 +10702,10 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
     }
 
     .chart-filter-row--selects .chart-control:has(#chartInstance),
-    .chart-filter-row--selects .chart-control:has(#chartPlaybackUser),
+    .chart-filter-row--selects .chart-control--user-select,
     .log-filter-row--selects .chart-control:has(#eventInstance),
     .log-filter-row--selects .chart-control:has(#embyEventInstance),
+    .log-filter-row--selects .chart-control--user-select,
     .log-filter-row--selects .chart-control:has(#syslogInstance),
     .log-filter-row--selects .chart-control:has(#embySyslogInstance) {
         flex: unset;
@@ -10748,7 +11025,11 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
     }
 
     #chartInstance,
-    #chartPeriod {
+    #chartPeriod,
+    .chart-filter-row--selects .chart-control--user-select .searchable-select,
+    .chart-filter-row--selects .chart-control--user-select .searchable-select__trigger,
+    .log-filter-row--selects .chart-control--user-select .searchable-select,
+    .log-filter-row--selects .chart-control--user-select .searchable-select__trigger {
         width: 100%;
         max-width: 100%;
     }

@@ -11,7 +11,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/css/style.css?v=2025062710">
+    <link rel="stylesheet" href="/static/css/style.css?v=2025070117">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0"></script>
     <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
 </head>
@@ -139,7 +139,7 @@
                             <path d="M4 4h12v10H4z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
                             <path d="M7 8h6M7 11h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
                         </svg>
-                        <span class="nav-tab-label">事件日志</span>
+                        <span class="nav-tab-label">事件记录</span>
                     </button>
                     <button type="button" class="nav-tab" data-tab="syslogs" onclick="switchTab('syslogs')">
                         <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true">
@@ -270,8 +270,8 @@
                                     <span class="chart-control-label">设备名称</span>
                                     <select id="chartInstance" onchange="onChartInstanceChange()"></select>
                                 </label>
-                                <label class="chart-control platform-panel platform-panel--emby" data-platform-panel="emby" hidden aria-hidden="true">
-                                    <span class="chart-control-label">外网用户</span>
+                                <label class="chart-control platform-panel platform-panel--emby chart-control--user-select" data-platform-panel="emby" hidden aria-hidden="true">
+                                    <span class="chart-control-label">用户选择</span>
                                     <select id="chartPlaybackUser" onchange="onChartPlaybackUserChange()">
                                         <option value="__all_users__">全部用户</option>
                                     </select>
@@ -445,7 +445,7 @@
                             </div>
                         </div>
                         <div class="log-filter-head-main log-filter-head-main--trailing">
-                            <h2 class="log-section-title">事件日志</h2>
+                            <h2 class="log-section-title">事件记录</h2>
                             <button type="button" class="log-filter-head-refresh-btn" onclick="refreshEventsLog()" aria-label="刷新" title="刷新">
                                 <svg class="log-filter-head-refresh-icon" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                                     <path d="M13 3v3h-3M3 13v-3h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -464,8 +464,8 @@
                                 <span class="chart-control-label">设备名称</span>
                                 <select id="embyEventInstance" onchange="loadEmbyEvents()"></select>
                             </label>
-                            <label class="chart-control" data-platform-panel="emby" data-emby-playback-user-filter hidden aria-hidden="true">
-                                <span class="chart-control-label">用户名称</span>
+                            <label class="chart-control chart-control--user-select" data-platform-panel="emby" data-emby-playback-user-filter hidden aria-hidden="true">
+                                <span class="chart-control-label">用户选择</span>
                                 <select id="embyEventPlaybackUser" onchange="onEmbyEventPlaybackUserChange()">
                                     <option value="">全部用户</option>
                                 </select>
@@ -536,10 +536,10 @@
                                 <span class="chart-control-label">日志级别</span>
                                 <select id="syslogLevel" onchange="onSyslogLevelChange()">
                                     <option value="">全部</option>
-                                    <option value="DEBUG">DEBUG</option>
-                                    <option value="INFO">INFO</option>
-                                    <option value="WARNING">WARNING</option>
-                                    <option value="ERROR">ERROR</option>
+                                    <option value="DEBUG">调试</option>
+                                    <option value="INFO">信息</option>
+                                    <option value="WARNING">警告</option>
+                                    <option value="ERROR">错误</option>
                                 </select>
                             </label>
                         </div>
@@ -596,7 +596,8 @@
 
     <script src="/static/js/version.js?v=2025062025"></script>
     <script src="/static/js/integration.js?v=2025062710"></script>
-    <script src="/static/js/app.js?v=2025062710"></script>
-    <script src="/static/js/emby.js?v=2025062710"></script>
+    <script src="/static/js/searchable-select.js?v=2025070116"></script>
+    <script src="/static/js/app.js?v=2025070118"></script>
+    <script src="/static/js/emby.js?v=2025070116"></script>
 </body>
 </html>

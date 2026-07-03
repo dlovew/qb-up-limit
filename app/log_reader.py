@@ -1,6 +1,9 @@
 import os
 import re
 from pathlib import Path
+from typing import Iterator, List, Optional
+
+from syslog_localize import localize_system_log_entry
 
 LOG_PATH = os.environ.get('APP_LOG_PATH', '/data/app.log')
 _LOG_LINE_RE = re.compile(
@@ -8,21 +11,60 @@ _LOG_LINE_RE = re.compile(
     r'\[(DEBUG|INFO|WARNING|ERROR|CRITICAL)\] '
     r'(\S+): (.*)$'
 )
-_TAIL_CHUNK_SIZE = 8192
+
+
+def _log_path_candidates() -> List[Path]:
+    candidates: List[Path] = []
+    env = (os.environ.get('APP_LOG_PATH') or '').strip()
+    if env:
+        candidates.append(Path(env))
+    candidates.append(Path('/data/app.log'))
+    candidates.append(Path(__file__).resolve().parent.parent / 'data' / 'app.log')
+    seen = set()
+    ordered: List[Path] = []
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(path)
+    return ordered
+
+
+def resolve_app_log_path(*, for_write: bool = False) -> Path:
+    """解析 app.log 路径：读时优先非空文件，写时优先 APP_LOG_PATH 或 /data。"""
+    if for_write:
+        env = (os.environ.get('APP_LOG_PATH') or '').strip()
+        if env:
+            base = Path(env)
+        elif Path('/data').exists():
+            base = Path('/data/app.log')
+        else:
+            base = Path(__file__).resolve().parent.parent / 'data' / 'app.log'
+        try:
+            base.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return base
+
+    for path in _log_path_candidates():
+        try:
+            if path.exists() and path.stat().st_size > 0:
+                return path
+        except OSError:
+            continue
+    for path in _log_path_candidates():
+        if path.exists():
+            return path
+    return _log_path_candidates()[0]
 
 
 def _log_files() -> list:
-    base = Path(LOG_PATH)
-    if not base.parent.exists():
-        fallback = Path(__file__).resolve().parent.parent / 'data' / 'app.log'
-        if fallback.exists():
-            base = fallback
-        else:
-            return []
+    base = resolve_app_log_path(for_write=False)
+    if not base.exists():
+        return []
 
-    files = []
-    if base.exists():
-        files.append(base)
+    files = [base]
     for idx in range(1, 4):
         rotated = Path(f'{base}.{idx}')
         if rotated.exists():
@@ -30,24 +72,45 @@ def _log_files() -> list:
     return files
 
 
-def _iter_lines_reversed(path: Path):
-    """从文件末尾向前逐行读取，避免整文件载入内存。"""
+def _iter_valid_log_lines(path: Path) -> Iterator[str]:
+    """逐行正向读取，仅产出符合格式的日志行（跳过 traceback 等续行）。"""
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+            for raw in handle:
+                line = raw.rstrip('\r\n')
+                if _LOG_LINE_RE.match(line):
+                    yield line
+    except OSError:
+        return
+
+
+def _iter_valid_log_lines_reverse(path: Path) -> Iterator[str]:
+    """从文件尾部反向逐行读取，仅产出符合格式的日志行。"""
     try:
         with open(path, 'rb') as handle:
             handle.seek(0, os.SEEK_END)
-            position = handle.tell()
-            buffer = b''
-            while position > 0:
-                read_size = min(_TAIL_CHUNK_SIZE, position)
-                position -= read_size
-                handle.seek(position)
-                buffer = handle.read(read_size) + buffer
-                while b'\n' in buffer:
-                    line, buffer = buffer.rsplit(b'\n', 1)
-                    if line:
-                        yield line.decode('utf-8', errors='replace').rstrip('\r\n')
-            if buffer:
-                yield buffer.decode('utf-8', errors='replace').rstrip('\r\n')
+            file_size = handle.tell()
+            if file_size == 0:
+                return
+            pos = file_size
+            remainder = b''
+            while pos > 0:
+                read_len = min(65536, pos)
+                pos -= read_len
+                handle.seek(pos)
+                remainder = handle.read(read_len) + remainder
+                parts = remainder.split(b'\n')
+                remainder = parts[0]
+                for part in reversed(parts[1:]):
+                    if not part:
+                        continue
+                    line = part.decode('utf-8', errors='replace').rstrip('\r')
+                    if _LOG_LINE_RE.match(line):
+                        yield line
+            if remainder:
+                line = remainder.decode('utf-8', errors='replace').rstrip('\r')
+                if line and _LOG_LINE_RE.match(line):
+                    yield line
     except OSError:
         return
 
@@ -129,16 +192,44 @@ def _entry_matches_service(entry: dict, service: str) -> bool:
     return True
 
 
-def get_system_logs(limit: int = 1000, level: str = None, instance: str = None,
-                    service: str = None) -> list:
-    limit = max(1, min(int(limit), 1000))
+def _entry_passes_filters(
+    entry: dict,
+    *,
+    level: Optional[str],
+    service: Optional[str],
+    instance: Optional[str],
+) -> bool:
+    if level and entry['level'] != level:
+        return False
+    if service and not _entry_matches_service(entry, service):
+        return False
+    if instance and not _entry_matches_instance(entry, instance):
+        return False
+    if _is_playback_or_browse_app_log(entry) and service != 'emby':
+        return False
+    return True
+
+
+def get_system_logs(limit: int = 300, level: str = None, instance: str = None,
+                    service: str = None,
+                    before_time: str = None, before_logger: str = None,
+                    before_message: str = None) -> tuple:
+    limit = max(1, min(int(limit), 500))
     level = (level or '').strip().upper() or None
     instance = (instance or '').strip() or None
     service = (service or '').strip().lower() or None
-    entries = []
+    cursor = None
+    if (before_time or '').strip():
+        cursor = (
+            before_time.strip(),
+            (before_logger or '').strip(),
+            (before_message or '').strip(),
+        )
+    matched: List[dict] = []
+    want = limit + 1
 
     for path in _log_files():
-        for line in _iter_lines_reversed(path):
+        for line in _iter_valid_log_lines_reverse(path):
             match = _LOG_LINE_RE.match(line)
             if not match:
                 continue
@@ -148,16 +239,21 @@ def get_system_logs(limit: int = 1000, level: str = None, instance: str = None,
                 'logger': match.group(3),
                 'message': match.group(4),
             }
-            if level and entry['level'] != level:
+            if not _entry_passes_filters(
+                entry, level=level, service=service, instance=instance,
+            ):
                 continue
-            if service and not _entry_matches_service(entry, service):
-                continue
-            if instance and not _entry_matches_instance(entry, instance):
-                continue
-            if _is_playback_or_browse_app_log(entry) and service != 'emby':
-                continue
-            entries.append(entry)
-            if len(entries) >= limit:
-                return entries
+            if cursor is not None:
+                key = (entry['time'], entry['logger'], entry['message'])
+                if key >= cursor:
+                    continue
+            matched.append(entry)
+            if len(matched) >= want:
+                break
+        if len(matched) >= want:
+            break
 
-    return entries
+    has_more = len(matched) > limit
+    matched = matched[:limit]
+    matched.reverse()
+    return [localize_system_log_entry(entry) for entry in matched], has_more

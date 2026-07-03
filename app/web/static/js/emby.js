@@ -30,6 +30,9 @@ const EMBY_M3_WAN_POOL_SCALE_MAX = 1.5;
 const EMBY_BROWSE_UPLOAD_MIN_MB_DEFAULT = 1.0;
 const EMBY_BROWSE_UPLOAD_MIN_MB_MIN = 0;
 const EMBY_BROWSE_UPLOAD_MIN_MB_MAX = 100;
+const EMBY_EPISODE_SWITCH_GAP_DEFAULT = 3;
+const EMBY_EPISODE_SWITCH_GAP_MIN = 1;
+const EMBY_EPISODE_SWITCH_GAP_MAX = 10;
 const EMBY_DEBUG_WINDOW_POS_KEY_PREFIX = 'qb-up-limit-emby-debug-window-pos-';
 const EMBY_DEBUG_LUCKY_DEFAULT_VIEWPORT_RATIO = 0.62;
 const EMBY_DEBUG_LUCKY_CONN_MIN = 160;
@@ -142,15 +145,26 @@ function normalizeEmbyDebugTrafficConfig(raw = null) {
     const browseMinMbRaw = parseFloat(
         src.browse_upload_min_mb ?? src.emby_browse_upload_min_mb,
     );
+    const episodeSwitchGapRaw = parseInt(
+        src.episode_switch_gap_seconds ?? src.emby_episode_switch_gap_seconds,
+        10,
+    );
     const m3Scale = Number.isFinite(m3ScaleRaw) ? m3ScaleRaw : EMBY_M3_WAN_POOL_SCALE_DEFAULT;
     const browseMinMb = Number.isFinite(browseMinMbRaw)
         ? browseMinMbRaw
         : EMBY_BROWSE_UPLOAD_MIN_MB_DEFAULT;
+    const episodeSwitchGap = Number.isFinite(episodeSwitchGapRaw)
+        ? episodeSwitchGapRaw
+        : EMBY_EPISODE_SWITCH_GAP_DEFAULT;
     return {
         new_session_window_seconds: Math.max(1, Math.min(30, newWindow)),
         seek_window_seconds: Math.max(1, Math.min(30, seekWindow)),
         priority_mode: priorityRaw === 'new_first' ? 'new_first' : EMBY_DEBUG_PRIORITY_DEFAULT,
         mode_switch_grace_seconds: Math.max(0, Math.min(10, modeSwitchGrace)),
+        episode_switch_gap_seconds: Math.max(
+            EMBY_EPISODE_SWITCH_GAP_MIN,
+            Math.min(EMBY_EPISODE_SWITCH_GAP_MAX, episodeSwitchGap),
+        ),
         m3_wan_pool_scale: Math.max(
             EMBY_M3_WAN_POOL_SCALE_MIN,
             Math.min(EMBY_M3_WAN_POOL_SCALE_MAX, Math.round(m3Scale * 100) / 100),
@@ -181,10 +195,10 @@ function formatEmbyBrowseUploadMinMbLabel(mb = null) {
 function buildEmbyBrowseLogHintText(mb = null) {
     const value = Number(mb ?? getEmbyBrowseUploadMinMb());
     if (!Number.isFinite(value) || value <= 0) {
-        return '选片时产生的上传流量均会计入，用户浏览已缓存的数据不计入';
+        return '已设置选片流量均会计入';
     }
     const label = formatEmbyBrowseUploadMinMbLabel(mb);
-    return `选片流量 > ${label} 计入，用户浏览已缓存的数据不计入`;
+    return `已设置选片流量 > ${label} 计入`;
 }
 
 function syncEmbyBrowseLogHintText() {
@@ -1321,9 +1335,18 @@ function resolveEmbySessionDebugWindowSeconds(session, instanceName = '') {
 
 function resolveEmbySessionTrafficBytes(session, instanceName = '') {
     const liveTotalBytes = Math.max(0, parseInt(session?.estimated_upload_bytes_live, 10) || 0);
+    const floorBytes = Math.max(
+        Math.max(0, parseInt(session?.estimated_upload_bytes_floor, 10) || 0),
+        Math.max(0, parseInt(session?.estimated_upload_bytes, 10) || 0),
+        Math.max(0, parseInt(session?.live_upload_checkpoint_bytes, 10) || 0),
+    );
     const liveWindowBytes = Math.max(0, parseInt(session?.estimated_upload_bytes_1s_live, 10) || 0);
     const windowSeconds = resolveEmbySessionDebugWindowSeconds(session, instanceName);
-    return { liveTotalBytes, liveWindowBytes, windowSeconds };
+    return {
+        liveTotalBytes: Math.max(liveTotalBytes, floorBytes),
+        liveWindowBytes,
+        windowSeconds,
+    };
 }
 
 function shouldShowEmbySessionTrafficStats(session, instanceName = '') {
@@ -1528,10 +1551,7 @@ function getEmbyPlayingWatchMetaText(runtime, startPos, position) {
     const start = Math.max(0, parseInt(startPos, 10) || 0);
     const pos = Math.max(0, Math.min(parseInt(position, 10) || 0, runtimeSec));
     const remaining = Math.max(0, runtimeSec - pos);
-    const estimatedEnd = new Date(Date.now() + remaining * 1000);
-    const estimatedText = formatEmbyWallClockTime(estimatedEnd);
-    if (!estimatedText) return '';
-    return `影片时长${formatEmbyDuration(runtimeSec)} | ${formatEmbyDuration(start)} - ${formatEmbyDuration(pos)} | 预计${estimatedText}结束`;
+    return `影片时长${formatEmbyDuration(runtimeSec)} | ${formatEmbyDuration(start)} - ${formatEmbyDuration(pos)} | 剩余${formatEmbyDuration(remaining)}`;
 }
 
 function applyEmbyLogPlayingWatchEl(watchEl, event) {
@@ -1558,12 +1578,16 @@ function applyEmbyLogPlayingWatchEl(watchEl, event) {
 
     const card = watchEl.closest('.emby-log-card');
     if (!card) return;
-    const pct = Math.min(100, parseFloat(formatEmbySessionPercent((currentPos / runtime) * 100)));
-    syncEmbyLogCardProgressStyle(card, pct);
+    const rangeStart = Math.min(startPos, currentPos);
+    const rangeEnd = Math.max(startPos, currentPos);
+    syncEmbyLogCardProgressStyle(card, {
+        startPct: Math.min(100, parseFloat(formatEmbySessionPercent((rangeStart / runtime) * 100))),
+        endPct: Math.min(100, parseFloat(formatEmbySessionPercent((rangeEnd / runtime) * 100))),
+    });
 }
 
 function tickEmbyLogPlayingCards() {
-    const cards = document.querySelectorAll('.emby-log-card--playing');
+    const cards = document.querySelectorAll('.emby-log-card--playing, .emby-log-card--paused');
     if (!cards.length) {
         if (embyLogPlayingTicker) {
             clearInterval(embyLogPlayingTicker);
@@ -1571,27 +1595,41 @@ function tickEmbyLogPlayingCards() {
         }
         return;
     }
+    syncPlaybackRecordsSeekFromLive();
     const now = Date.now();
     cards.forEach((card) => {
         const watchEl = card.querySelector('.emby-log-play-watch');
-        if (!watchEl || watchEl.hidden) return;
-        const runtime = parseInt(watchEl.dataset.runtime, 10) || 0;
-        if (runtime <= 0) return;
-        let position = parseInt(watchEl.dataset.position, 10) || 0;
-        if (watchEl.dataset.paused !== '1') {
-            const synced = parseInt(watchEl.dataset.synced, 10) || now;
-            const elapsed = Math.floor((now - synced) / 1000);
-            position = Math.min(runtime, position + elapsed);
+        if (watchEl && !watchEl.hidden) {
+            const runtime = parseInt(watchEl.dataset.runtime, 10) || 0;
+            if (runtime > 0) {
+                let position = parseInt(watchEl.dataset.position, 10) || 0;
+                if (watchEl.dataset.paused !== '1') {
+                    const synced = parseInt(watchEl.dataset.synced, 10) || now;
+                    const elapsed = Math.floor((now - synced) / 1000);
+                    position = Math.min(runtime, position + elapsed);
+                }
+                const startPos = parseInt(watchEl.dataset.startPos, 10) || 0;
+                const rangeStart = Math.min(startPos, position);
+                const rangeEnd = Math.max(startPos, position);
+                syncEmbyLogCardProgressStyle(card, {
+                    startPct: Math.min(100, parseFloat(formatEmbySessionPercent((rangeStart / runtime) * 100))),
+                    endPct: Math.min(100, parseFloat(formatEmbySessionPercent((rangeEnd / runtime) * 100))),
+                });
+                watchEl.textContent = getEmbyPlayingWatchMetaText(runtime, startPos, position);
+            }
         }
-        const startPos = parseInt(watchEl.dataset.startPos, 10) || 0;
-        const pct = Math.min(100, parseFloat(formatEmbySessionPercent((position / runtime) * 100)));
-        syncEmbyLogCardProgressStyle(card, pct);
-        watchEl.textContent = getEmbyPlayingWatchMetaText(runtime, startPos, position);
+
+        const recordId = String(card.dataset.recordId || '').trim();
+        if (!recordId) return;
+        const rec = _lastPlaybackRecords.find((item) => String(item.id || '') === recordId);
+        if (!rec || rec.status !== 'playing') return;
+        const viewRec = mergeLiveSessionIntoPlaybackRecord(rec);
+        patchEmbyLogCardSeekBadge(card, playbackRecordAsEvent(viewRec));
     });
 }
 
 function ensureEmbyLogPlayingTicker() {
-    const hasPlaying = document.querySelector('.emby-log-card--playing');
+    const hasPlaying = document.querySelector('.emby-log-card--playing, .emby-log-card--paused');
     if (!hasPlaying) {
         if (embyLogPlayingTicker) {
             clearInterval(embyLogPlayingTicker);
@@ -2087,6 +2125,95 @@ function updateEmbyHeaderStats(instances) {
     if (wanEl) wanEl.textContent = wanPlay;
 }
 
+let embySeekBadgeOpenWrap = null;
+let embyLogPopoverHoverWrap = null;
+
+const EMBY_LOG_TAP_POPOVER_SELECTOR = '.emby-seek-badge-wrap, .emby-transcode-badge-wrap';
+
+// 卡片内弹层用 fixed 定位，按徽标位置计算坐标并夹取到视口内，
+// 从而脱离 .events-list 等 overflow 滚动祖先，不再被卡片/列表裁切。
+function positionEmbyLogPopover(wrap) {
+    if (!wrap) return;
+    const popover = wrap.querySelector('.status-badge-popover');
+    if (!popover) return;
+    const badgeRect = wrap.getBoundingClientRect();
+    const popRect = popover.getBoundingClientRect();
+    const margin = 8;
+    const gap = 6;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    let left = badgeRect.left + badgeRect.width / 2 - popRect.width / 2;
+    left = Math.max(margin, Math.min(left, vw - popRect.width - margin));
+    let top = badgeRect.bottom + gap;
+    if (top + popRect.height > vh - margin && badgeRect.top - popRect.height - gap >= margin) {
+        top = badgeRect.top - popRect.height - gap;
+    }
+    top = Math.max(margin, Math.min(top, vh - popRect.height - margin));
+    popover.style.left = `${Math.round(left)}px`;
+    popover.style.top = `${Math.round(top)}px`;
+}
+
+function closeEmbySeekBadgePopover() {
+    if (!embySeekBadgeOpenWrap) return;
+    embySeekBadgeOpenWrap.classList.remove('is-open');
+    embySeekBadgeOpenWrap = null;
+}
+
+function toggleEmbyLogPopover(wrap) {
+    const wasOpen = wrap.classList.contains('is-open');
+    closeEmbySeekBadgePopover();
+    if (!wasOpen) {
+        wrap.classList.add('is-open');
+        embySeekBadgeOpenWrap = wrap;
+        positionEmbyLogPopover(wrap);
+    }
+}
+
+function setupEmbySeekBadgePopover() {
+    if (setupEmbySeekBadgePopover._bound) return;
+    setupEmbySeekBadgePopover._bound = true;
+
+    // 悬停（细指针设备）时定位弹层并记录当前悬停项，供滚动/缩放时重新定位
+    document.addEventListener('mouseover', (e) => {
+        const wrap = e.target.closest(EMBY_LOG_TAP_POPOVER_SELECTOR);
+        if (wrap === embyLogPopoverHoverWrap) return;
+        embyLogPopoverHoverWrap = wrap || null;
+        if (wrap) positionEmbyLogPopover(wrap);
+    });
+
+    // 点击开/关（桌面与移动端一致）：再次点击或点击别处关闭
+    document.addEventListener('click', (e) => {
+        const wrap = e.target.closest(EMBY_LOG_TAP_POPOVER_SELECTOR);
+        if (wrap) {
+            e.preventDefault();
+            e.stopPropagation();
+            toggleEmbyLogPopover(wrap);
+            return;
+        }
+        if (embySeekBadgeOpenWrap && !embySeekBadgeOpenWrap.contains(e.target)) {
+            closeEmbySeekBadgePopover();
+        }
+    });
+
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            closeEmbySeekBadgePopover();
+            return;
+        }
+        const wrap = e.target.closest(EMBY_LOG_TAP_POPOVER_SELECTOR);
+        if (!wrap || (e.key !== 'Enter' && e.key !== ' ')) return;
+        e.preventDefault();
+        toggleEmbyLogPopover(wrap);
+    });
+
+    const reposition = () => {
+        const wrap = embySeekBadgeOpenWrap || embyLogPopoverHoverWrap;
+        if (wrap && document.contains(wrap)) positionEmbyLogPopover(wrap);
+    };
+    document.addEventListener('scroll', reposition, true);
+    window.addEventListener('resize', reposition);
+}
+
 function initEmby() {
     if (typeof getChartPlatform === 'function' && getChartPlatform() === 'emby') {
         if (typeof syncChartInstanceSelectForPlatform === 'function') {
@@ -2129,6 +2256,7 @@ function initEmby() {
         openEmbySessionDetail(item.dataset.instance, item.dataset.sessionId);
     });
     ensureEmbySessionTimeTicker();
+    setupEmbySeekBadgePopover();
 }
 
 function toggleEmbyNav() {
@@ -2158,7 +2286,7 @@ async function refreshEmbyAll(forceRender = false, silent = false) {
     if (isEmbyEventsTabActive()) await loadEmbyEvents(silent);
     if (typeof currentTab !== 'undefined' && currentTab === 'syslogs'
         && typeof getSyslogTypeFilter === 'function' && getSyslogTypeFilter() === 'emby') {
-        await loadEmbySystemLogs(silent);
+        await loadSyslogsForCurrentType(silent, true);
     }
     if (embyCurrentTab === 'stats' && document.getElementById('chartInstance')?.value
         && typeof updateChart === 'function') {
@@ -2313,7 +2441,7 @@ function updateEmbyInstanceSelects(instances) {
         if (syslogChanged && typeof currentTab !== 'undefined' && currentTab === 'syslogs'
             && typeof getSyslogTypeFilter === 'function' && getSyslogTypeFilter() === 'emby'
             && typeof loadSyslogsForCurrentType === 'function') {
-            loadSyslogsForCurrentType(true);
+            loadSyslogsForCurrentType(true, true);
         }
         if (syslogSel.value) {
             sessionStorage.setItem('qb-up-limit-syslog-instance-emby', syslogSel.value);
@@ -2343,6 +2471,27 @@ function updateEmbyInstanceSelects(instances) {
 }
 
 let lastEmbyCardsStructureKey = '';
+const _embySessionDisplayHold = new Map();
+const EMBY_SESSION_DISPLAY_HOLD_MS = 3000;
+
+function resolveEmbyActiveSessionsForDisplay(inst) {
+    const live = getEmbyActivePlaybackSessions(inst);
+    const name = inst?.name || '';
+    if (!name) return live;
+    if (live.length) {
+        _embySessionDisplayHold.set(name, {
+            sessions: live,
+            until: Date.now() + EMBY_SESSION_DISPLAY_HOLD_MS,
+        });
+        return live;
+    }
+    const hold = _embySessionDisplayHold.get(name);
+    if (hold && Date.now() < hold.until && hold.sessions?.length) {
+        return hold.sessions;
+    }
+    _embySessionDisplayHold.delete(name);
+    return live;
+}
 
 function getEmbyCardsStructureKey(instances) {
     const isMergeEmby = typeof getDeviceViewMode === 'function' && getDeviceViewMode() === 'merge';
@@ -2588,6 +2737,7 @@ function buildEmbyDebugWindowBodyHtml(inst, options = {}) {
     const modeSwitchGraceTip = `模式切换时若会话接口晚于 Docker 流量更新，可在这段时间（秒）内暂缓把上传计入程序余量，待会话确认再回放到目标模式，建议与页面刷新间隔 [[${modeSwitchRefreshSeconds}]] 秒一致，范围 0-10 秒。`;
     const m3WanPoolScaleTip = `仅 M3（局域网+外网）生效：对码率权重切出的 WAN 池乘以该系数。分摊权重已按各会话 transcode_kind 与音视频分量码率自动计算（直串流/音视频转码/仅音频转码等组合无需逐个调参）。1.0 为默认；若 Emby 上报码率与路由仍有系统性偏差，可用 1.05～1.10 或 0.90～0.95 做全局微调（长时间播放可能漂移）。M2 不受影响。范围 ${EMBY_M3_WAN_POOL_SCALE_MIN}～${EMBY_M3_WAN_POOL_SCALE_MAX}。`;
     const browseUploadMinMbTip = '选片时产生的上传流量累计超过此值，才会记入选片记录和统计。设为 0 表示只要有上传就记录；用户已缓存、几乎不产生上传的浏览本身就不算。默认值1，范围 0～100 MB。';
+    const episodeSwitchGapTip = '自动连播或快速切下一集时，连接波次可能短暂显示为「在线 · 选片」。若这段空窗不超过此秒数，就能避免误入选片流量。默认 3 秒，范围 1～10 秒。';
     const luckyDebugFooterTip = 'Lucky 按 ConnsStatistics 采集各连接上传增量；按 AcceptTime 聚波并与 Emby 外网会话统一裁决，同 IP 多会话按码率权重分摊；选片与播放分账，选片段由开播/断线边沿触发结算落库。';
     const luckyDebugFooterNote = '连接级采集 · 波次会话裁决 · 码率权重分摊 · 选片边沿结算';
     const luckyLayoutHtml = isLucky
@@ -2629,6 +2779,10 @@ function buildEmbyDebugWindowBodyHtml(inst, options = {}) {
                         <label class="emby-debug-config-field">
                             <span class="emby-debug-config-field-label">选片入账阈值 (MB)<span class="emby-debug-help" tabindex="0" data-tip="${escapeHtml(browseUploadMinMbTip)}">?</span></span>
                             <input type="number" min="${EMBY_BROWSE_UPLOAD_MIN_MB_MIN}" max="${EMBY_BROWSE_UPLOAD_MIN_MB_MAX}" step="0.1" value="${cfg.browse_upload_min_mb}" data-field="browse-upload-min-mb" />
+                        </label>
+                        <label class="emby-debug-config-field">
+                            <span class="emby-debug-config-field-label">连播切集空窗期 (秒)<span class="emby-debug-help" tabindex="0" data-tip="${escapeHtml(episodeSwitchGapTip)}">?</span></span>
+                            <input type="number" min="${EMBY_EPISODE_SWITCH_GAP_MIN}" max="${EMBY_EPISODE_SWITCH_GAP_MAX}" step="1" value="${cfg.episode_switch_gap_seconds}" data-field="episode-switch-gap" />
                         </label>
                     </div>
                 </div>
@@ -2902,6 +3056,7 @@ function buildEmbyDebugTrafficConfigPanelHtml(inst) {
 
 let embyDebugTipEl = null;
 let embyDebugTipAnchor = null;
+let embyDebugTipPinned = false;
 
 function ensureEmbyDebugTipEl() {
     if (embyDebugTipEl && document.body.contains(embyDebugTipEl)) return embyDebugTipEl;
@@ -2955,6 +3110,7 @@ function refreshEmbyDebugTipIfAnchored() {
 
 function hideEmbyDebugTip() {
     embyDebugTipAnchor = null;
+    embyDebugTipPinned = false;
     if (embyDebugTipEl) embyDebugTipEl.classList.remove('visible');
 }
 
@@ -2968,16 +3124,40 @@ function bindEmbyDebugTipEvents() {
     if (window.__embyDebugTipBound) return;
     window.__embyDebugTipBound = true;
     document.addEventListener('mouseover', (e) => {
+        if (embyDebugTipPinned) return;
         const t = resolveEmbyDebugTipTarget(e.target);
         if (t) showEmbyDebugTip(t);
     });
     document.addEventListener('mouseout', (e) => {
+        if (embyDebugTipPinned) return;
         const t = resolveEmbyDebugTipTarget(e.target);
         if (!t) return;
         const related = e.relatedTarget;
         if (related && t.contains(related)) return;
         if (related && embyDebugTipEl?.contains(related)) return;
         hideEmbyDebugTip();
+    });
+    // 点击开/关（桌面与移动端一致）：再次点击同一标签或点击别处关闭
+    document.addEventListener('click', (e) => {
+        const t = resolveEmbyDebugTipTarget(e.target);
+        if (t) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (embyDebugTipPinned && embyDebugTipAnchor === t) {
+                hideEmbyDebugTip();
+            } else {
+                showEmbyDebugTip(t);
+                embyDebugTipPinned = true;
+            }
+            return;
+        }
+        if (embyDebugTipPinned
+            && !embyDebugTipEl?.contains(e.target)) {
+            hideEmbyDebugTip();
+        }
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && embyDebugTipPinned) hideEmbyDebugTip();
     });
     document.addEventListener('focusin', (e) => {
         const t = resolveEmbyDebugTipTarget(e.target);
@@ -3086,6 +3266,7 @@ function applyEmbyDebugTrafficConfigToPanel(panel, cfg) {
     setValue('mode-switch-grace', normalized.mode_switch_grace_seconds);
     setValue('m3-wan-pool-scale', normalized.m3_wan_pool_scale);
     setValue('browse-upload-min-mb', normalized.browse_upload_min_mb);
+    setValue('episode-switch-gap', normalized.episode_switch_gap_seconds);
     const priorityEl = panel.querySelector('[data-field="priority-mode"]');
     if (priorityEl && normalized.priority_mode) {
         priorityEl.value = normalized.priority_mode;
@@ -3109,6 +3290,7 @@ async function saveEmbyDebugTrafficConfig(button) {
     const m3WanPoolScaleEl = panel.querySelector('[data-field="m3-wan-pool-scale"]');
     const priorityModeEl = panel.querySelector('[data-field="priority-mode"]');
     const browseMinMbEl = panel.querySelector('[data-field="browse-upload-min-mb"]');
+    const episodeSwitchGapEl = panel.querySelector('[data-field="episode-switch-gap"]');
 
     if (newWindowEl) {
         const newWindow = parseInt(newWindowEl.value, 10);
@@ -3171,6 +3353,21 @@ async function saveEmbyDebugTrafficConfig(button) {
             return;
         }
         payload.browse_upload_min_mb = Math.round(browseMinMb * 100) / 100;
+    }
+    if (episodeSwitchGapEl) {
+        const episodeSwitchGap = parseInt(episodeSwitchGapEl.value, 10);
+        if (
+            !Number.isFinite(episodeSwitchGap)
+            || episodeSwitchGap < EMBY_EPISODE_SWITCH_GAP_MIN
+            || episodeSwitchGap > EMBY_EPISODE_SWITCH_GAP_MAX
+        ) {
+            showEmbyDebugToast(
+                `连播切集空窗期请输入 ${EMBY_EPISODE_SWITCH_GAP_MIN}～${EMBY_EPISODE_SWITCH_GAP_MAX} 秒`,
+                'error',
+            );
+            return;
+        }
+        payload.episode_switch_gap_seconds = episodeSwitchGap;
     }
     if (!Object.keys(payload).length) {
         showEmbyDebugToast('没有可保存的参数', 'error');
@@ -3532,7 +3729,7 @@ function patchEmbyCardMetrics(inst, card) {
         }
     }
 
-    const count = getEmbyActivePlaybackSessions(inst).length;
+    const count = resolveEmbyActiveSessionsForDisplay(inst).length;
     const countBadge = card.querySelector('[data-field="session-count-badge"] span');
     if (countBadge) countBadge.textContent = `${count} 路播放`;
 
@@ -3545,7 +3742,7 @@ function patchEmbyCardMetrics(inst, card) {
             : '当前播放会话';
     }
 
-    const activeSessions = getEmbyActivePlaybackSessions(inst);
+    const activeSessions = resolveEmbyActiveSessionsForDisplay(inst);
     const sessionsEl = card.querySelector('[data-field="sessions"]');
     if (sessionsEl) {
         if (activeSessions.length) {
@@ -3633,7 +3830,7 @@ function buildEmbyInstanceForm(inst, mode) {
         <div class="modal-form modal-form--instance modal-form--emby">
             <div class="form-section form-section--notice">
                 <h3>使用须知</h3>
-                <p class="form-hint form-hint--field form-hint--notice">本程序采集数据后统一按 二进制（1 KB = 1024 B）显示；建议开启 Lucky反代模式 流量采集。</p>
+                <p class="form-hint form-hint--field form-hint--notice">本程序采集数据后统一按 二进制（1 KB = 1024 B）显示；<br>建议开启「Lucky反代模式」进行流量采集，并确保 Emby、Lucky、本程序三者统一时区。</p>
             </div>
             <div class="form-section form-section--basic">
                 <h3>基础设置</h3>
@@ -4863,7 +5060,71 @@ function getEmbyBrowseLogListEl() {
 
 function refreshEmbyEventPlaybackUsersFromCaches() {
     if (!isEmbyCombinedLogViewActive()) return;
-    refreshEmbyEventPlaybackUsers([..._lastPlaybackRecords, ..._lastBrowseRecords]);
+    void refreshEmbyEventPlaybackUsers([..._lastPlaybackRecords, ..._lastBrowseRecords]);
+}
+
+function collectEmbyUserNamesFromRecords(records) {
+    const seen = new Set();
+    const names = [];
+    (records || []).forEach((rec) => {
+        const name = String(rec.user_name || '').trim();
+        if (!name || seen.has(name)) return;
+        seen.add(name);
+        names.push(name);
+    });
+    names.sort((a, b) => a.localeCompare(b, 'zh-CN'));
+    return names;
+}
+
+function applyEmbyEventPlaybackUserOptions(names, prev) {
+    const select = document.getElementById('embyEventPlaybackUser');
+    if (!select) return;
+    select.innerHTML = '<option value="">全部用户</option>';
+    (names || []).forEach((name) => {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        select.appendChild(opt);
+    });
+    const persisted = sessionStorage.getItem('qb-up-limit-emby-event-playback-user') || '';
+    const target = prev || persisted;
+    if (target && [...select.options].some((o) => o.value === target)) {
+        select.value = target;
+    }
+    sessionStorage.setItem('qb-up-limit-emby-event-playback-user', select.value || '');
+    syncEmbyEventPlaybackUserSearchable();
+}
+
+async function refreshEmbyEventPlaybackUsers(records) {
+    const select = document.getElementById('embyEventPlaybackUser');
+    if (!select) return;
+    const persisted = sessionStorage.getItem('qb-up-limit-emby-event-playback-user') || '';
+    const prev = select.value || persisted;
+    const instance = document.getElementById('embyEventInstance')?.value || '';
+    let names = [];
+    if (instance) {
+        try {
+            const res = await axios.get('/api/emby/playback-users', { params: { instance } });
+            if (res.data?.success) {
+                names = (res.data.data || [])
+                    .map((name) => String(name || '').trim())
+                    .filter(Boolean);
+            }
+        } catch (e) {
+            /* API 失败时回退到记录内用户名 */
+        }
+    }
+    if (!names.length) {
+        names = collectEmbyUserNamesFromRecords(records);
+    }
+    applyEmbyEventPlaybackUserOptions(names, prev);
+}
+
+function embyUserNameMatches(recordName, selectedUser) {
+    const left = String(recordName || '').trim();
+    const right = String(selectedUser || '').trim();
+    if (!left || !right) return false;
+    return left.toLocaleLowerCase() === right.toLocaleLowerCase();
 }
 
 function getEmbyEventPlaybackUser() {
@@ -4882,7 +5143,7 @@ function syncEmbyEventPlaybackUserFilterVisibility() {
     label.setAttribute('aria-hidden', show ? 'false' : 'true');
     const caption = label.querySelector('.chart-control-label');
     if (caption) {
-        caption.textContent = logType === 'browse' ? '用户名称' : '用户名称';
+        caption.textContent = '用户选择';
     }
     syncEmbyBrowseLogHintVisibility();
 }
@@ -4901,38 +5162,11 @@ function syncEmbyBrowseLogHintVisibility() {
     if (showBrowse) syncEmbyBrowseLogHintText();
 }
 
-function refreshEmbyEventPlaybackUsers(records) {
-    const select = document.getElementById('embyEventPlaybackUser');
-    if (!select) return;
-    const persisted = sessionStorage.getItem('qb-up-limit-emby-event-playback-user') || '';
-    const prev = select.value || persisted;
-    const seen = new Set();
-    const names = [];
-    (records || []).forEach((rec) => {
-        const name = String(rec.user_name || '').trim();
-        if (!name || seen.has(name)) return;
-        seen.add(name);
-        names.push(name);
-    });
-    names.sort((a, b) => a.localeCompare(b, 'zh-CN'));
-    select.innerHTML = '<option value="">全部用户</option>';
-    names.forEach((name) => {
-        const opt = document.createElement('option');
-        opt.value = name;
-        opt.textContent = name;
-        select.appendChild(opt);
-    });
-    if (prev && [...select.options].some((o) => o.value === prev)) {
-        select.value = prev;
-    }
-    sessionStorage.setItem('qb-up-limit-emby-event-playback-user', select.value || '');
-}
-
 function filterPlaybackRecordsByUser(records) {
     let filtered = filterEmbyEventRecordsExcludeLan(records);
     const user = getEmbyEventPlaybackUser();
     if (!user) return filtered;
-    return filtered.filter((rec) => String(rec.user_name || '').trim() === user);
+    return filtered.filter((rec) => embyUserNameMatches(rec.user_name, user));
 }
 
 function filterBrowseRecordsByUser(records) {
@@ -4943,7 +5177,7 @@ function filterBrowseRecordsByUser(records) {
     );
     eligible = filterEmbyEventRecordsExcludeLan(eligible);
     if (!user) return eligible;
-    return eligible.filter((rec) => String(rec.user_name || '').trim() === user);
+    return eligible.filter((rec) => embyUserNameMatches(rec.user_name, user));
 }
 
 function onEmbyEventLogTypeChange() {
@@ -5034,7 +5268,7 @@ async function loadEmbyCombinedPlaybackBrowseRecords(silent = false) {
         loadEmbyPlaybackRecords(silent),
         loadEmbyBrowseRecords(silent),
     ]);
-    refreshEmbyEventPlaybackUsersFromCaches();
+    await refreshEmbyEventPlaybackUsers([..._lastPlaybackRecords, ..._lastBrowseRecords]);
 }
 
 async function loadEmbyBrowseRecords(silent = false) {
@@ -5049,7 +5283,12 @@ async function loadEmbyBrowseRecords(silent = false) {
         _lastEmbyEventBrowseInstance = instance;
         _lastBrowseRecordsFingerprint = '';
         const userSelect = document.getElementById('embyEventPlaybackUser');
-        if (userSelect) userSelect.value = '';
+        if (userSelect) {
+            userSelect.value = '';
+            if (typeof syncEmbyEventPlaybackUserSearchable === 'function') {
+                syncEmbyEventPlaybackUserSearchable();
+            }
+        }
     }
     try {
         const res = await axios.get('/api/emby/browse-records', {
@@ -5083,10 +5322,20 @@ let _embyActivityLogSeq = 0;
 const _embyPlaybackLogTrafficPeak = new Map();
 
 function playbackRecordsFingerprint(records) {
-    return (records || []).map((rec) => (
-        `${rec.id || ''}:${rec.status || ''}:${rec.stopped_at || ''}:${rec.started_at || ''}`
-        + `:${rec.estimated_upload_bytes || 0}:${rec.upload_bytes || 0}:${rec.seek_count || 0}`
-    )).join('|');
+    return (records || []).map((rec) => {
+        const timeline = resolveEmbySeekTimeline(rec);
+        const tail = timeline.length
+            ? `${timeline[timeline.length - 1].direction}:`
+            + `${timeline[timeline.length - 1].from_seconds}-`
+            + `${timeline[timeline.length - 1].to_seconds}`
+            : '';
+        return (
+            `${rec.id || ''}:${rec.status || ''}:${rec.stopped_at || ''}:${rec.started_at || ''}`
+            + `:${rec.estimated_upload_bytes || 0}:${rec.upload_bytes || 0}:${rec.seek_count || 0}`
+            + `:${rec.seek_forward_count || 0}:${rec.seek_backward_count || 0}`
+            + `:${timeline.length}:${tail}`
+        );
+    }).join('|');
 }
 
 async function loadEmbyPlaybackRecords(silent = false) {
@@ -5101,7 +5350,12 @@ async function loadEmbyPlaybackRecords(silent = false) {
         _lastEmbyEventPlaybackInstance = instance;
         _lastPlaybackRecordsFingerprint = '';
         const userSelect = document.getElementById('embyEventPlaybackUser');
-        if (userSelect) userSelect.value = '';
+        if (userSelect) {
+            userSelect.value = '';
+            if (typeof syncEmbyEventPlaybackUserSearchable === 'function') {
+                syncEmbyEventPlaybackUserSearchable();
+            }
+        }
     }
     const requestId = ++_embyPlaybackRecordsSeq;
     try {
@@ -5113,6 +5367,7 @@ async function loadEmbyPlaybackRecords(silent = false) {
         const records = res.data.data || [];
         const fingerprint = playbackRecordsFingerprint(records);
         if (silent && fingerprint === _lastPlaybackRecordsFingerprint) {
+            _lastPlaybackRecords = records;
             syncEmbyPlaybackLogCardsFromLive();
             return;
         }
@@ -5340,11 +5595,88 @@ function ensureEmbyEventIpToggle() {
     });
 }
 
+const EMBY_TRANSCODE_REASON_LABELS = {
+    ContainerNotSupported: '容器不支持',
+    ContainerBitrateExceedsLimit: '容器码率超限',
+    VideoCodecNotSupported: '视频编码不支持',
+    VideoProfileNotSupported: '视频 Profile 不支持',
+    VideoLevelNotSupported: '视频 Level 不支持',
+    VideoResolutionNotSupported: '视频分辨率不支持',
+    VideoBitDepthNotSupported: '视频位深不支持',
+    VideoFramerateNotSupported: '视频帧率不支持',
+    VideoBitrateNotSupported: '视频码率不支持',
+    VideoRangeTypeNotSupported: '视频动态范围不支持',
+    AnamorphicVideoNotSupported: '变形视频不支持',
+    InterlacedVideoNotSupported: '隔行视频不支持',
+    RefFramesNotSupported: '参考帧不支持',
+    AudioCodecNotSupported: '音频编码不支持',
+    AudioProfileNotSupported: '音频 Profile 不支持',
+    AudioBitrateNotSupported: '音频码率不支持',
+    AudioChannelsNotSupported: '音频声道不支持',
+    AudioSampleRateNotSupported: '音频采样率不支持',
+    AudioBitDepthNotSupported: '音频位深不支持',
+    SecondaryAudioNotSupported: '次要音轨不支持',
+    SubtitleCodecNotSupported: '字幕格式不支持',
+    DirectPlayError: '直连失败',
+    UnknownVideoStreamInfo: '视频流信息未知',
+    UnknownAudioStreamInfo: '音频流信息未知',
+};
+
+function embyTranscodeReasonLabel(reason) {
+    const key = String(reason || '').trim();
+    if (!key) return '';
+    return EMBY_TRANSCODE_REASON_LABELS[key] || key;
+}
+
+function buildEmbyTranscodePopoverRows(event) {
+    const rows = [];
+    const methodLabel = embyPlayMethodLabel(event.play_method);
+    if (methodLabel) rows.push(['播放方式', methodLabel]);
+
+    const isVideoDirect = event.is_video_direct;
+    const isAudioDirect = event.is_audio_direct;
+    if (isVideoDirect != null) rows.push(['视频', isVideoDirect ? '直连' : '转码']);
+    if (isAudioDirect != null) rows.push(['音频', isAudioDirect ? '直连' : '转码']);
+
+    const codec = [event.video_codec, event.audio_codec].filter(Boolean).join(' / ');
+    if (codec) rows.push(['编码', codec.toUpperCase()]);
+    if (event.container) rows.push(['容器', String(event.container).toUpperCase()]);
+
+    const resolution = formatEmbyResolution(event.width, event.height);
+    if (resolution) rows.push(['分辨率', resolution]);
+
+    const bitrateText = formatEmbyKbps(event.bitrate);
+    if (bitrateText) rows.push(['码率', bitrateText]);
+
+    const reasons = Array.isArray(event.transcode_reasons) ? event.transcode_reasons : [];
+    const reasonText = reasons.map(embyTranscodeReasonLabel).filter(Boolean).join('、');
+    if (reasonText) rows.push(['转码原因', reasonText]);
+
+    return rows;
+}
+
+function buildEmbyTranscodePopoverHtml(event) {
+    const rows = buildEmbyTranscodePopoverRows(event);
+    if (!rows.length) return '';
+    return rows.map(([k, v]) => (
+        `<div class="badge-popover-meta"><span class="emby-transcode-popover-key">${escapeHtml(k)}</span>`
+        + `<span class="emby-transcode-popover-val">${escapeHtml(String(v))}</span></div>`
+    )).join('');
+}
+
 function buildEmbyEventTranscodeBadgeHtml(event) {
     const kind = deriveEmbyEventTranscodeKind(event);
     const label = embyTranscodeKindLabel(kind);
     if (!label) return '';
-    return `<span class="emby-session-badge emby-event-badge--transcode">${escapeHtml(label)}</span>`;
+    const popoverHtml = buildEmbyTranscodePopoverHtml(event);
+    if (!popoverHtml) {
+        return `<span class="emby-session-badge emby-event-badge--transcode">${escapeHtml(label)}</span>`;
+    }
+    return `
+        <span class="emby-transcode-badge-wrap status-badge-wrap" tabindex="0" role="button">
+            <span class="emby-session-badge emby-event-badge--transcode">${escapeHtml(label)}</span>
+            <span class="status-badge-popover emby-transcode-badge-popover" role="tooltip">${popoverHtml}</span>
+        </span>`;
 }
 
 function buildEmbyEventTranscodeHtml(event) {
@@ -5358,7 +5690,120 @@ function isEmbyPlaybackStopEvent(type) {
 }
 
 const EMBY_WATCH_COMPLETE_RATIO = 0.85;
-const EMBY_EFFECTIVE_WATCH_SECONDS = 300;
+const EMBY_SEEK_FORWARD_MIN_DELTA = 25;
+const EMBY_SEEK_BACKWARD_TOLERANCE = 8;
+const EMBY_SEEK_TIP_SEPARATOR = '------------------------------';
+
+function buildEmbySeekTipThresholdLine() {
+    return `前跳>${EMBY_SEEK_FORWARD_MIN_DELTA}s/次；后跳>${EMBY_SEEK_BACKWARD_TOLERANCE}s/次`;
+}
+
+function buildEmbySeekTipCountLine(forward, backward) {
+    return `前跳${forward}次；后跳${backward}次`;
+}
+
+function buildEmbySeekTipDetailLines(event) {
+    const timeline = resolveEmbySeekTimeline(event);
+    return timeline.map((entry, idx) => {
+        const kind = entry.direction === 'backward' ? '后跳' : '前跳';
+        return (
+            `${idx + 1} - ${kind}：`
+            + `${formatEmbyDuration(entry.from_seconds)}→${formatEmbyDuration(entry.to_seconds)}`
+        );
+    });
+}
+
+function buildEmbySeekCombinedTooltip(event) {
+    const forward = resolveEmbySeekForwardCount(event);
+    const backward = resolveEmbySeekBackwardCount(event);
+    const total = forward + backward;
+    if (total <= 0) return '';
+    const lines = [
+        buildEmbySeekTipThresholdLine(),
+        EMBY_SEEK_TIP_SEPARATOR,
+        buildEmbySeekTipCountLine(forward, backward),
+        ...buildEmbySeekTipDetailLines(event),
+    ];
+    return lines.join('\n');
+}
+
+function buildEmbySeekPopoverHtml(event) {
+    const forward = resolveEmbySeekForwardCount(event);
+    const backward = resolveEmbySeekBackwardCount(event);
+    const total = forward + backward;
+    if (total <= 0) return '';
+    const detailLines = buildEmbySeekTipDetailLines(event);
+    const detailHtml = detailLines.map(
+        (line) => `<div class="badge-popover-meta emby-seek-popover-entry">${escapeHtml(line)}</div>`,
+    ).join('');
+    return `
+        <div class="badge-popover-meta">${escapeHtml(buildEmbySeekTipThresholdLine())}</div>
+        <div class="badge-popover-divider badge-popover-divider--partial"></div>
+        <div class="badge-popover-meta badge-popover-meta--emph">${escapeHtml(buildEmbySeekTipCountLine(forward, backward))}</div>
+        ${detailHtml}`;
+}
+
+function buildEmbySeekBadgeHtml(event) {
+    const total = resolveEmbySeekCount(event);
+    if (total <= 0) return '';
+    const label = total === 1 ? '跳转1次' : `跳转${total}次`;
+    const popoverHtml = buildEmbySeekPopoverHtml(event);
+    const tip = buildEmbySeekCombinedTooltip(event);
+    return `
+        <span class="emby-seek-badge-wrap status-badge-wrap" tabindex="0" role="button" aria-label="${escapeHtml(tip)}">
+            <span class="emby-session-badge emby-event-badge--seek">${escapeHtml(label)}</span>
+            <span class="status-badge-popover emby-seek-badge-popover" role="tooltip">${popoverHtml}</span>
+        </span>`;
+}
+
+function normalizeEmbySeekLog(raw) {
+    if (!Array.isArray(raw)) return [];
+    const result = [];
+    raw.forEach((item) => {
+        if (!item || typeof item !== 'object') return;
+        const from = parseInt(item.from_seconds ?? item.from, 10);
+        const to = parseInt(item.to_seconds ?? item.to, 10);
+        if (Number.isNaN(from) || Number.isNaN(to)) return;
+        result.push({
+            from_seconds: Math.max(0, from),
+            to_seconds: Math.max(0, to),
+        });
+    });
+    return result;
+}
+
+function normalizeEmbySeekTimeline(raw) {
+    if (!Array.isArray(raw)) return [];
+    const result = [];
+    raw.forEach((item) => {
+        if (!item || typeof item !== 'object') return;
+        const from = parseInt(item.from_seconds ?? item.from, 10);
+        const to = parseInt(item.to_seconds ?? item.to, 10);
+        if (Number.isNaN(from) || Number.isNaN(to)) return;
+        const direction = String(item.direction || '').toLowerCase() === 'backward'
+            ? 'backward'
+            : 'forward';
+        result.push({
+            direction,
+            from_seconds: Math.max(0, from),
+            to_seconds: Math.max(0, to),
+        });
+    });
+    return result;
+}
+
+function resolveEmbySeekTimeline(event) {
+    const timeline = normalizeEmbySeekTimeline(event?.seek_log);
+    if (timeline.length) return timeline;
+    const rebuilt = [];
+    normalizeEmbySeekLog(event?.seek_forward_log).forEach((entry) => {
+        rebuilt.push({ ...entry, direction: 'forward' });
+    });
+    normalizeEmbySeekLog(event?.seek_backward_log).forEach((entry) => {
+        rebuilt.push({ ...entry, direction: 'backward' });
+    });
+    return rebuilt;
+}
 
 function buildEmbyEventUserBadgeHtml(event) {
     const name = event.user_name || '';
@@ -5372,11 +5817,117 @@ function resolveEmbySeekCount(event) {
     return raw;
 }
 
-function buildEmbySeekBadgeHtml(event) {
-    const count = resolveEmbySeekCount(event);
-    if (count <= 0) return '';
-    const label = count === 1 ? '跳转1次' : `跳转${count}次`;
-    return `<span class="emby-session-badge emby-event-badge--seek">${escapeHtml(label)}</span>`;
+function resolveEmbySeekForwardCount(event) {
+    const raw = parseInt(event?.seek_forward_count, 10);
+    if (!Number.isNaN(raw) && raw >= 0) return raw;
+    const total = resolveEmbySeekCount(event);
+    const backward = resolveEmbySeekBackwardCount(event);
+    return Math.max(0, total - backward);
+}
+
+function resolveEmbySeekBackwardCount(event) {
+    const raw = parseInt(event?.seek_backward_count, 10);
+    if (!Number.isNaN(raw) && raw >= 0) return raw;
+    return 0;
+}
+
+function ensureEmbyLogCardTagsEl(cardEl) {
+    let tagsEl = cardEl?.querySelector('.emby-log-card-tags');
+    if (tagsEl) return tagsEl;
+    const head = cardEl?.querySelector('.emby-log-card-head');
+    if (!head) return null;
+    tagsEl = document.createElement('div');
+    tagsEl.className = 'emby-log-card-tags';
+    head.appendChild(tagsEl);
+    return tagsEl;
+}
+
+function pickRicherEmbySeekLog(liveLog, recordLog) {
+    const live = normalizeEmbySeekLog(liveLog);
+    const record = normalizeEmbySeekLog(recordLog);
+    if (live.length !== record.length) {
+        return live.length > record.length ? live : record;
+    }
+    if (!live.length) return record;
+    for (let i = 0; i < live.length; i += 1) {
+        const left = live[i];
+        const right = record[i];
+        if (!right) return live;
+        if (left.from_seconds !== right.from_seconds || left.to_seconds !== right.to_seconds) {
+            return live;
+        }
+    }
+    return live;
+}
+
+function pickRicherEmbySeekTimeline(liveLog, recordLog) {
+    const live = normalizeEmbySeekTimeline(liveLog);
+    const record = normalizeEmbySeekTimeline(recordLog);
+    if (live.length !== record.length) {
+        return live.length > record.length ? live : record;
+    }
+    if (!live.length) return record;
+    for (let i = 0; i < live.length; i += 1) {
+        const left = live[i];
+        const right = record[i];
+        if (!right) return live;
+        if (
+            left.direction !== right.direction
+            || left.from_seconds !== right.from_seconds
+            || left.to_seconds !== right.to_seconds
+        ) {
+            return live;
+        }
+    }
+    return live;
+}
+
+function patchEmbyLogCardSeekBadge(cardEl, event) {
+    const tagsEl = ensureEmbyLogCardTagsEl(cardEl);
+    if (!tagsEl) return;
+
+    tagsEl.querySelector('.emby-event-badge--seek-forward')?.remove();
+    tagsEl.querySelector('.emby-event-badge--seek-backward')?.remove();
+    tagsEl.querySelectorAll('.emby-event-badge--seek').forEach((el) => {
+        if (!el.closest('.emby-seek-badge-wrap')) el.remove();
+    });
+
+    const html = buildEmbySeekBadgeHtml(event);
+    const existing = tagsEl.querySelector('.emby-seek-badge-wrap');
+    if (!html) {
+        existing?.remove();
+        return;
+    }
+
+    const insertAfter = tagsEl.querySelector('.emby-transcode-badge-wrap')
+        || tagsEl.querySelector('.emby-event-badge--transcode');
+    if (existing) {
+        const wrap = document.createElement('span');
+        wrap.innerHTML = html;
+        const next = wrap.firstElementChild;
+        const nextPopover = next.querySelector('.status-badge-popover');
+        const existingPopover = existing.querySelector('.status-badge-popover');
+        const nextLabel = next.querySelector('.emby-event-badge--seek');
+        const existingLabel = existing.querySelector('.emby-event-badge--seek');
+        if (
+            existingLabel?.textContent !== nextLabel?.textContent
+            || existingPopover?.innerHTML !== nextPopover?.innerHTML
+        ) {
+            const wasOpen = existing.classList.contains('is-open');
+            existing.replaceWith(next);
+            if (wasOpen) next.classList.add('is-open');
+        }
+        return;
+    }
+
+    const wrap = document.createElement('span');
+    wrap.innerHTML = html;
+    const badgeEl = wrap.firstElementChild;
+    if (insertAfter) {
+        insertAfter.insertAdjacentElement('afterend', badgeEl);
+    } else {
+        tagsEl.appendChild(badgeEl);
+    }
 }
 
 function buildEmbyWatchStatusBadgeHtml(event) {
@@ -5430,11 +5981,12 @@ function resolveEmbyWallClockPlayedSeconds(event, startEvent = null) {
 }
 
 function resolveEmbyPlayedSeconds(event, startEvent = null) {
-    const played = parseInt(event?.played_seconds, 10);
-    if (!Number.isNaN(played) && played > 0) return played;
-
+    // 时长口径 = 墙钟：本段从开始播放到播放完毕的真实时间（started_at → stopped_at）。
     const wall = resolveEmbyWallClockPlayedSeconds(event, startEvent);
     if (wall > 0) return wall;
+
+    const played = parseInt(event?.played_seconds, 10);
+    if (!Number.isNaN(played) && played > 0) return played;
 
     const end = parseInt(event?.end_position_seconds, 10);
     const startPos = parseInt(event?.start_position_seconds, 10);
@@ -5471,7 +6023,7 @@ function buildEmbyEventWatchTextLine(event) {
     if (resolveEmbySeekCount(event) > 0) {
         html += escapeHtml(' 含跳转');
     }
-    return `<div class="event-watch-meta">${html}</div>`;
+    return `<div class="event-watch-meta emby-log-watch-progress">${html}</div>`;
 }
 
 function formatEmbyWallClockTime(date) {
@@ -5527,16 +6079,24 @@ function findLiveSessionForPlaybackRecord(rec) {
     return null;
 }
 
+function resolvePlaybackRecordUploadFloor(rec) {
+    const booked = Math.max(0, parseInt(rec?.estimated_upload_bytes, 10) || 0);
+    const checkpoint = Math.max(0, parseInt(rec?.live_upload_checkpoint_bytes, 10) || 0);
+    const floorField = Math.max(0, parseInt(rec?.estimated_upload_bytes_floor, 10) || 0);
+    return Math.max(booked, checkpoint, floorField);
+}
+
 function applyEmbyPlaybackLogTrafficPeak(merged) {
     const id = String(merged?.id || '').trim();
     if (!id || merged?.status !== 'playing') {
         if (id) _embyPlaybackLogTrafficPeak.delete(id);
         return merged;
     }
-    if (getEmbyTrafficCollectMode(merged.instance_name) === 'lucky') {
-        return merged;
-    }
-    const liveTotal = Math.max(0, parseInt(merged?.estimated_upload_bytes_live, 10) || 0);
+    const floor = resolvePlaybackRecordUploadFloor(merged);
+    const liveTotal = Math.max(
+        floor,
+        Math.max(0, parseInt(merged?.estimated_upload_bytes_live, 10) || 0),
+    );
     const peak = _embyPlaybackLogTrafficPeak.get(id) || 0;
     if (liveTotal > 0) {
         const nextPeak = Math.max(peak, liveTotal);
@@ -5549,6 +6109,14 @@ function applyEmbyPlaybackLogTrafficPeak(merged) {
         }
     }
     return merged;
+}
+
+function syncPlaybackRecordsSeekFromLive() {
+    if (!_lastPlaybackRecords.length) return;
+    _lastPlaybackRecords = _lastPlaybackRecords.map((rec) => {
+        if (rec?.status !== 'playing') return rec;
+        return mergeLiveSessionIntoPlaybackRecord(rec);
+    });
 }
 
 function mergeLiveSessionIntoPlaybackRecord(rec) {
@@ -5564,6 +6132,9 @@ function mergeLiveSessionIntoPlaybackRecord(rec) {
             'remote_endpoint', 'client_ip', 'is_remote', 'is_paused',
             'play_method', 'is_video_direct', 'is_audio_direct', 'transcode_kind',
             'runtime_seconds', 'position_seconds', 'bitrate',
+            'video_codec', 'audio_codec', 'container', 'width', 'height',
+            'video_bitrate', 'audio_bitrate', 'framerate', 'audio_channels',
+            'transcode_reasons', 'protocol',
         ];
         keys.forEach((key) => {
             if (!(key in liveSession)) return;
@@ -5590,8 +6161,16 @@ function mergeLiveSessionIntoPlaybackRecord(rec) {
         ['seek_count', 'seek_forward_count', 'seek_backward_count', 'played_seconds'].forEach((key) => {
             if (liveSession[key] == null) return;
             const val = parseInt(liveSession[key], 10);
-            if (!Number.isNaN(val) && val >= 0) merged[key] = val;
+            if (Number.isNaN(val) || val < 0) return;
+            const prev = parseInt(merged[key], 10);
+            merged[key] = Math.max(Number.isNaN(prev) ? 0 : prev, val);
         });
+        ['seek_forward_log', 'seek_backward_log'].forEach((key) => {
+            const picked = pickRicherEmbySeekLog(liveSession[key], merged[key]);
+            if (picked.length) merged[key] = picked;
+        });
+        const seekTimeline = pickRicherEmbySeekTimeline(liveSession.seek_log, merged.seek_log);
+        if (seekTimeline.length) merged.seek_log = seekTimeline;
         if (liveSession.playback_started_at) {
             merged.playback_started_at = liveSession.playback_started_at;
         }
@@ -5619,7 +6198,7 @@ function buildEmbyEventPlayingWatchTextLine(event) {
     const text = getEmbyPlayingWatchMetaText(runtime, startPos, currentPos);
     if (!text) return '';
 
-    return `<div class="event-watch-meta emby-log-play-watch" data-runtime="${runtime}"`
+    return `<div class="event-watch-meta emby-log-play-watch emby-log-watch-progress" data-runtime="${runtime}"`
         + ` data-position="${currentPos}" data-start-pos="${startPos}"`
         + ` data-paused="${event.is_paused ? '1' : '0'}" data-synced="${Date.now()}">`
         + `${escapeHtml(text)}</div>`;
@@ -5800,9 +6379,58 @@ const EMBY_LOG_STATE_LABEL = {
     stopped: '播放完毕',
 };
 
-function syncEmbyLogCardProgressStyle(card, progressPct) {
-    if (!card || progressPct == null) return;
-    card.style.setProperty('--emby-log-play-progress', `${progressPct.toFixed(2)}%`);
+function syncEmbyLogCardProgressStyle(card, range) {
+    if (!card || !range) return;
+    const startPct = Math.max(0, Math.min(100, Number(range.startPct) || 0));
+    const endPct = Math.max(startPct, Math.min(100, Number(range.endPct) || 0));
+    card.style.setProperty('--emby-log-play-progress-start', `${startPct.toFixed(2)}%`);
+    card.style.setProperty('--emby-log-play-progress-end', `${endPct.toFixed(2)}%`);
+}
+
+function resolvePlaybackRecordPositionRange(rec, options = {}) {
+    const { allowPaused = false, ended = false } = options;
+    if (!rec) return null;
+    const runtime = parseInt(rec.runtime_seconds, 10) || 0;
+    if (runtime <= 0) return null;
+
+    const startRaw = parseInt(rec.start_position_seconds, 10);
+    const start = Number.isNaN(startRaw) ? 0 : Math.max(0, startRaw);
+
+    let end = null;
+    if (rec.status === 'playing') {
+        if (rec.is_paused && !allowPaused) return null;
+        end = resolveEmbyContentPosition(rec);
+    } else if (ended) {
+        const endRaw = parseInt(rec.end_position_seconds, 10);
+        if (!Number.isNaN(endRaw) && endRaw >= 0) {
+            end = endRaw;
+        } else {
+            end = resolveEmbyContentPosition(rec);
+        }
+    } else {
+        return null;
+    }
+
+    if (end == null || end < 0) return null;
+
+    const rangeStart = Math.min(start, end);
+    const rangeEnd = Math.max(start, end);
+    const startPct = Math.min(
+        100,
+        parseFloat(formatEmbySessionPercent((rangeStart / runtime) * 100)),
+    );
+    const endPct = Math.min(
+        100,
+        Math.max(startPct, parseFloat(formatEmbySessionPercent((rangeEnd / runtime) * 100))),
+    );
+    return { startPct, endPct };
+}
+
+function buildPlaybackRecordProgressStyleAttr(range) {
+    if (!range) return '';
+    const startPct = Math.max(0, Math.min(100, Number(range.startPct) || 0));
+    const endPct = Math.max(startPct, Math.min(100, Number(range.endPct) || 0));
+    return ` style="--emby-log-play-progress-start: ${startPct.toFixed(2)}%; --emby-log-play-progress-end: ${endPct.toFixed(2)}%"`;
 }
 
 function resolvePlaybackRecordState(rec) {
@@ -5812,40 +6440,9 @@ function resolvePlaybackRecordState(rec) {
 }
 
 function getPlaybackRecordProgressPercent(rec, options = {}) {
-    const { allowPaused = false, ended = false } = options;
-    if (!rec) return null;
-    const runtime = parseInt(rec.runtime_seconds, 10) || 0;
-    if (runtime <= 0) return null;
-
-    if (rec.status === 'playing') {
-        if (rec.is_paused && !allowPaused) return null;
-        const pos = resolveEmbyContentPosition(rec);
-        if (pos != null && pos >= 0) {
-            return Math.min(100, parseFloat(formatEmbySessionPercent((pos / runtime) * 100)));
-        }
-        const pct = getEmbySessionProgressPercent(
-            rec.position_seconds,
-            rec.runtime_seconds,
-            rec.progress_percent,
-        );
-        if (pct == null || pct < 0) return null;
-        return Math.min(100, pct);
-    }
-
-    if (!ended) return null;
-    const pos = resolveEmbyContentPosition(rec);
-    if (pos != null && pos >= 0) {
-        return Math.min(100, parseFloat(formatEmbySessionPercent((pos / runtime) * 100)));
-    }
-    const played = parseInt(rec.played_seconds, 10) || 0;
-    const start = parseInt(rec.start_position_seconds, 10) || 0;
-    if (played > 0) {
-        return Math.min(
-            100,
-            parseFloat(formatEmbySessionPercent(((start + played) / runtime) * 100)),
-        );
-    }
-    return 0;
+    const range = resolvePlaybackRecordPositionRange(rec, options);
+    if (!range) return null;
+    return range.endPct;
 }
 
 function buildPlaybackRecordTimeRangeText(rec) {
@@ -5934,22 +6531,17 @@ function renderPlaybackRecordCard(rec) {
     const tagHtml = badges.filter(Boolean).join('');
     const tagsHtml = tagHtml ? `<div class="emby-log-card-tags">${tagHtml}</div>` : '';
 
-    const progressPct = (state === 'playing' || state === 'paused')
-        ? getPlaybackRecordProgressPercent(viewRec, { allowPaused: true })
+    const progressRange = (state === 'playing' || state === 'paused')
+        ? resolvePlaybackRecordPositionRange(viewRec, { allowPaused: true })
         : (state === 'stopped'
-            ? getPlaybackRecordProgressPercent(viewRec, { ended: true })
+            ? resolvePlaybackRecordPositionRange(viewRec, { ended: true })
             : null);
-    const progressAttr = progressPct != null
-        ? ` style="--emby-log-play-progress: ${progressPct.toFixed(2)}%"`
-        : '';
-    const progressFullClass = (
-        state === 'stopped' && isEmbyPlaybackWatchComplete(event)
-    ) ? ' emby-log-card--progress-full' : '';
+    const progressAttr = buildPlaybackRecordProgressStyleAttr(progressRange);
 
     const recordId = escapeHtml(String(viewRec.id || ''));
 
     return `
-        <div class="emby-log-card emby-log-card--${state}${progressFullClass}" data-record-id="${recordId}"${progressAttr}>
+        <div class="emby-log-card emby-log-card--${state}" data-record-id="${recordId}"${progressAttr}>
             <span class="emby-log-card-rail" aria-hidden="true"></span>
             <div class="emby-log-card-body">
                 <div class="emby-log-card-head">
@@ -6006,12 +6598,12 @@ function applyEmbyLogPlayingCardPatch(el, rec) {
     el.classList.remove('emby-log-card--playing', 'emby-log-card--paused', 'emby-log-card--stopped', 'emby-log-card--interrupt');
     el.classList.add(`emby-log-card--${state}`);
 
-    const progressPct = getPlaybackRecordProgressPercent(
+    const progressRange = resolvePlaybackRecordPositionRange(
         viewRec,
         { allowPaused: state === 'playing' || state === 'paused' },
     );
-    if (progressPct != null) {
-        el.style.setProperty('--emby-log-play-progress', `${progressPct.toFixed(2)}%`);
+    if (progressRange) {
+        syncEmbyLogCardProgressStyle(el, progressRange);
     }
 
     const statusText = el.querySelector('.emby-log-status-text');
@@ -6036,6 +6628,8 @@ function applyEmbyLogPlayingCardPatch(el, rec) {
             trafficEl.remove();
         }
     }
+
+    patchEmbyLogCardSeekBadge(el, event);
 
     const watchEl = el.querySelector('.emby-log-play-watch');
     if (watchEl) {
@@ -6111,6 +6705,7 @@ function syncEmbyPlaybackLogCardsFromLive() {
     const list = getEmbyPlaybackLogListEl();
     if (!list || !_lastPlaybackRecords.length) return;
     if (!list.querySelector('.emby-log-card')) return;
+    syncPlaybackRecordsSeekFromLive();
     const filtered = filterPlaybackRecordsByUser(_lastPlaybackRecords);
     const existingCards = [...list.querySelectorAll('.emby-log-card')];
     const canPatch = existingCards.length === filtered.length
@@ -6131,7 +6726,7 @@ function renderPlaybackRecords(records) {
     if (records !== undefined) {
         _lastPlaybackRecords = records || [];
         if (!isEmbyCombinedLogViewActive()) {
-            refreshEmbyEventPlaybackUsers(_lastPlaybackRecords);
+            void refreshEmbyEventPlaybackUsers(_lastPlaybackRecords);
         }
     }
     const filtered = filterPlaybackRecordsByUser(_lastPlaybackRecords);
@@ -6151,6 +6746,7 @@ function renderPlaybackRecords(records) {
         ));
 
     if (canPatch) {
+        syncPlaybackRecordsSeekFromLive();
         filtered.forEach((rec, index) => patchPlaybackRecordCard(existingCards[index], rec));
     } else {
         list.innerHTML = filtered.map(renderPlaybackRecordCard).join('');
@@ -6256,7 +6852,7 @@ function renderBrowseRecords(records) {
     if (records !== undefined) {
         _lastBrowseRecords = records || [];
         if (!isEmbyCombinedLogViewActive()) {
-            refreshEmbyEventPlaybackUsers(_lastBrowseRecords);
+            void refreshEmbyEventPlaybackUsers(_lastBrowseRecords);
         }
     }
     const filtered = filterBrowseRecordsByUser(_lastBrowseRecords);

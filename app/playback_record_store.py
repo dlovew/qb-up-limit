@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Set
 
 import emby_playback_upload_sync
 import emby_watch_progress
+from emby_watch_progress import _normalize_seek_log, _normalize_seek_timeline
 from emby_client import EmbyClient
 from emby_storage_paths import (
     EMBY_EVENTS_DIR,
@@ -298,6 +299,16 @@ def _apply_session_meta(record: dict, session: dict) -> None:
     for key in ('play_method', 'is_video_direct', 'is_audio_direct', 'transcode_kind'):
         if key in meta:
             record[key] = meta[key]
+    # 转码明细：留存到记录，播放完毕后卡片仍可悬停查看具体转码信息
+    for key in (
+        'video_codec', 'audio_codec', 'container', 'width', 'height',
+        'video_bitrate', 'audio_bitrate', 'framerate', 'audio_channels',
+        'transcode_reasons',
+    ):
+        val = prepared.get(key)
+        if val in (None, '', 0, []):
+            continue
+        record[key] = val
     if 'is_paused' in prepared:
         record['is_paused'] = bool(prepared.get('is_paused'))
     mode = str(
@@ -505,11 +516,19 @@ def enrich_sessions_playback_started_at(instance_name: str,
     by_track: Dict[tuple, dict] = {}
     for rec in playing:
         started = str(rec.get('started_at') or '').strip()
+        booked = max(0, int(rec.get('estimated_upload_bytes') or 0))
+        checkpoint = max(0, int(rec.get('live_upload_checkpoint_bytes') or 0))
         meta = {
             'playback_started_at': started,
             'seek_count': max(0, int(rec.get('seek_count') or 0)),
+            'seek_forward_count': max(0, int(rec.get('seek_forward_count') or 0)),
+            'seek_backward_count': max(0, int(rec.get('seek_backward_count') or 0)),
             'last_seek_at': str(rec.get('last_seek_at') or '').strip(),
             'played_seconds': max(0, int(rec.get('played_seconds') or 0)),
+            'estimated_upload_bytes_floor': max(booked, checkpoint),
+            'seek_forward_log': _normalize_seek_log(rec.get('seek_forward_log')),
+            'seek_backward_log': _normalize_seek_log(rec.get('seek_backward_log')),
+            'seek_log': _normalize_seek_timeline(rec.get('seek_log')),
         }
         sid = str(rec.get('emby_session_id') or '').strip()
         if sid:
@@ -528,12 +547,30 @@ def enrich_sessions_playback_started_at(instance_name: str,
         seek_count = int(meta.get('seek_count') or 0)
         if seek_count > 0:
             session['seek_count'] = seek_count
+        seek_forward_count = int(meta.get('seek_forward_count') or 0)
+        if seek_forward_count > 0:
+            session['seek_forward_count'] = seek_forward_count
+        seek_backward_count = int(meta.get('seek_backward_count') or 0)
+        if seek_backward_count > 0:
+            session['seek_backward_count'] = seek_backward_count
         last_seek_at = str(meta.get('last_seek_at') or '').strip()
         if last_seek_at:
             session['last_seek_at'] = last_seek_at
         played_seconds = int(meta.get('played_seconds') or 0)
         if played_seconds > 0:
             session['played_seconds'] = played_seconds
+        upload_floor = int(meta.get('estimated_upload_bytes_floor') or 0)
+        if upload_floor > 0:
+            session['estimated_upload_bytes_floor'] = upload_floor
+        forward_log = meta.get('seek_forward_log') or []
+        if forward_log:
+            session['seek_forward_log'] = forward_log
+        backward_log = meta.get('seek_backward_log') or []
+        if backward_log:
+            session['seek_backward_log'] = backward_log
+        timeline = meta.get('seek_log') or []
+        if timeline:
+            session['seek_log'] = timeline
         enriched.append(session)
     return enriched
 
@@ -568,9 +605,17 @@ def _emby_confirms_stop(session: dict) -> bool:
     """Emby /Sessions 明确报告已停止（非暂停、非播放中）。"""
     if not session:
         return False
-    if bool(session.get('is_paused')):
+    prepared = _prepare_session(session)
+    if bool(prepared.get('is_paused')):
         return False
-    return not bool(session.get('is_playing'))
+    if str(prepared.get('session_mode') or '').strip() == 'paused':
+        return False
+    if (
+        EmbyClient.session_has_now_playing_media(prepared)
+        and not bool(prepared.get('is_playing'))
+    ):
+        return False
+    return not bool(prepared.get('is_playing'))
 
 
 def _find_api_session_by_sid(sessions: list, record: dict) -> Optional[dict]:
@@ -804,6 +849,18 @@ def _handle_offline(instance_name: str, store: dict, now_mono: float) -> bool:
     return changed
 
 
+def _transfer_browse_on_item_change(instance_name: str, session: dict) -> None:
+    try:
+        import emby_playback_traffic
+        emby_playback_traffic.transfer_browse_bytes_to_play_for_session(
+            instance_name, session,
+        )
+    except Exception as e:
+        logger.debug(
+            f'[Playback:{instance_name}] 换集选片桶转播放失败: {e}',
+        )
+
+
 def tick_from_sessions(instance_name: str, sessions: list, *,
                        api_online: bool = True,
                        return_store: bool = False):
@@ -854,6 +911,7 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
                     )
                     changed = True
                     needs_immediate_save = True
+                    _transfer_browse_on_item_change(instance_name, prepared)
                     record = None
             if record is None:
                 record = _new_record(instance_name, store, prepared)
@@ -869,6 +927,7 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
                         instance_name, record, status='ended',
                         settle_reason='item_change',
                     )
+                    _transfer_browse_on_item_change(instance_name, prepared)
                     record = _new_record(instance_name, store, prepared)
                     store.setdefault('records', []).insert(0, record)
                     changed = True
@@ -903,6 +962,9 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
                     ):
                         record['live_upload_checkpoint_bytes'] = total_snapshot
                         changed = True
+                    emby_playback_traffic.touch_playback_upload_keys(
+                        instance_name, record,
+                    )
                 except Exception as e:
                     logger.debug(
                         f'[Playback:{instance_name}] 会话流量 checkpoint 同步失败: {e}',
@@ -987,6 +1049,31 @@ def delete_instance_records(instance_name: str) -> bool:
         except OSError as e:
             logger.warning(f'删除播放记录缓存失败 {path}: {e}')
             return False
+
+
+def delete_user_records(instance_name: str, user_name: str) -> int:
+    """从播放记录 JSON 中移除指定用户，返回删除条数。"""
+    inst = (instance_name or '').strip()
+    user = (user_name or '').strip()
+    if not inst or not user:
+        return 0
+    user_fold = user.casefold()
+    with _lock:
+        store = _load_store(inst)
+        records = list(store.get('records') or [])
+        kept = []
+        removed = 0
+        for rec in records:
+            name = str(rec.get('user_name') or '').strip()
+            if name and name.casefold() == user_fold:
+                removed += 1
+                continue
+            kept.append(rec)
+        if removed <= 0:
+            return 0
+        store['records'] = kept
+        _save_store(store, immediate=True)
+        return removed
 
 
 def rename_instance_records(old_name: str, new_name: str) -> None:

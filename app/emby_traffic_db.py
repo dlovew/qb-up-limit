@@ -2030,8 +2030,8 @@ def save_playback_upload_fact(instance_name: str, segment_id: int,
             conn.close()
 
 
-def list_playback_upload_users(instance_name: str) -> list:
-    """有外网播放或选片入库记录的用户名列表。"""
+def list_distinct_user_names(instance_name: str) -> list:
+    """实例下所有出现过流量/选片记录的用户名（去重排序）。"""
     name = (instance_name or '').strip()
     if not name:
         return []
@@ -2051,6 +2051,107 @@ def list_playback_upload_users(instance_name: str) -> list:
             return [row['user_name'] for row in c.fetchall() if row['user_name']]
         finally:
             conn.close()
+
+
+def collect_user_ids_for_name(instance_name: str, user_name: str) -> list:
+    """收集某用户名在本地库中出现过的 Emby user_id。"""
+    name = (instance_name or '').strip()
+    user = (user_name or '').strip()
+    if not name or not user:
+        return []
+    _ensure_emby_schema()
+    with _lock:
+        conn = get_conn()
+        try:
+            c = conn.cursor()
+            ids = set()
+            for table in ('emby_playback_upload_facts', 'emby_browse_upload_facts'):
+                c.execute(f'''
+                    SELECT DISTINCT user_id FROM {table}
+                    WHERE instance_name = ? AND user_name COLLATE NOCASE = ?
+                      AND user_id != ''
+                ''', (name, user))
+                for row in c.fetchall():
+                    uid = str(row['user_id'] or '').strip()
+                    if uid:
+                        ids.add(uid)
+            return sorted(ids)
+        finally:
+            conn.close()
+
+
+def _delete_user_persist_keys_unlocked(
+    c,
+    instance_name: str,
+    user_name: str,
+    user_ids: list,
+) -> None:
+    from emby_lucky_verdict import persist_key_belongs_to_user
+
+    name = (instance_name or '').strip()
+    user_fold = str(user_name or '').strip().casefold()
+    uid_set = {str(uid or '').strip() for uid in (user_ids or []) if str(uid or '').strip()}
+    if not name or not user_fold:
+        return
+    for table in (
+        'emby_session_upload_accumulators',
+        'emby_browse_upload_accumulators',
+        'emby_lucky_conn_bindings',
+    ):
+        c.execute(f'''
+            SELECT persist_key FROM {table}
+            WHERE instance_name = ?
+        ''', (name,))
+        keys = [
+            str(row['persist_key'] or '').strip()
+            for row in c.fetchall()
+            if persist_key_belongs_to_user(
+                str(row['persist_key'] or '').strip(), user_fold, uid_set,
+            )
+        ]
+        for key in keys:
+            c.execute(f'''
+                DELETE FROM {table}
+                WHERE instance_name = ? AND persist_key = ?
+            ''', (name, key))
+
+
+def delete_user_data(
+    instance_name: str,
+    user_name: str,
+    *,
+    user_ids: list = None,
+) -> None:
+    """删除某用户在本地库中的全部流量与持久化状态。"""
+    name = (instance_name or '').strip()
+    user = (user_name or '').strip()
+    if not name or not user:
+        return
+    ids = list(user_ids or collect_user_ids_for_name(name, user))
+    _ensure_emby_schema()
+    with _lock:
+        conn = get_conn()
+        try:
+            c = conn.cursor()
+            for table in (
+                'emby_playback_upload_facts',
+                'emby_playback_upload_hourly',
+                'emby_browse_upload_facts',
+                'emby_browse_upload_hourly',
+            ):
+                c.execute(f'''
+                    DELETE FROM {table}
+                    WHERE instance_name = ? AND user_name COLLATE NOCASE = ?
+                ''', (name, user))
+            _delete_user_persist_keys_unlocked(c, name, user, ids)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def list_playback_upload_users(instance_name: str) -> list:
+    """有外网播放或选片入库记录的用户名列表。"""
+    return list_distinct_user_names(instance_name)
 
 
 def list_browse_upload_records(

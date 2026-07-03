@@ -19,6 +19,7 @@ SEEK_COOLDOWN_SECONDS = 2.5
 STALL_GRACE_SECONDS = 8
 MAX_POLL_GAP_SECONDS = 15
 WATCH_COMPLETE_RATIO = 0.85
+MAX_SEEK_LOG_ENTRIES = 64
 
 WATCH_FIELD_KEYS = (
     'runtime_seconds',
@@ -30,11 +31,75 @@ WATCH_FIELD_KEYS = (
     'seek_count',
     'seek_forward_count',
     'seek_backward_count',
+    'seek_forward_log',
+    'seek_backward_log',
+    'seek_log',
     'last_seek_at',
 )
 
 _lock = threading.RLock()
 _trackers: Dict[str, Dict[str, 'SessionWatchState']] = {}
+
+
+def _normalize_seek_log(raw) -> list:
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            from_sec = item.get('from_seconds', item.get('from'))
+            to_sec = item.get('to_seconds', item.get('to'))
+            fr = max(0, int(from_sec))
+            to = max(0, int(to_sec))
+        except (TypeError, ValueError):
+            continue
+        result.append({'from_seconds': fr, 'to_seconds': to})
+    return result[:MAX_SEEK_LOG_ENTRIES]
+
+
+def _normalize_seek_timeline(raw) -> list:
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            from_sec = item.get('from_seconds', item.get('from'))
+            to_sec = item.get('to_seconds', item.get('to'))
+            fr = max(0, int(from_sec))
+            to = max(0, int(to_sec))
+        except (TypeError, ValueError):
+            continue
+        direction = str(item.get('direction') or '').strip().lower()
+        if direction not in ('forward', 'backward'):
+            direction = 'backward' if to < fr else 'forward'
+        result.append({
+            'direction': direction,
+            'from_seconds': fr,
+            'to_seconds': to,
+        })
+    return result[:MAX_SEEK_LOG_ENTRIES]
+
+
+def _rebuild_seek_timeline_from_legacy(forward_log, backward_log) -> list:
+    """旧记录仅有分方向日志时，按前跳后后跳拼接（无法还原真实交错顺序）。"""
+    timeline = []
+    for entry in _normalize_seek_log(forward_log):
+        timeline.append({
+            'direction': 'forward',
+            'from_seconds': entry['from_seconds'],
+            'to_seconds': entry['to_seconds'],
+        })
+    for entry in _normalize_seek_log(backward_log):
+        timeline.append({
+            'direction': 'backward',
+            'from_seconds': entry['from_seconds'],
+            'to_seconds': entry['to_seconds'],
+        })
+    return timeline[:MAX_SEEK_LOG_ENTRIES]
 
 
 class SessionWatchState:
@@ -43,6 +108,7 @@ class SessionWatchState:
         'last_position', 'last_monotonic', 'stall_seconds', 'start_locked',
         'first_position_seconds', 'start_position_seconds', 'end_position_seconds',
         'played_seconds', 'seek_count', 'seek_forward_count', 'seek_backward_count',
+        'seek_forward_log', 'seek_backward_log', 'seek_log',
         'last_seek_at', 'last_seek_mono', 'user_id', 'client', 'item_id', 'series_name',
         'item_title', 'episode_label', '_bound_media_id',
     )
@@ -62,6 +128,9 @@ class SessionWatchState:
         self.seek_count = 0
         self.seek_forward_count = 0
         self.seek_backward_count = 0
+        self.seek_forward_log = []
+        self.seek_backward_log = []
+        self.seek_log: list = []
         self.last_seek_at = ''
         self.last_seek_mono = None
         self.user_id = ''
@@ -98,6 +167,9 @@ class SessionWatchState:
         self.seek_count = 0
         self.seek_forward_count = 0
         self.seek_backward_count = 0
+        self.seek_forward_log = []
+        self.seek_backward_log = []
+        self.seek_log: list = []
         self.last_seek_at = ''
         self.last_seek_mono = None
 
@@ -156,6 +228,15 @@ class SessionWatchState:
             self.start_locked = True
             self.continuous_seconds = float(WATCH_LOCK_SECONDS)
 
+        self.seek_forward_log = _normalize_seek_log(record.get('seek_forward_log'))
+        self.seek_backward_log = _normalize_seek_log(record.get('seek_backward_log'))
+        timeline = _normalize_seek_timeline(record.get('seek_log'))
+        if timeline:
+            self.seek_log = timeline
+        elif self.seek_forward_log or self.seek_backward_log:
+            self.seek_log = _rebuild_seek_timeline_from_legacy(
+                self.seek_forward_log, self.seek_backward_log,
+            )
         for key in ('seek_count', 'seek_forward_count', 'seek_backward_count'):
             val = int(record.get(key) or 0)
             if val > 0:
@@ -187,6 +268,12 @@ class SessionWatchState:
             result['seek_backward_count'] = self.seek_backward_count
         if self.last_seek_at:
             result['last_seek_at'] = self.last_seek_at
+        if self.seek_forward_log:
+            result['seek_forward_log'] = list(self.seek_forward_log)
+        if self.seek_backward_log:
+            result['seek_backward_log'] = list(self.seek_backward_log)
+        if self.seek_log:
+            result['seek_log'] = list(self.seek_log)
         return result
 
     @staticmethod
@@ -195,10 +282,28 @@ class SessionWatchState:
 
     def _record_seek(self, last_pos: int, pos: int) -> None:
         self.seek_count += 1
-        if pos < last_pos:
+        fr = max(0, int(last_pos))
+        to = max(0, int(pos))
+        direction = 'backward' if pos < last_pos else 'forward'
+        entry = {
+            'direction': direction,
+            'from_seconds': fr,
+            'to_seconds': to,
+        }
+        self.seek_log.append(entry)
+        if len(self.seek_log) > MAX_SEEK_LOG_ENTRIES:
+            self.seek_log.pop(0)
+        plain = {'from_seconds': fr, 'to_seconds': to}
+        if direction == 'backward':
             self.seek_backward_count += 1
+            self.seek_backward_log.append(plain)
+            if len(self.seek_backward_log) > MAX_SEEK_LOG_ENTRIES:
+                self.seek_backward_log.pop(0)
         else:
             self.seek_forward_count += 1
+            self.seek_forward_log.append(plain)
+            if len(self.seek_forward_log) > MAX_SEEK_LOG_ENTRIES:
+                self.seek_forward_log.pop(0)
         self.last_seek_at = self._utc_now_iso()
         self.last_seek_mono = time.monotonic()
 
@@ -287,7 +392,8 @@ class SessionWatchState:
             self.start_locked = True
             self.start_position_seconds = int(self.segment_start_position or position)
 
-        self.played_seconds += int(elapsed * playback_rate)
+        # 浮点累加，避免每 tick int() 截断丢秒（1s 轮询下会系统性丢失约一半时长）。
+        self.played_seconds += elapsed * playback_rate
         self.last_position = position
 
 
@@ -524,6 +630,26 @@ def apply_watch_fields(event: dict, snapshot: dict, *, exact: bool = False) -> b
         event['last_seek_at'] = last_seek
         changed = True
 
+    for key in ('seek_forward_log', 'seek_backward_log'):
+        raw = snapshot.get(key)
+        if not isinstance(raw, list) or not raw:
+            continue
+        normalized = _normalize_seek_log(raw)
+        prev = _normalize_seek_log(event.get(key))
+        if exact or len(normalized) >= len(prev):
+            if normalized != prev:
+                event[key] = normalized
+                changed = True
+
+    raw_timeline = snapshot.get('seek_log')
+    if isinstance(raw_timeline, list) and raw_timeline:
+        normalized_tl = _normalize_seek_timeline(raw_timeline)
+        prev_tl = _normalize_seek_timeline(event.get('seek_log'))
+        if exact or len(normalized_tl) >= len(prev_tl):
+            if normalized_tl != prev_tl:
+                event['seek_log'] = normalized_tl
+                changed = True
+
     return changed
 
 
@@ -539,10 +665,16 @@ def merge_watch_snapshot(event: dict, snapshot: dict,
         for key in (
             'start_position_seconds', 'end_position_seconds', 'played_seconds',
             'seek_count', 'seek_forward_count', 'seek_backward_count',
+            'seek_forward_log', 'seek_backward_log', 'seek_log',
         ):
             value = snapshot.get(key)
             if value is None:
                 continue
-            event[key] = max(0, int(value))
+            if key == 'seek_log':
+                event[key] = _normalize_seek_timeline(value)
+            elif key in ('seek_forward_log', 'seek_backward_log'):
+                event[key] = _normalize_seek_log(value)
+            else:
+                event[key] = max(0, int(value))
     after = {k: event.get(k) for k in WATCH_FIELD_KEYS if k in event}
     return before != after

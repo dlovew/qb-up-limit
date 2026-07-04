@@ -964,16 +964,21 @@ def _emby_debug_traffic_config_payload(global_cfg: dict = None) -> dict:
     browse_min_mb = config_manager.clamp_emby_browse_upload_min_mb(
         cfg.get('emby_browse_upload_min_mb', 1.0),
     )
-    try:
-        episode_switch_gap = int(cfg.get('emby_episode_switch_gap_seconds', 3))
-    except (TypeError, ValueError):
-        episode_switch_gap = 3
+    preplay_burst_mbps = config_manager.clamp_emby_preplay_burst_mbps(
+        cfg.get('emby_preplay_burst_mbps', 1.5),
+    )
+    preplay_burst_window_seconds = (
+        config_manager.clamp_emby_preplay_burst_window_seconds(
+            cfg.get('emby_preplay_burst_window_seconds', 3),
+        )
+    )
     return {
         'new_session_window_seconds': max(1, min(30, new_window)),
         'seek_window_seconds': max(1, min(30, seek_window)),
         'priority_mode': mode,
         'mode_switch_grace_seconds': max(0, min(10, mode_switch_grace)),
-        'episode_switch_gap_seconds': max(1, min(10, episode_switch_gap)),
+        'preplay_burst_mbps': preplay_burst_mbps,
+        'preplay_burst_window_seconds': preplay_burst_window_seconds,
         'm3_wan_pool_scale': m3_scale,
         'browse_upload_min_mb': browse_min_mb,
         'browse_upload_min_bytes': config_manager.emby_browse_upload_min_bytes(
@@ -1097,9 +1102,13 @@ def api_emby_debug_traffic_config_update():
             merged_global['emby_m3_wan_pool_scale'] = data.get('m3_wan_pool_scale')
         if 'browse_upload_min_mb' in data:
             merged_global['emby_browse_upload_min_mb'] = data.get('browse_upload_min_mb')
-        if 'episode_switch_gap_seconds' in data:
-            merged_global['emby_episode_switch_gap_seconds'] = data.get(
-                'episode_switch_gap_seconds',
+        if 'preplay_burst_mbps' in data:
+            merged_global['emby_preplay_burst_mbps'] = data.get(
+                'preplay_burst_mbps',
+            )
+        if 'preplay_burst_window_seconds' in data:
+            merged_global['emby_preplay_burst_window_seconds'] = data.get(
+                'preplay_burst_window_seconds',
             )
 
         validated, full_config = config_manager.update_global(

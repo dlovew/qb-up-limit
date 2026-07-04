@@ -458,6 +458,33 @@ class EmbyClient:
         return []
 
     @staticmethod
+    def is_emby_abnormal_disconnect_session(session: dict) -> bool:
+        """Emby 仍挂 NowPlayingItem/TranscodingInfo，但客户端已异常断开。"""
+        if not isinstance(session, dict):
+            return False
+        play_state = session.get('PlayState') or {}
+        now_playing = session.get('NowPlayingItem') or {}
+        if not isinstance(now_playing, dict):
+            now_playing = {}
+        if bool(play_state.get('IsPaused')):
+            return False
+        if not (now_playing.get('Id') or now_playing.get('Name')):
+            return False
+        if 'IsPlaying' in play_state and bool(play_state.get('IsPlaying')):
+            return False
+        supports_remote = bool(session.get('SupportsRemoteControl'))
+        if 'IsPlaying' in play_state and not play_state.get('IsPlaying'):
+            # 长暂停空窗常 IsPlaying=false 但客户端仍在线；不可遥控则视为异常断开
+            return not supports_remote
+        if (
+            'IsPlaying' not in play_state
+            and session.get('TranscodingInfo')
+            and not supports_remote
+        ):
+            return True
+        return False
+
+    @staticmethod
     def _session_is_actively_playing(now_playing: dict, play_state: dict,
                                      transcoding: dict) -> bool:
         """Emby Web 外网停止后常保留 NowPlayingItem；需结合 PlayState/转码信息判定。"""
@@ -469,8 +496,7 @@ class EmbyClient:
             return True
         if 'IsPlaying' in play_state:
             return bool(play_state.get('IsPlaying'))
-        if transcoding:
-            return True
+        # IsPlaying 缺失时不凭 TranscodingInfo 推断在播；DirectStream 等仍可用 PlayMethod
         play_method = str(play_state.get('PlayMethod') or '').strip()
         return bool(play_method)
 
@@ -502,15 +528,13 @@ class EmbyClient:
             prepared = EmbyClient.normalize_session(session)
         else:
             prepared = session
+        if EmbyClient.is_emby_abnormal_disconnect_session(session):
+            return False
         if not EmbyClient.session_has_now_playing_media(prepared):
             return False
         if bool(prepared.get('is_paused')):
             return True
         if bool(prepared.get('is_playing')):
-            return True
-        if bool(prepared.get('transcoding')):
-            return True
-        if session.get('TranscodingInfo'):
             return True
         # Emby Web 长暂停空窗：NowPlayingItem 仍在而 IsPlaying/IsPaused 均为 false。
         if str(prepared.get('session_mode') or '').strip() == 'paused':
@@ -1242,13 +1266,18 @@ class EmbyClient:
         session_mode = EmbyClient._session_mode(
             now_playing, viewing, play_state, transcoding,
         )
+        is_abnormal_disconnect = EmbyClient.is_emby_abnormal_disconnect_session(session)
+        if is_abnormal_disconnect:
+            session_mode = 'stopped'
+        is_playing = False if is_abnormal_disconnect else EmbyClient._session_is_actively_playing(
+            now_playing, play_state, transcoding,
+        )
 
         return {
             'id': session.get('Id') or '',
             'session_mode': session_mode,
-            'is_playing': EmbyClient._session_is_actively_playing(
-                now_playing, play_state, transcoding,
-            ),
+            'is_abnormal_disconnect': is_abnormal_disconnect,
+            'is_playing': is_playing,
             'user_name': session.get('UserName') or '',
             'user_id': session.get('UserId') or '',
             'client': session.get('Client') or '',

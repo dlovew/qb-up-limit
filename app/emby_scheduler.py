@@ -1491,20 +1491,24 @@ class EmbyMonitor:
         except (TypeError, ValueError):
             mode_switch_grace = 2
         self.mode_switch_grace_seconds = max(0, min(10, mode_switch_grace))
-        try:
-            episode_switch_gap = int(
-                self.global_cfg.get('emby_episode_switch_gap_seconds', 3),
+        self.preplay_burst_mbps = config_manager.clamp_emby_preplay_burst_mbps(
+            self.global_cfg.get('emby_preplay_burst_mbps', 1.5),
+        )
+        self.preplay_burst_window_seconds = (
+            config_manager.clamp_emby_preplay_burst_window_seconds(
+                self.global_cfg.get('emby_preplay_burst_window_seconds', 3),
             )
-        except (TypeError, ValueError):
-            episode_switch_gap = 3
-        self.episode_switch_gap_seconds = max(1, min(10, episode_switch_gap))
+        )
         try:
-            import emby_continuous_playback
-            emby_continuous_playback.set_episode_switch_gap_max_seconds(
-                self.episode_switch_gap_seconds,
+            import emby_playback_traffic
+            emby_playback_traffic.set_browse_stream_burst_bps(
+                config_manager.emby_preplay_burst_bps(self.global_cfg),
+            )
+            emby_playback_traffic.set_browse_stream_burst_window_seconds(
+                self.preplay_burst_window_seconds,
             )
         except Exception as e:
-            logger.debug(f'连播切集空窗期配置同步失败: {e}')
+            logger.debug(f'推流突发识别阈值配置同步失败: {e}')
         self.m3_wan_pool_scale = config_manager.clamp_emby_m3_wan_pool_scale(
             self.global_cfg.get('emby_m3_wan_pool_scale', 1.0),
         )

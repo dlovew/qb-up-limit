@@ -41,7 +41,8 @@ DEFAULT_GLOBAL = {
     'emby_burst_seek_window_seconds': 6,
     'emby_burst_priority_mode': 'seek_first',
     'emby_mode_switch_grace_seconds': 2,
-    'emby_episode_switch_gap_seconds': 3,
+    'emby_preplay_burst_mbps': 1.5,
+    'emby_preplay_burst_window_seconds': 3,
     'emby_m3_wan_pool_scale': 1.0,
     'emby_browse_upload_min_mb': 1.0,
 }
@@ -50,6 +51,10 @@ EMBY_M3_WAN_POOL_SCALE_MIN = 0.5
 EMBY_M3_WAN_POOL_SCALE_MAX = 1.5
 EMBY_BROWSE_UPLOAD_MIN_MB_MIN = 0.0
 EMBY_BROWSE_UPLOAD_MIN_MB_MAX = 100.0
+EMBY_PREPLAY_BURST_MBPS_MIN = 0.5
+EMBY_PREPLAY_BURST_MBPS_MAX = 10.0
+EMBY_PREPLAY_BURST_WINDOW_SECONDS_MIN = 1
+EMBY_PREPLAY_BURST_WINDOW_SECONDS_MAX = 10
 
 REFRESH_INTERVAL_MIN = 1
 REFRESH_INTERVAL_MAX = 10
@@ -610,6 +615,55 @@ def emby_browse_upload_min_bytes(global_cfg: dict = None) -> int:
     return int(mb * 1024 * 1024)
 
 
+def clamp_emby_preplay_burst_mbps(value, *, strict: bool = False) -> float:
+    """推流突发识别阈值（MB/s）：会话尚未 playing 时上传速率超过该值即判为开播缓冲。"""
+    try:
+        mbps = float(value)
+    except (TypeError, ValueError):
+        mbps = float(DEFAULT_GLOBAL['emby_preplay_burst_mbps'])
+    if strict:
+        if mbps < EMBY_PREPLAY_BURST_MBPS_MIN or mbps > EMBY_PREPLAY_BURST_MBPS_MAX:
+            raise ValueError(
+                f'推流突发识别阈值须在 {EMBY_PREPLAY_BURST_MBPS_MIN}～'
+                f'{EMBY_PREPLAY_BURST_MBPS_MAX} MB/s 之间',
+            )
+        return round(mbps, 2)
+    mbps = max(
+        EMBY_PREPLAY_BURST_MBPS_MIN,
+        min(EMBY_PREPLAY_BURST_MBPS_MAX, mbps),
+    )
+    return round(mbps, 2)
+
+
+def emby_preplay_burst_bps(global_cfg: dict = None) -> int:
+    """推流突发识别阈值换算为字节/秒（MB 按十进制 1,000,000，与历史默认 1.5MB/s 一致）。"""
+    cfg = global_cfg if isinstance(global_cfg, dict) else DEFAULT_GLOBAL
+    mbps = clamp_emby_preplay_burst_mbps(
+        cfg.get('emby_preplay_burst_mbps', DEFAULT_GLOBAL['emby_preplay_burst_mbps']),
+    )
+    return int(mbps * 1_000_000)
+
+
+def clamp_emby_preplay_burst_window_seconds(value, *, strict: bool = False) -> int:
+    """开播前突发窗口（秒）：开播瞬间往前回溯该秒数，窗口内的推流突发归为播放。"""
+    try:
+        seconds = int(round(float(value)))
+    except (TypeError, ValueError):
+        seconds = int(DEFAULT_GLOBAL['emby_preplay_burst_window_seconds'])
+    if strict:
+        if (seconds < EMBY_PREPLAY_BURST_WINDOW_SECONDS_MIN
+                or seconds > EMBY_PREPLAY_BURST_WINDOW_SECONDS_MAX):
+            raise ValueError(
+                f'开播前突发窗口须在 {EMBY_PREPLAY_BURST_WINDOW_SECONDS_MIN}～'
+                f'{EMBY_PREPLAY_BURST_WINDOW_SECONDS_MAX} 秒之间',
+            )
+        return seconds
+    return max(
+        EMBY_PREPLAY_BURST_WINDOW_SECONDS_MIN,
+        min(EMBY_PREPLAY_BURST_WINDOW_SECONDS_MAX, seconds),
+    )
+
+
 def _safe_int(value, default: int) -> int:
     try:
         return int(value)
@@ -703,16 +757,17 @@ def _validate_global(global_cfg: dict, strict: bool = False,
     else:
         mode_switch_grace = max(0, min(10, mode_switch_grace))
     result['emby_mode_switch_grace_seconds'] = mode_switch_grace
-    episode_switch_gap = _safe_int(
-        result.get('emby_episode_switch_gap_seconds'),
-        DEFAULT_GLOBAL['emby_episode_switch_gap_seconds'],
+    result['emby_preplay_burst_mbps'] = clamp_emby_preplay_burst_mbps(
+        result.get('emby_preplay_burst_mbps', DEFAULT_GLOBAL['emby_preplay_burst_mbps']),
+        strict=strict,
     )
-    if strict:
-        if episode_switch_gap < 1 or episode_switch_gap > 10:
-            raise ValueError('连播切集空窗期须在 1～10 秒之间')
-    else:
-        episode_switch_gap = max(1, min(10, episode_switch_gap))
-    result['emby_episode_switch_gap_seconds'] = episode_switch_gap
+    result['emby_preplay_burst_window_seconds'] = clamp_emby_preplay_burst_window_seconds(
+        result.get(
+            'emby_preplay_burst_window_seconds',
+            DEFAULT_GLOBAL['emby_preplay_burst_window_seconds'],
+        ),
+        strict=strict,
+    )
     result['emby_m3_wan_pool_scale'] = clamp_emby_m3_wan_pool_scale(
         result.get('emby_m3_wan_pool_scale', DEFAULT_GLOBAL['emby_m3_wan_pool_scale']),
         strict=strict,

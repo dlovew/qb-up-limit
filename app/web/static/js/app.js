@@ -7408,6 +7408,7 @@ const SYSLOG_MESSAGE_REPLACEMENTS = [
     [/reason=timeout_offline/g, '原因=超时离线'],
     [/reason=instance_reset/g, '原因=实例重置'],
     [/reason=emby_confirmed_stop/g, '原因=Emby 确认停止'],
+    [/reason=emby_abnormal_disconnect/g, '原因=Emby侧异常断开'],
     [/reason=grace_expired/g, '原因=宽限期结束'],
     [/reason=item_change/g, '原因=切换条目'],
     [/\[Playback:/g, '[播放:'],

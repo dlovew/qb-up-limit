@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 MAX_STORED_RECORDS = 500
 OFFLINE_TIMEOUT_SECONDS = 5 * 60
 STOP_GRACE_SECONDS = 5
+# 暂停抖动去重：卡片消失即时结案后，若会话卡片抖动回来（Emby web 暂停会
+# paused⇄connected），且位置仍停在刚结案的那个点（未推进），视为同一暂停段，
+# 不再新建重复播放段，从根源避免大量极小流量的重复停止卡片。
+FLAP_POSITION_TOLERANCE_SECONDS = 3
 _SAVE_DEBOUNCE_SECONDS = 2.0
 
 _lock = threading.RLock()
@@ -434,12 +438,44 @@ def _finalize_record(instance_name: str, record: dict, *,
     _clear_pending_stop(bucket, record)
     if record.get('emby_session_id'):
         bucket.pop(f'sid:{record["emby_session_id"]}', None)
-    if reason in ('emby_confirmed_stop', 'grace_expired', 'item_change'):
+    if reason in ('emby_confirmed_stop', 'emby_abnormal_disconnect', 'grace_expired', 'item_change'):
         logger.info(
             f'[Playback:{instance_name}] 播放段结案 rid={record.get("id")} '
             f'sid={record.get("emby_session_id") or "?"} reason={reason}',
         )
     record.pop('live_upload_checkpoint_bytes', None)
+
+
+def _should_suppress_flap_record(store: dict, session: dict) -> bool:
+    """暂停抖动去重：暂停会话卡片抖动回来、位置仍停在刚结案位置时，不重复建段。
+
+    仅当会话处于暂停态、且存在同一 emby_session_id + 同一 item、结案位置与当前
+    暂停位置基本一致（未推进）的已结束记录时才抑制。用户真正恢复播放时会话为
+    playing（不抑制），故不影响续播/重播建段。
+    """
+    if not bool(session.get('is_paused')):
+        return False
+    sid = str(session.get('id') or '').strip()
+    item_id = str(session.get('item_id') or '').strip()
+    if not sid or not item_id:
+        return False
+    pos = session.get('position_seconds')
+    if pos is None:
+        return False
+    pos = int(pos)
+    for rec in store.get('records') or []:
+        if rec.get('status') == 'playing':
+            continue
+        if str(rec.get('emby_session_id') or '').strip() != sid:
+            continue
+        if str(rec.get('item_id') or '').strip() != item_id:
+            continue
+        end_pos = rec.get('end_position_seconds')
+        if end_pos is None:
+            continue
+        if abs(pos - int(end_pos)) <= FLAP_POSITION_TOLERANCE_SECONDS:
+            return True
+    return False
 
 
 def _new_record(instance_name: str, store: dict, session: dict) -> dict:
@@ -605,6 +641,9 @@ def _emby_confirms_stop(session: dict) -> bool:
     """Emby /Sessions 明确报告已停止（非暂停、非播放中）。"""
     if not session:
         return False
+    raw = session if (session.get('NowPlayingItem') or session.get('PlayState')) else session
+    if EmbyClient.is_emby_abnormal_disconnect_session(raw):
+        return True
     prepared = _prepare_session(session)
     if bool(prepared.get('is_paused')):
         return False
@@ -616,6 +655,20 @@ def _emby_confirms_stop(session: dict) -> bool:
     ):
         return False
     return not bool(prepared.get('is_playing'))
+
+
+def _finalize_emby_confirmed_stop(
+    instance_name: str,
+    record: dict,
+    session: dict,
+) -> None:
+    raw = session if (session.get('NowPlayingItem') or session.get('PlayState')) else session
+    reason = (
+        'emby_abnormal_disconnect'
+        if EmbyClient.is_emby_abnormal_disconnect_session(raw)
+        else 'emby_confirmed_stop'
+    )
+    _finalize_record(instance_name, record, status='ended', settle_reason=reason)
 
 
 def _find_api_session_by_sid(sessions: list, record: dict) -> Optional[dict]:
@@ -647,8 +700,9 @@ def _handle_stale_open_record(
     sessions: list,
     now_mono: float,
 ) -> str:
-    """open 段本轮未在活跃列表：Emby 确认停止则立即结案，否则 5 秒宽限后结案。"""
+    """open 段本轮不在「当前播放会话」列表：卡片仍在则保持，卡片消失即时结案，会话消失 5s 宽限。"""
     matched = _find_api_session_for_record(sessions, record)
+    # 卡片仍在（会话仍是「当前播放会话」，含暂停态）：保持 open，跟随 Emby。
     if matched is not None:
         if _session_keeps_open_playback_record(matched):
             _clear_pending_stop(bucket, record)
@@ -656,10 +710,7 @@ def _handle_stale_open_record(
             return 'updated'
         if _emby_confirms_stop(matched):
             _clear_pending_stop(bucket, record)
-            _finalize_record(
-                instance_name, record, status='ended',
-                settle_reason='emby_confirmed_stop',
-            )
+            _finalize_emby_confirmed_stop(instance_name, record, matched)
             return 'finalized'
 
     api_session = _find_api_session_by_sid(sessions, record)
@@ -671,13 +722,12 @@ def _handle_stale_open_record(
                 return 'updated'
             return 'unchanged'
         if _emby_confirms_stop(api_session):
+            # 卡片消失（会话跌为 connected）：即时结案，跟随卡片状态。
             _clear_pending_stop(bucket, record)
-            _finalize_record(
-                instance_name, record, status='ended',
-                settle_reason='emby_confirmed_stop',
-            )
+            _finalize_emby_confirmed_stop(instance_name, record, api_session)
             return 'finalized'
 
+    # 会话已从 /Sessions 消失：5 秒宽限确认（容忍单次轮询丢失），随后结案。
     pending = _pending_stop_map(bucket)
     rid = int(record.get('id') or 0)
     if rid <= 0:
@@ -914,6 +964,9 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
                     _transfer_browse_on_item_change(instance_name, prepared)
                     record = None
             if record is None:
+                if _should_suppress_flap_record(store, prepared):
+                    # 暂停抖动：卡片消失已结案、位置未推进，跳过重复建段。
+                    continue
                 record = _new_record(instance_name, store, prepared)
                 store.setdefault('records', []).insert(0, record)
                 changed = True

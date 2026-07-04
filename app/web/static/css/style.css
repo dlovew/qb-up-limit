@@ -1987,29 +1987,44 @@ html:not(.emby-feature-enabled) .chart-control--device-type {
 .emby-debug-lucky-params {
     flex-shrink: 0;
     margin: 0;
-    padding: 10px 12px 0;
+    padding: 6px 10px 0;
     border-top: 1px solid rgba(148, 163, 184, 0.18);
+    gap: 4px;
 }
 
 .emby-debug-lucky-params .emby-debug-section-title {
-    margin-bottom: 8px;
+    margin-bottom: 0;
+    font-size: 11px;
 }
 
 .emby-debug-config-grid--lucky {
     grid-template-columns: minmax(0, 1fr);
-    gap: 8px;
-    margin-bottom: 8px;
+    gap: 5px;
+    margin-bottom: 4px;
+}
+
+.emby-debug-preplay-burst-hint {
+    margin: 0;
+    padding: 4px 7px;
+    border-radius: 5px;
+    background: #f8fafc;
+    font-size: 10.5px;
+    line-height: 1.35;
+    color: #64748b;
 }
 
 .emby-debug-config-grid--lucky .emby-debug-config-field {
     justify-content: flex-start;
-    gap: 10px;
+    gap: 8px;
+    padding: 4px 8px;
+    border-radius: 7px;
 }
 
 .emby-debug-config-grid--lucky .emby-debug-config-field-label {
     flex: 0 0 auto;
     width: auto;
     white-space: nowrap;
+    font-size: 11.5px;
 }
 
 .emby-debug-config-grid--lucky .emby-debug-config-field input {
@@ -2017,6 +2032,10 @@ html:not(.emby-feature-enabled) .chart-control--device-type {
     width: auto;
     min-width: 0;
     max-width: none;
+    height: 30px;
+    padding: 2px 8px;
+    font-size: 12px;
+    border-radius: 6px;
 }
 
 .emby-debug-lucky-conn-section {
@@ -7403,6 +7422,10 @@ body.chart-fullscreen-active.chart-fullscreen-active--pie .chart-fullscreen-cont
 
 .emby-event-badge--watch-meta {
     color: var(--text-secondary);
+}
+
+.emby-event-badge--emby-abnormal-disconnect {
+    color: var(--warning-color, #d97706);
 }
 
 .event-item[class*="emby-playback"] .event-playback-tags {

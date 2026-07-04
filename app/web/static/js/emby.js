@@ -30,9 +30,12 @@ const EMBY_M3_WAN_POOL_SCALE_MAX = 1.5;
 const EMBY_BROWSE_UPLOAD_MIN_MB_DEFAULT = 1.0;
 const EMBY_BROWSE_UPLOAD_MIN_MB_MIN = 0;
 const EMBY_BROWSE_UPLOAD_MIN_MB_MAX = 100;
-const EMBY_EPISODE_SWITCH_GAP_DEFAULT = 3;
-const EMBY_EPISODE_SWITCH_GAP_MIN = 1;
-const EMBY_EPISODE_SWITCH_GAP_MAX = 10;
+const EMBY_PREPLAY_BURST_MBPS_DEFAULT = 1.5;
+const EMBY_PREPLAY_BURST_MBPS_MIN = 0.5;
+const EMBY_PREPLAY_BURST_MBPS_MAX = 10;
+const EMBY_PREPLAY_BURST_WINDOW_DEFAULT = 3;
+const EMBY_PREPLAY_BURST_WINDOW_MIN = 1;
+const EMBY_PREPLAY_BURST_WINDOW_MAX = 10;
 const EMBY_DEBUG_WINDOW_POS_KEY_PREFIX = 'qb-up-limit-emby-debug-window-pos-';
 const EMBY_DEBUG_LUCKY_DEFAULT_VIEWPORT_RATIO = 0.62;
 const EMBY_DEBUG_LUCKY_CONN_MIN = 160;
@@ -145,25 +148,35 @@ function normalizeEmbyDebugTrafficConfig(raw = null) {
     const browseMinMbRaw = parseFloat(
         src.browse_upload_min_mb ?? src.emby_browse_upload_min_mb,
     );
-    const episodeSwitchGapRaw = parseInt(
-        src.episode_switch_gap_seconds ?? src.emby_episode_switch_gap_seconds,
+    const preplayBurstMbpsRaw = parseFloat(
+        src.preplay_burst_mbps ?? src.emby_preplay_burst_mbps,
+    );
+    const preplayBurstWindowRaw = parseInt(
+        src.preplay_burst_window_seconds ?? src.emby_preplay_burst_window_seconds,
         10,
     );
     const m3Scale = Number.isFinite(m3ScaleRaw) ? m3ScaleRaw : EMBY_M3_WAN_POOL_SCALE_DEFAULT;
     const browseMinMb = Number.isFinite(browseMinMbRaw)
         ? browseMinMbRaw
         : EMBY_BROWSE_UPLOAD_MIN_MB_DEFAULT;
-    const episodeSwitchGap = Number.isFinite(episodeSwitchGapRaw)
-        ? episodeSwitchGapRaw
-        : EMBY_EPISODE_SWITCH_GAP_DEFAULT;
+    const preplayBurstMbps = Number.isFinite(preplayBurstMbpsRaw)
+        ? preplayBurstMbpsRaw
+        : EMBY_PREPLAY_BURST_MBPS_DEFAULT;
+    const preplayBurstWindow = Number.isFinite(preplayBurstWindowRaw)
+        ? preplayBurstWindowRaw
+        : EMBY_PREPLAY_BURST_WINDOW_DEFAULT;
     return {
         new_session_window_seconds: Math.max(1, Math.min(30, newWindow)),
         seek_window_seconds: Math.max(1, Math.min(30, seekWindow)),
         priority_mode: priorityRaw === 'new_first' ? 'new_first' : EMBY_DEBUG_PRIORITY_DEFAULT,
         mode_switch_grace_seconds: Math.max(0, Math.min(10, modeSwitchGrace)),
-        episode_switch_gap_seconds: Math.max(
-            EMBY_EPISODE_SWITCH_GAP_MIN,
-            Math.min(EMBY_EPISODE_SWITCH_GAP_MAX, episodeSwitchGap),
+        preplay_burst_mbps: Math.max(
+            EMBY_PREPLAY_BURST_MBPS_MIN,
+            Math.min(EMBY_PREPLAY_BURST_MBPS_MAX, Math.round(preplayBurstMbps * 100) / 100),
+        ),
+        preplay_burst_window_seconds: Math.max(
+            EMBY_PREPLAY_BURST_WINDOW_MIN,
+            Math.min(EMBY_PREPLAY_BURST_WINDOW_MAX, Math.round(preplayBurstWindow)),
         ),
         m3_wan_pool_scale: Math.max(
             EMBY_M3_WAN_POOL_SCALE_MIN,
@@ -183,6 +196,60 @@ function getEmbyBrowseUploadMinMb(raw = null) {
 function getEmbyBrowseUploadMinBytes(raw = null) {
     const mb = getEmbyBrowseUploadMinMb(raw);
     return Math.round(mb * 1024 * 1024);
+}
+
+function buildPreplayBurstSummaryHintText(windowSeconds, thresholdMbps) {
+    const windowVal = Number.isFinite(windowSeconds) && windowSeconds > 0
+        ? Math.round(windowSeconds)
+        : EMBY_PREPLAY_BURST_WINDOW_DEFAULT;
+    const thresholdVal = Number.isFinite(thresholdMbps) && thresholdMbps > 0
+        ? thresholdMbps
+        : EMBY_PREPLAY_BURST_MBPS_DEFAULT;
+    const thresholdText = Number.isInteger(thresholdVal)
+        ? String(thresholdVal)
+        : String(Math.round(thresholdVal * 100) / 100);
+    return `当前开播突发判定：点击开播后，前 ${windowVal} 秒内、速率 ≥ ${thresholdText} MB/s 的流量视为推流突发，计入播放。`;
+}
+
+function syncPreplayBurstSummaryHint(panel) {
+    if (!panel) return;
+    const hintEl = panel.querySelector('[data-field="preplay-burst-summary-hint"]');
+    if (!hintEl) return;
+    const windowSeconds = parseInt(
+        panel.querySelector('[data-field="preplay-burst-window"]')?.value,
+        10,
+    );
+    const thresholdMbps = parseFloat(
+        panel.querySelector('[data-field="preplay-burst-mbps"]')?.value,
+    );
+    hintEl.textContent = buildPreplayBurstSummaryHintText(windowSeconds, thresholdMbps);
+}
+
+function bindPreplayBurstConfigInputs() {
+    if (window.__embyPreplayBurstInputBound) return;
+    window.__embyPreplayBurstInputBound = true;
+    document.addEventListener('input', (e) => {
+        const field = e.target?.dataset?.field;
+        if (field !== 'preplay-burst-window' && field !== 'preplay-burst-mbps') return;
+        syncPreplayBurstSummaryHint(e.target.closest('.emby-debug-float-window'));
+    });
+}
+
+function buildLuckyConnDebugMetaHtml(row, options = {}) {
+    const parts = [
+        `建连 ${escapeHtml(row.acceptTime || '—')}`,
+        `+${escapeHtml(formatEmbyTrafficText(row.deltaOut))}`,
+        `总累计 ${escapeHtml(formatEmbyTrafficText(row.trafficOut))}`,
+    ];
+    if (Number.isFinite(row.timeMatchSeconds) && row.timeMatchSeconds >= 0) {
+        parts.push(`时差 ${row.timeMatchSeconds}s`);
+    }
+    if (row.billingState === 'credited' && row.accumulatorBytes > 0) {
+        parts.push(`播放累计 ${escapeHtml(formatEmbyTrafficText(row.accumulatorBytes))}`);
+    } else if (row.billingState === 'browse_credited' && row.accumulatorBytes > 0) {
+        parts.push(`选片累计 ${escapeHtml(formatEmbyTrafficText(row.accumulatorBytes))}`);
+    }
+    return parts.join(' · ');
 }
 
 function formatEmbyBrowseUploadMinMbLabel(mb = null) {
@@ -311,6 +378,18 @@ function normalizeLuckyConnVerdictRow(row) {
     };
     const billingState = String(row?.billing_state || '').trim()
         || (row?.persist_key ? 'credited' : 'excluded');
+    const accumulatorBytes = parseBytes(row?.accumulator_bytes);
+    // 选片流量的入账/不入账实时按「选片入账阈值」点亮，仅作展示（真正入账以结算为准）。
+    let billingLabel = String(row?.billing_label || '').trim();
+    let billingDisplayState = billingState;
+    if (billingState === 'browse_credited') {
+        const thresholdBytes = getEmbyBrowseUploadMinMb() * 1024 * 1024;
+        const lit = accumulatorBytes >= thresholdBytes;
+        billingLabel = lit ? '选片入账' : '不入账';
+        billingDisplayState = lit ? 'browse_credited' : 'browse_pending';
+    } else if (!billingLabel) {
+        billingLabel = billingState === 'credited' ? '已入账' : '不入账';
+    }
     return {
         remoteAddr: String(row?.remote_addr || '').trim(),
         ip: String(row?.ip || '').trim(),
@@ -324,16 +403,15 @@ function normalizeLuckyConnVerdictRow(row) {
         embyUser: String(row?.emby_user || row?.user_name || '').trim(),
         embyMode: String(row?.emby_mode || '').trim(),
         billingState,
-        billingLabel: String(row?.billing_label || '').trim()
-            || (billingState === 'credited' ? '已入账'
-                : (billingState === 'browse_credited' ? '选片入账' : '不入账')),
+        billingDisplayState,
+        billingLabel,
         confidence: String(row?.confidence || '').trim(),
         confidenceLabel: String(row?.confidence_label || '').trim() || '—',
         reasons: Array.isArray(row?.reasons)
             ? row.reasons.map((r) => String(r || '').trim()).filter(Boolean)
             : [],
         persistKey: String(row?.billing_persist_key || row?.persist_key || '').trim(),
-        accumulatorBytes: parseBytes(row?.accumulator_bytes),
+        accumulatorBytes,
         timeMatchSeconds: row?.time_match_seconds,
         waveId: parseInt(row?.wave_id, 10) || 0,
         matchScore: Number.isFinite(row?.match_score) ? parseInt(row.match_score, 10) : null,
@@ -403,6 +481,7 @@ function luckyBillingClass(state) {
     const map = {
         credited: 'emby-debug-lucky-billing--credited',
         browse_credited: 'emby-debug-lucky-billing--browse',
+        browse_pending: 'emby-debug-lucky-billing--excluded',
         pending: 'emby-debug-lucky-billing--pending',
         orphan: 'emby-debug-lucky-billing--orphan',
     };
@@ -475,7 +554,7 @@ function buildLuckyMatchScoreTipText(row) {
 
 function buildLuckyConnDebugRowHtml(row, options = {}) {
     const roleClass = luckyConnRoleClass(row.connRole);
-    const billingClass = luckyBillingClass(row.billingState);
+    const billingClass = luckyBillingClass(row.billingDisplayState || row.billingState);
     const confClass = luckyConfidenceClass(row.confidence);
     const scoreTipText = buildLuckyMatchScoreTipText(row);
     const scoreTipAttr = scoreTipText ? ` data-tip="${escapeHtml(scoreTipText)}"` : '';
@@ -502,17 +581,7 @@ function buildLuckyConnDebugRowHtml(row, options = {}) {
     const confidenceTipAttr = !Number.isFinite(row.matchScore) && scoreTipText
         ? ` data-tip="${escapeHtml(scoreTipText)}"`
         : '';
-    const metaParts = [
-        `建连 ${escapeHtml(row.acceptTime || '—')}`,
-        `+${escapeHtml(formatEmbyTrafficText(row.deltaOut))}`,
-        `累计 ${escapeHtml(formatEmbyTrafficText(row.trafficOut))}`,
-    ];
-    if (Number.isFinite(row.timeMatchSeconds) && row.timeMatchSeconds >= 0) {
-        metaParts.push(`时差 ${row.timeMatchSeconds}s`);
-    }
-    if (row.billingState === 'credited' && row.accumulatorBytes > 0) {
-        metaParts.push(`段累计 ${escapeHtml(formatEmbyTrafficText(row.accumulatorBytes))}`);
-    }
+    const metaHtml = buildLuckyConnDebugMetaHtml(row, options);
     const ipRevealed = !!options.ipRevealed;
     const addrText = formatLuckyDebugIpText(row.ip, { port: row.port, revealed: ipRevealed });
     const addrTitle = luckyDebugIpTitleAttr(row.ip, row.remoteAddr, ipRevealed);
@@ -532,7 +601,7 @@ function buildLuckyConnDebugRowHtml(row, options = {}) {
             </div>
             <div class="emby-debug-lucky-verdict-line emby-debug-lucky-verdict-line--sub">
                 <span class="emby-debug-lucky-verdict-emby"${embyLabelTitle ? ` title="${embyLabelTitle}"` : ''}>${escapeHtml(row.embyLabel)}</span>
-                <span class="emby-debug-lucky-conn-meta">${metaParts.join(' · ')}</span>
+                <span class="emby-debug-lucky-conn-meta">${metaHtml}</span>
             </div>
         </div>`;
 }
@@ -632,7 +701,7 @@ function patchLuckyConnDebugRowElement(rowEl, row, options = {}) {
 
     const billingEl = rowEl.querySelector('.emby-debug-lucky-billing');
     if (billingEl) {
-        billingEl.className = `emby-debug-lucky-billing ${luckyBillingClass(row.billingState)}`;
+        billingEl.className = `emby-debug-lucky-billing ${luckyBillingClass(row.billingDisplayState || row.billingState)}`;
         billingEl.textContent = row.billingLabel || '—';
     }
 
@@ -692,19 +761,9 @@ function patchLuckyConnDebugRowElement(rowEl, row, options = {}) {
         }
     }
 
-    const metaParts = [
-        `建连 ${row.acceptTime || '—'}`,
-        `+${formatEmbyTrafficText(row.deltaOut)}`,
-        `累计 ${formatEmbyTrafficText(row.trafficOut)}`,
-    ];
-    if (Number.isFinite(row.timeMatchSeconds) && row.timeMatchSeconds >= 0) {
-        metaParts.push(`时差 ${row.timeMatchSeconds}s`);
-    }
-    if (row.billingState === 'credited' && row.accumulatorBytes > 0) {
-        metaParts.push(`段累计 ${formatEmbyTrafficText(row.accumulatorBytes)}`);
-    }
+    const metaHtml = buildLuckyConnDebugMetaHtml(row, options);
     const metaEl = rowEl.querySelector('.emby-debug-lucky-conn-meta');
-    if (metaEl) metaEl.textContent = metaParts.join(' · ');
+    if (metaEl) metaEl.innerHTML = metaHtml;
 }
 
 function tryPatchLuckyConnDebugGroups(connGroupsEl, snapshot, options = {}) {
@@ -770,6 +829,8 @@ function updateLuckyConnDebugGroupsDom(connGroupsEl, snapshot, options = {}) {
         firstOpen: !hadGroups,
         allOpen: false,
         ipRevealed,
+        instanceName: options.instanceName,
+        tickSeconds: options.tickSeconds,
     });
     if (hadGroups) {
         connGroupsEl.querySelectorAll('.emby-debug-lucky-ip-group').forEach((el) => {
@@ -2737,7 +2798,12 @@ function buildEmbyDebugWindowBodyHtml(inst, options = {}) {
     const modeSwitchGraceTip = `模式切换时若会话接口晚于 Docker 流量更新，可在这段时间（秒）内暂缓把上传计入程序余量，待会话确认再回放到目标模式，建议与页面刷新间隔 [[${modeSwitchRefreshSeconds}]] 秒一致，范围 0-10 秒。`;
     const m3WanPoolScaleTip = `仅 M3（局域网+外网）生效：对码率权重切出的 WAN 池乘以该系数。分摊权重已按各会话 transcode_kind 与音视频分量码率自动计算（直串流/音视频转码/仅音频转码等组合无需逐个调参）。1.0 为默认；若 Emby 上报码率与路由仍有系统性偏差，可用 1.05～1.10 或 0.90～0.95 做全局微调（长时间播放可能漂移）。M2 不受影响。范围 ${EMBY_M3_WAN_POOL_SCALE_MIN}～${EMBY_M3_WAN_POOL_SCALE_MAX}。`;
     const browseUploadMinMbTip = '选片时产生的上传流量累计超过此值，才会记入选片记录和统计。设为 0 表示只要有上传就记录；用户已缓存、几乎不产生上传的浏览本身就不算。默认值1，范围 0～100 MB。';
-    const episodeSwitchGapTip = '自动连播或快速切下一集时，连接波次可能短暂显示为「在线 · 选片」。若这段空窗不超过此秒数，就能避免误入选片流量。默认 3 秒，范围 1～10 秒。';
+    const preplayBurstMbpsTip = '与「开播突发窗口」配合使用：每次点击开播后，前 N 秒内上传速率 ≥ 本阈值的流量，视为推流突发，计入播放，不计为选片流量。填写参考：在调试面板观察该连接，点击播放瞬间留意前几秒的实时上传速率（+xxx/s），取略低于最低的突发速率。服务器上行带宽大、缓冲推得猛，可适当调高；带宽一般或选片阶段常有较大上传，可适当调低以免误判。默认 1.5 MB/s，范围 0.5～10。';
+    const preplayBurstWindowTip = '与「开播突发阈值」配合使用：每次点击开播后，往前回溯本窗口秒数；该时段内上传速率达到阈值的流量，视为推流突发，计入播放，不计为选片流量。填写参考：点击播放后，观察推流突发通常持续几秒（多数 1～3 秒，慢网或高码率可能 4～5 秒），窗口略大于实际突发时长即可，不必过长以免把真选片流量算进去。默认 3 秒，范围 1～10。';
+    const preplayBurstSummaryHint = buildPreplayBurstSummaryHintText(
+        cfg.preplay_burst_window_seconds,
+        cfg.preplay_burst_mbps,
+    );
     const luckyDebugFooterTip = 'Lucky 按 ConnsStatistics 采集各连接上传增量；按 AcceptTime 聚波并与 Emby 外网会话统一裁决，同 IP 多会话按码率权重分摊；选片与播放分账，选片段由开播/断线边沿触发结算落库。';
     const luckyDebugFooterNote = '连接级采集 · 波次会话裁决 · 码率权重分摊 · 选片边沿结算';
     const luckyLayoutHtml = isLucky
@@ -2766,7 +2832,12 @@ function buildEmbyDebugWindowBodyHtml(inst, options = {}) {
                     </div>
                     <div class="emby-debug-lucky-conn-viewport" data-field="lucky-conn-viewport">
                         <div class="emby-debug-lucky-conn-groups" data-field="lucky-conn-groups">
-                            ${buildLuckyConnDebugGroupsHtml(metrics.luckyConnBindings, { firstOpen: false, ipRevealed: luckyIpRevealed })}
+                            ${buildLuckyConnDebugGroupsHtml(metrics.luckyConnBindings, {
+                                firstOpen: false,
+                                ipRevealed: luckyIpRevealed,
+                                instanceName: inst?.name,
+                                tickSeconds: resolveEmbyRefreshInterval(inst),
+                            })}
                         </div>
                     </div>
                 </div>
@@ -2780,9 +2851,14 @@ function buildEmbyDebugWindowBodyHtml(inst, options = {}) {
                             <span class="emby-debug-config-field-label">选片入账阈值 (MB)<span class="emby-debug-help" tabindex="0" data-tip="${escapeHtml(browseUploadMinMbTip)}">?</span></span>
                             <input type="number" min="${EMBY_BROWSE_UPLOAD_MIN_MB_MIN}" max="${EMBY_BROWSE_UPLOAD_MIN_MB_MAX}" step="0.1" value="${cfg.browse_upload_min_mb}" data-field="browse-upload-min-mb" />
                         </label>
+                        <p class="emby-debug-preplay-burst-hint" data-field="preplay-burst-summary-hint">${escapeHtml(preplayBurstSummaryHint)}</p>
                         <label class="emby-debug-config-field">
-                            <span class="emby-debug-config-field-label">连播切集空窗期 (秒)<span class="emby-debug-help" tabindex="0" data-tip="${escapeHtml(episodeSwitchGapTip)}">?</span></span>
-                            <input type="number" min="${EMBY_EPISODE_SWITCH_GAP_MIN}" max="${EMBY_EPISODE_SWITCH_GAP_MAX}" step="1" value="${cfg.episode_switch_gap_seconds}" data-field="episode-switch-gap" />
+                            <span class="emby-debug-config-field-label">开播突发阈值 (MB/s)<span class="emby-debug-help" tabindex="0" data-tip="${escapeHtml(preplayBurstMbpsTip)}">?</span></span>
+                            <input type="number" min="${EMBY_PREPLAY_BURST_MBPS_MIN}" max="${EMBY_PREPLAY_BURST_MBPS_MAX}" step="0.1" value="${cfg.preplay_burst_mbps}" data-field="preplay-burst-mbps" />
+                        </label>
+                        <label class="emby-debug-config-field">
+                            <span class="emby-debug-config-field-label">开播突发窗口 (秒)<span class="emby-debug-help" tabindex="0" data-tip="${escapeHtml(preplayBurstWindowTip)}">?</span></span>
+                            <input type="number" min="${EMBY_PREPLAY_BURST_WINDOW_MIN}" max="${EMBY_PREPLAY_BURST_WINDOW_MAX}" step="1" value="${cfg.preplay_burst_window_seconds}" data-field="preplay-burst-window" />
                         </label>
                     </div>
                 </div>
@@ -3045,6 +3121,8 @@ function patchEmbyDebugFloatWindow(inst, win = null) {
         const ipRevealed = isLuckyDebugIpRevealed(panel);
         updateLuckyConnDebugGroupsDom(connGroupsEl, metrics.luckyConnBindings, {
             ipRevealed,
+            instanceName: inst.name,
+            tickSeconds: resolveEmbyRefreshInterval(inst),
         });
         applyLuckyDebugIpRevealState(panel, ipRevealed);
     }
@@ -3123,6 +3201,7 @@ function resolveEmbyDebugTipTarget(node) {
 function bindEmbyDebugTipEvents() {
     if (window.__embyDebugTipBound) return;
     window.__embyDebugTipBound = true;
+    bindPreplayBurstConfigInputs();
     document.addEventListener('mouseover', (e) => {
         if (embyDebugTipPinned) return;
         const t = resolveEmbyDebugTipTarget(e.target);
@@ -3266,7 +3345,9 @@ function applyEmbyDebugTrafficConfigToPanel(panel, cfg) {
     setValue('mode-switch-grace', normalized.mode_switch_grace_seconds);
     setValue('m3-wan-pool-scale', normalized.m3_wan_pool_scale);
     setValue('browse-upload-min-mb', normalized.browse_upload_min_mb);
-    setValue('episode-switch-gap', normalized.episode_switch_gap_seconds);
+    setValue('preplay-burst-mbps', normalized.preplay_burst_mbps);
+    setValue('preplay-burst-window', normalized.preplay_burst_window_seconds);
+    syncPreplayBurstSummaryHint(panel);
     const priorityEl = panel.querySelector('[data-field="priority-mode"]');
     if (priorityEl && normalized.priority_mode) {
         priorityEl.value = normalized.priority_mode;
@@ -3290,7 +3371,8 @@ async function saveEmbyDebugTrafficConfig(button) {
     const m3WanPoolScaleEl = panel.querySelector('[data-field="m3-wan-pool-scale"]');
     const priorityModeEl = panel.querySelector('[data-field="priority-mode"]');
     const browseMinMbEl = panel.querySelector('[data-field="browse-upload-min-mb"]');
-    const episodeSwitchGapEl = panel.querySelector('[data-field="episode-switch-gap"]');
+    const preplayBurstMbpsEl = panel.querySelector('[data-field="preplay-burst-mbps"]');
+    const preplayBurstWindowEl = panel.querySelector('[data-field="preplay-burst-window"]');
 
     if (newWindowEl) {
         const newWindow = parseInt(newWindowEl.value, 10);
@@ -3354,20 +3436,35 @@ async function saveEmbyDebugTrafficConfig(button) {
         }
         payload.browse_upload_min_mb = Math.round(browseMinMb * 100) / 100;
     }
-    if (episodeSwitchGapEl) {
-        const episodeSwitchGap = parseInt(episodeSwitchGapEl.value, 10);
+    if (preplayBurstMbpsEl) {
+        const preplayBurstMbps = parseFloat(preplayBurstMbpsEl.value);
         if (
-            !Number.isFinite(episodeSwitchGap)
-            || episodeSwitchGap < EMBY_EPISODE_SWITCH_GAP_MIN
-            || episodeSwitchGap > EMBY_EPISODE_SWITCH_GAP_MAX
+            !Number.isFinite(preplayBurstMbps)
+            || preplayBurstMbps < EMBY_PREPLAY_BURST_MBPS_MIN
+            || preplayBurstMbps > EMBY_PREPLAY_BURST_MBPS_MAX
         ) {
             showEmbyDebugToast(
-                `连播切集空窗期请输入 ${EMBY_EPISODE_SWITCH_GAP_MIN}～${EMBY_EPISODE_SWITCH_GAP_MAX} 秒`,
+                `开播突发阈值请输入 ${EMBY_PREPLAY_BURST_MBPS_MIN}～${EMBY_PREPLAY_BURST_MBPS_MAX} MB/s`,
                 'error',
             );
             return;
         }
-        payload.episode_switch_gap_seconds = episodeSwitchGap;
+        payload.preplay_burst_mbps = Math.round(preplayBurstMbps * 100) / 100;
+    }
+    if (preplayBurstWindowEl) {
+        const preplayBurstWindow = parseInt(preplayBurstWindowEl.value, 10);
+        if (
+            !Number.isFinite(preplayBurstWindow)
+            || preplayBurstWindow < EMBY_PREPLAY_BURST_WINDOW_MIN
+            || preplayBurstWindow > EMBY_PREPLAY_BURST_WINDOW_MAX
+        ) {
+            showEmbyDebugToast(
+                `开播突发窗口请输入 ${EMBY_PREPLAY_BURST_WINDOW_MIN}～${EMBY_PREPLAY_BURST_WINDOW_MAX} 秒`,
+                'error',
+            );
+            return;
+        }
+        payload.preplay_burst_window_seconds = preplayBurstWindow;
     }
     if (!Object.keys(payload).length) {
         showEmbyDebugToast('没有可保存的参数', 'error');
@@ -6056,6 +6153,14 @@ function liveSessionMatchesPlaybackRecord(rec, session) {
     return !!(recItem || sid);
 }
 
+function buildEmbyPlaybackSettleReasonBadgeHtml(rec) {
+    const reason = String(rec?.settle_reason || '').trim();
+    if (reason === 'emby_abnormal_disconnect') {
+        return '<span class="emby-session-badge emby-event-badge--settle emby-event-badge--emby-abnormal-disconnect">Emby侧异常断开</span>';
+    }
+    return '';
+}
+
 function findLiveSessionForPlaybackRecord(rec) {
     if (rec?.status !== 'playing') return null;
     const instName = rec.instance_name || '';
@@ -6065,11 +6170,14 @@ function findLiveSessionForPlaybackRecord(rec) {
     const sid = normalizeEmbySessionId(rec.emby_session_id);
     if (sid) {
         const matched = sessions.find((s) => normalizeEmbySessionId(s.id) === sid);
-        if (matched && liveSessionMatchesPlaybackRecord(rec, matched)) return matched;
+        if (matched && !matched.is_abnormal_disconnect && liveSessionMatchesPlaybackRecord(rec, matched)) {
+            return matched;
+        }
     }
     const itemId = String(rec.item_id || '').trim();
     const userName = String(rec.user_name || '').trim().toLowerCase();
     for (const session of sessions) {
+        if (session.is_abnormal_disconnect) continue;
         if (!session.is_playing && !session.item_id) continue;
         if (itemId && String(session.item_id || '') !== itemId) continue;
         const sName = String(session.user_name || '').trim().toLowerCase();
@@ -6521,6 +6629,7 @@ function renderPlaybackRecordCard(rec) {
 
     const badges = [];
     if (!isPlaying) {
+        badges.push(buildEmbyPlaybackSettleReasonBadgeHtml(viewRec));
         badges.push(buildEmbyWatchStatusBadgeHtml(event));
         badges.push(buildEmbyWatchDurationBadgeHtml(event, { startEvent }));
     }

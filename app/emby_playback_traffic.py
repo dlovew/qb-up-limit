@@ -57,6 +57,42 @@ _conn_bindings: Dict[str, Dict[str, str]] = {}
 _conn_match_hints: Dict[str, Dict[str, str]] = {}
 _segment_conn_baselines: Dict[str, Dict[str, Dict[str, int]]] = {}
 _conn_info_cache: Dict[str, Dict[str, dict]] = {}
+# 开播前突发追踪：Emby 会话在开播前会有一段（可长达数十秒）仍报 connected/viewing
+# 而连接已在推流缓冲的窗口，这段突发会按选片入账进选片桶。此处并行记录"计入选片
+# 桶的推流突发量"（带时间戳，不受实时累加器清理影响），待开播结算那一刻把「开播前
+# 突发窗口」秒内的突发从选片桶移回播放键累加器，更早的突发保留为真实选片流量。
+# name -> browse_key -> [(monotonic_ts, bytes), ...]
+_browse_preplay_burst: Dict[str, Dict[str, List[Tuple[float, int]]]] = {}
+# 推流突发识别阈值（字节/秒）：会话仍报 connected/viewing 但单 tick 上传速率达到
+# 此值，即判定为开播缓冲突发。可由「推流突发识别阈值 (MB/s)」设置项覆盖。
+BROWSE_STREAM_BURST_BPS = 1_500_000
+# 开播前突发窗口（秒）：开播结算时只回溯该秒数内的突发归入播放。可由设置项覆盖。
+BROWSE_STREAM_BURST_WINDOW_SECONDS = 3
+# 突发条目最长保留时长（秒）：超过则视为与本次开播无关的历史，避免无限增长。
+_BURST_ENTRY_RETENTION_SECONDS = 120
+
+
+def set_browse_stream_burst_bps(bps) -> None:
+    """由配置同步推流突发识别阈值（字节/秒）。"""
+    global BROWSE_STREAM_BURST_BPS
+    try:
+        val = int(bps)
+    except (TypeError, ValueError):
+        return
+    if val > 0:
+        BROWSE_STREAM_BURST_BPS = val
+
+
+def set_browse_stream_burst_window_seconds(seconds) -> None:
+    """由配置同步开播前突发窗口（秒）。"""
+    global BROWSE_STREAM_BURST_WINDOW_SECONDS
+    try:
+        val = int(seconds)
+    except (TypeError, ValueError):
+        return
+    if val > 0:
+        BROWSE_STREAM_BURST_WINDOW_SECONDS = val
+
 
 DEFAULT_NEW_SESSION_WINDOW_SECONDS = 8
 DEFAULT_SEEK_WINDOW_SECONDS = 6
@@ -1391,6 +1427,12 @@ def take_accumulated_browse_upload_by_key(
         value = bucket.pop(key, None)
         if not bucket:
             _browse_upload_accumulators.pop(name, None)
+        # 选片键被结算/取走：同步清除其开播前突发计数，避免键复用时误移。
+        burst_bucket = _browse_preplay_burst.get(name) or {}
+        if key in burst_bucket:
+            burst_bucket.pop(key, None)
+            if not burst_bucket:
+                _browse_preplay_burst.pop(name, None)
     if key:
         _delete_persisted_upload_keys(name, [key])
     if value is None:
@@ -1410,6 +1452,82 @@ def take_accumulated_browse_upload(instance_name: str, subject: dict) -> Optiona
     if not key:
         return None
     return take_accumulated_browse_upload_by_key(instance_name, key)
+
+
+def _is_pre_play_stream_burst(
+    session: Optional[dict],
+    delta: int,
+    tick_seconds: Optional[float],
+) -> bool:
+    """流量形态识别：会话尚未翻到 playing（仍 connected/viewing），但单 tick
+    增量达到推流突发速率，判定为开播缓冲突发（Emby 会话状态滞后窗口）。"""
+    if not session or not isinstance(session, dict):
+        return False
+    mode = str(session.get('session_mode') or '').strip()
+    if mode not in ('connected', 'viewing'):
+        return False
+    tick_s = float(tick_seconds or 1.0)
+    if tick_s <= 0:
+        tick_s = 1.0
+    rate = int(delta or 0) / tick_s
+    return rate >= BROWSE_STREAM_BURST_BPS
+
+
+def _tag_preplay_burst(name: str, browse_key: str, delta: int) -> None:
+    """记录计入选片桶的推流突发量（带时间戳，须在持有 _lock 时调用）。"""
+    if not name or not browse_key or delta <= 0:
+        return
+    now = time.monotonic()
+    bucket = _browse_preplay_burst.setdefault(name, {})
+    entries = bucket.setdefault(browse_key, [])
+    entries.append((now, int(delta)))
+    # 丢弃过旧条目，避免长时间未结算的键无限增长。
+    cutoff = now - _BURST_ENTRY_RETENTION_SECONDS
+    if entries and entries[0][0] < cutoff:
+        bucket[browse_key] = [e for e in entries if e[0] >= cutoff]
+
+
+def settle_preplay_burst_to_play(instance_name: str, session: dict) -> int:
+    """开播结算时，把「开播前突发窗口」秒内误计入选片桶的推流突发移回播放键累加器。
+
+    在会话已转 playing 的安全时刻调用：仅回溯窗口内的突发归到播放段，窗口之外
+    的更早突发保留在选片桶，作为真实选片流量结算。返回移动的字节数。"""
+    name = (instance_name or '').strip()
+    if not name or not isinstance(session, dict):
+        return 0
+    play_key = _persist_key_for_session(session)
+    moved = 0
+    now = time.monotonic()
+    window_start = now - float(BROWSE_STREAM_BURST_WINDOW_SECONDS)
+    with _lock:
+        burst_bucket = _browse_preplay_burst.get(name) or {}
+        if not burst_bucket:
+            return 0
+        browse_bucket = _browse_upload_accumulators.get(name) or {}
+        sid = str(
+            session.get('id') or session.get('session_id')
+            or session.get('emby_session_id') or '',
+        ).strip()
+        for bkey in list(burst_bucket.keys()):
+            if sid and _browse_sid_from_key(bkey) != sid:
+                continue
+            entries = burst_bucket.get(bkey) or []
+            # 仅回溯开播前窗口内的突发，窗口之外的更早突发保留为选片。
+            burst = sum(
+                max(0, int(b)) for (ts, b) in entries if ts >= window_start
+            )
+            avail = max(0, int(browse_bucket.get(bkey) or 0))
+            move = min(burst, avail)
+            if move > 0 and play_key:
+                browse_bucket[bkey] = avail - move
+                acc = _upload_accumulators.setdefault(name, {})
+                acc[play_key] = int(acc.get(play_key, 0)) + move
+                _touch_accumulator_key(name, play_key, now)
+                moved += move
+            burst_bucket.pop(bkey, None)
+        if not burst_bucket:
+            _browse_preplay_burst.pop(name, None)
+    return moved
 
 
 def accumulate_wan_upload_by_conn(
@@ -1509,6 +1627,9 @@ def accumulate_wan_upload_by_conn(
             elif billing == 'browse_credited' and browse_key:
                 browse_sid = _browse_sid_from_key(browse_key)
                 stream_session = _session_for_sid(sessions, browse_sid)
+                is_burst = _is_pre_play_stream_burst(
+                    stream_session, delta, tick_seconds,
+                )
                 route_play = False
                 if stream_session:
                     import emby_continuous_playback
@@ -1529,6 +1650,10 @@ def accumulate_wan_upload_by_conn(
                     browse_shares[browse_key] = (
                         browse_shares.get(browse_key, 0) + delta
                     )
+                    # 开播前 Emby 仍报 connected/viewing 但连接已推流缓冲：
+                    # 照常计入选片桶，同时标记该突发量，待开播结算移回播放键。
+                    if is_burst:
+                        _tag_preplay_burst(name, browse_key, delta)
             else:
                 ip = str(
                     row.get('ip') or parse_endpoint_ip(addr) or '',

@@ -384,15 +384,19 @@ def _redirect_or_settle_browse_playback_start(
     name = (instance_name or '').strip()
     now_mono = time.monotonic() if now_mono is None else float(now_mono)
     meta = _meta_from_session(session)
-    if not emby_continuous_playback.should_settle_browse_on_playback_start(
+    settle_browse = emby_continuous_playback.should_settle_browse_on_playback_start(
         name, session, prev_mode, now_mono=now_mono,
-    ):
+    )
+    if not settle_browse:
         moved = emby_playback_traffic.transfer_browse_bytes_to_play_for_session(
             name, session,
         )
         if moved > 0:
             _clear_browse_pending_key(name, sid, meta)
         return
+    # 开播结算前：把开播前误计入选片桶的推流突发移回播放键累加器，
+    # 使选片记录只结算真实选片流量，突发归到播放段。
+    emby_playback_traffic.settle_preplay_burst_to_play(name, session)
     if not _has_browse_bytes(name, sid, meta):
         return
     if meta.get('user_name'):

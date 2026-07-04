@@ -11,30 +11,17 @@ logger = logging.getLogger(__name__)
 
 # 近期在播记忆（用于判断 connected 是否紧跟播放）
 CONTINUOUS_PLAYBACK_MEMORY_SECONDS = 30
-# 仅短于此秒数的 connected（且紧跟在播、播放段仍 open）视为切集空窗
-EPISODE_SWITCH_GAP_MAX_SECONDS_DEFAULT = 3
-_gap_max_seconds = EPISODE_SWITCH_GAP_MAX_SECONDS_DEFAULT
+# 连播切集空窗内部固定窗口（秒，非用户可调）：仅短于此秒数的 connected（且紧跟在播、
+# 播放段仍 open）视为切集空窗，超过则按真选片处理，避免误吞较长的选片流量。
+# 比历史默认 3 秒略宽以覆盖较慢网络；开播/切集的突发误计由 tag-and-settle 机制
+# （与时长无关）兜底，故此窗口无需再拉长。
+EPISODE_SWITCH_GAP_MAX_SECONDS = 6
 
 _lock = threading.RLock()
 _last_playing_mono: Dict[str, Dict[str, float]] = {}
 _connected_since_mono: Dict[str, Dict[str, float]] = {}
 # 进入 playing 时缓存上一段 connected 时长（供同轮结算读取）
 _connected_age_at_play: Dict[str, Dict[str, float]] = {}
-
-
-def get_episode_switch_gap_max_seconds() -> int:
-    with _lock:
-        return int(_gap_max_seconds)
-
-
-def set_episode_switch_gap_max_seconds(seconds) -> None:
-    global _gap_max_seconds
-    try:
-        val = int(seconds)
-    except (TypeError, ValueError):
-        val = EPISODE_SWITCH_GAP_MAX_SECONDS_DEFAULT
-    with _lock:
-        _gap_max_seconds = max(1, min(10, val))
 
 
 def _session_sid(session: dict) -> str:
@@ -162,7 +149,7 @@ def is_episode_switch_gap(
     *,
     now_mono: Optional[float] = None,
 ) -> bool:
-    """连播切集空窗：短暂 connected、无选片媒资、紧跟在播且播放段仍 open。"""
+    """连播切集空窗：connected、无选片媒资、紧跟在播、仍在高速率推流缓冲且播放段 open。"""
     if not isinstance(session, dict):
         return False
     mode = str(session.get('session_mode') or '').strip()
@@ -173,12 +160,11 @@ def is_episode_switch_gap(
     sid = _session_sid(session)
     if not sid:
         return False
-    if not recently_was_playing(instance_name, sid, now_mono=now_mono):
+    now = time.monotonic() if now_mono is None else float(now_mono)
+    if not recently_was_playing(instance_name, sid, now_mono=now):
         return False
-    conn_age = connected_duration_seconds(
-        instance_name, sid, now_mono=now_mono,
-    )
-    if conn_age >= get_episode_switch_gap_max_seconds():
+    conn_age = connected_duration_seconds(instance_name, sid, now_mono=now)
+    if conn_age >= EPISODE_SWITCH_GAP_MAX_SECONDS:
         return False
     try:
         import playback_record_store

@@ -57,6 +57,7 @@ _SETTLE_REASON_ZH = {
     'timeout_offline': '超时离线',
     'instance_reset': '实例重置',
     'emby_confirmed_stop': 'Emby 确认停止',
+    'emby_abnormal_disconnect': 'Emby侧异常断开',
     'grace_expired': '宽限期结束',
     'item_change': '切换条目',
 }

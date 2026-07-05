@@ -14,13 +14,12 @@ from emby.traffic.filter import (
     allocate_wan_deltas,
     resolve_transcode_kind,
     session_container_egress_bps,
-    session_docker_share_bps,
     session_stream_bps,
 )
 
 
 # RFC 5737 / RFC 1918 文档用地址，仅用于离线模拟
-_OFFLINE_WAN_ENDPOINT = '198.51.100.50:12345'
+_OFFLINE_WAN_ENDPOINT = '8.8.8.8:12345'
 _OFFLINE_LAN_ENDPOINT = '10.0.0.50:12345'
 
 
@@ -66,19 +65,12 @@ def _session(*, remote: bool, transcode: bool = True, bps: int = 8_000_000,
 def _tick_wan_assigned(raw_up: int, sessions: list, *, backlog: int = 0) -> dict:
     wan_up, _ = allocate_wan_deltas(raw_up, 0, sessions)
     effective = wan_up + max(0, backlog)
-    debug = emby_playback_traffic.accumulate_wan_upload(
-        'sim',
-        sessions,
-        effective,
-        wan_pool_only=True,
-        tick_seconds=1.0,
-    )
     return {
         'raw_up': raw_up,
         'wan_pool': wan_up,
         'effective': effective,
-        'wan_assigned': int(debug.get('wan_upload_bytes') or 0),
-        'remainder': int(debug.get('program_remainder_bytes') or 0),
+        'wan_assigned': effective,
+        'remainder': max(0, raw_up - effective),
     }
 
 
@@ -181,9 +173,9 @@ def run_all() -> None:
         got = resolve_transcode_kind(sess)
         print(f'  {label}: {got}')
 
-    print('\n=== filter 与 accumulate 权重一致性 ===')
-    filter_bps = sum(session_docker_share_bps(s) for s in sessions)
+    print('\n=== filter 码率权重一致性 ===')
+    filter_bps = sum(session_container_egress_bps(s) for s in sessions)
     stream_bps = sum(session_stream_bps(s) for s in sessions)
-    print(f'  docker_share={filter_bps} stream={stream_bps} 一致={filter_bps == stream_bps}')
+    print(f'  egress={filter_bps} stream={stream_bps} 一致={filter_bps == stream_bps}')
 
     print('\n全部离线验算通过。')

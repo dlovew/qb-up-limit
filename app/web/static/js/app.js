@@ -7378,7 +7378,6 @@ const SYSLOG_LOGGER_LABELS = {
     emby_traffic_db: 'Emby 流量数据库',
     emby_client: 'Emby 客户端',
     emby_playback_traffic: 'Emby 播放流量',
-    emby_docker: 'Emby Docker',
     emby_lucky: 'Lucky 客户端',
     emby_user_sync: 'Emby 用户同步',
     emby_continuous_playback: 'Emby 连播',
@@ -9537,7 +9536,7 @@ function renderGlobalSettingsForm(g) {
                             <input type="checkbox" id="globalEmbyEnabled" ${g.emby_enabled ? 'checked' : ''} ${g.emby_feature_locked ? 'disabled' : ''} />
                             <span>开启 Emby 监控功能</span>
                         </label>
-                        <p class="form-hint form-hint--field">开启可实现同步监控 Emby 的播放会话与外网流量数据。<br>数据来源：Lucky-API(准确) / docker 容器接口（估算）</p>
+                        <p class="form-hint form-hint--field">开启可实现同步监控 Emby 的播放会话与外网流量数据。<br>数据来源：Lucky-API（准确采集）</p>
                         ${g.emby_feature_locked ? '<p class="form-hint form-hint--field form-hint--warning">当前仍有 Emby 设备，无法关闭此功能。</p>' : ''}
                     </div>
                     <div id="globalEmbyDefaultViewWrap" class="form-field" ${g.emby_enabled ? '' : 'hidden'} aria-hidden="${g.emby_enabled ? 'false' : 'true'}">

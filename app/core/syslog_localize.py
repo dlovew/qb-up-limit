@@ -23,7 +23,6 @@ _LOGGER_ZH = {
     'emby_traffic_db': 'Emby 流量数据库',
     'emby_client': 'Emby 客户端',
     'emby_playback_traffic': 'Emby 播放流量',
-    'emby_docker': 'Emby Docker',
     'emby_lucky': 'Lucky 客户端',
     'emby_user_sync': 'Emby 用户同步',
     'emby_continuous_playback': 'Emby 连播',

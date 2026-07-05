@@ -107,8 +107,6 @@ DEFAULT_EMBY_INSTANCE = {
     'use_https': False,
     'verify_ssl': False,
     'api_key': '',
-    'container_name': '',
-    'container_id': '',
     'connection_timeout': INSTANCE_HTTP_TIMEOUT,
     'display_priority': 1,
     'wan_traffic_only': True,
@@ -1106,7 +1104,7 @@ def instance_only_basics_changed(existing: dict, updated: dict) -> bool:
 
 _EMBY_CONNECTION_KEYS = (
     'host', 'port', 'use_https', 'verify_ssl',
-    'container_name', 'container_id', 'traffic_collect_mode',
+    'traffic_collect_mode',
     'lucky_base_url', 'lucky_verify_ssl', 'lucky_rule_key', 'lucky_sub_key',
     'lucky_rule_label', 'lucky_frontend_host', 'lucky_credit_browse_traffic',
 )
@@ -1245,8 +1243,6 @@ def _migrate_emby_instance_fields(inst: dict) -> dict:
     item['use_https'] = bool(item.get('use_https', False))
     item['verify_ssl'] = bool(item.get('verify_ssl', False))
     item['api_key'] = str(item.get('api_key', '') or '').strip()
-    item['container_name'] = str(item.get('container_name', '') or '').strip()
-    item['container_id'] = str(item.get('container_id', '') or '').strip()
     try:
         priority = int(item.get('display_priority', 1))
     except (TypeError, ValueError):
@@ -1283,7 +1279,6 @@ def _validate_emby_instance(inst: dict, existing_names: list = None,
                               original_name: str = None,
                               require_name: bool = True,
                               require_api_key: bool = True,
-                              require_container: bool = True,
                               require_lucky: bool = False,
                               require_host: bool = True) -> dict:
     result = {**DEFAULT_EMBY_INSTANCE, **inst}
@@ -1318,14 +1313,11 @@ def _validate_emby_instance(inst: dict, existing_names: list = None,
     if not api_key and require_api_key and require_name:
         raise ValueError('请填写 Emby API Key')
     result.pop('api_key', None)
-    result['container_name'] = str(result.get('container_name', '') or '').strip()
-    result['container_id'] = str(result.get('container_id', '') or '').strip()
     mode = normalize_traffic_collect_mode(migrate_estimate_upload_flag(result))
     result['traffic_collect_mode'] = mode
     result.pop('estimate_upload_enabled', None)
-    if mode == 'docker' and require_container:
-        if not result['container_name'] and not result['container_id']:
-            raise ValueError('Docker 采集需填写容器名或容器 ID')
+    result.pop('container_name', None)
+    result.pop('container_id', None)
     result['lucky_base_url'] = normalize_lucky_base_url(result.get('lucky_base_url', ''))
     result['lucky_verify_ssl'] = bool(result.get('lucky_verify_ssl', False))
     rule_key = str(result.get('lucky_rule_key', '') or '').strip()
@@ -1376,14 +1368,12 @@ def _validate_emby_instance(inst: dict, existing_names: list = None,
 
 def validate_emby_instance_for_test(inst: dict, test_type: str = 'connectivity') -> dict:
     require_api = test_type == 'api'
-    require_container = test_type == 'docker'
-    require_lucky = test_type == 'lucky'
+    require_lucky = test_type in ('lucky', 'lucky_rules', 'lucky_connect')
     require_host = test_type not in ('lucky', 'lucky_rules', 'lucky_connect')
     result = _validate_emby_instance(
         inst,
         require_name=False,
         require_api_key=require_api,
-        require_container=require_container,
         require_lucky=require_lucky,
         require_host=require_host,
     )
@@ -1453,8 +1443,6 @@ def mask_emby_instance_for_api(inst: dict) -> dict:
         result['has_lucky_rule_keys'] = False
     result.pop('lucky_rule_key', None)
     result.pop('lucky_sub_key', None)
-    mode = result.get('traffic_collect_mode') or ''
-    result['estimate_upload_enabled'] = mode == 'docker'
     return result
 
 

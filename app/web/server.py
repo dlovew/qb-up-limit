@@ -943,24 +943,6 @@ def _emby_required():
 
 def _emby_debug_traffic_config_payload(global_cfg: dict = None) -> dict:
     cfg = dict(global_cfg or {})
-    try:
-        new_window = int(cfg.get('emby_burst_new_session_window_seconds', 8))
-    except (TypeError, ValueError):
-        new_window = 8
-    try:
-        seek_window = int(cfg.get('emby_burst_seek_window_seconds', 6))
-    except (TypeError, ValueError):
-        seek_window = 6
-    try:
-        mode_switch_grace = int(cfg.get('emby_mode_switch_grace_seconds', 2))
-    except (TypeError, ValueError):
-        mode_switch_grace = 2
-    mode = str(cfg.get('emby_burst_priority_mode') or '').strip().lower()
-    if mode not in ('seek_first', 'new_first'):
-        mode = 'seek_first'
-    m3_scale = config_manager.clamp_emby_m3_wan_pool_scale(
-        cfg.get('emby_m3_wan_pool_scale', 1.0),
-    )
     browse_min_mb = config_manager.clamp_emby_browse_upload_min_mb(
         cfg.get('emby_browse_upload_min_mb', 1.0),
     )
@@ -973,13 +955,8 @@ def _emby_debug_traffic_config_payload(global_cfg: dict = None) -> dict:
         )
     )
     return {
-        'new_session_window_seconds': max(1, min(30, new_window)),
-        'seek_window_seconds': max(1, min(30, seek_window)),
-        'priority_mode': mode,
-        'mode_switch_grace_seconds': max(0, min(10, mode_switch_grace)),
         'preplay_burst_mbps': preplay_burst_mbps,
         'preplay_burst_window_seconds': preplay_burst_window_seconds,
-        'm3_wan_pool_scale': m3_scale,
         'browse_upload_min_mb': browse_min_mb,
         'browse_upload_min_bytes': config_manager.emby_browse_upload_min_bytes(
             {'emby_browse_upload_min_mb': browse_min_mb},
@@ -997,7 +974,6 @@ def api_emby_status():
         return jsonify({
             'success': True,
             'data': emby_monitor.get_status_summary(),
-            'docker_socket_available': emby_monitor.docker.is_available(),
             'debug_traffic_config': _emby_debug_traffic_config_payload(global_cfg),
             'timestamp': traffic_db.now_local().isoformat(),
         })
@@ -1084,22 +1060,6 @@ def api_emby_debug_traffic_config_update():
 
         current_global = config_manager.get_global_config(monitor.config)
         merged_global = dict(current_global)
-        if 'new_session_window_seconds' in data:
-            merged_global['emby_burst_new_session_window_seconds'] = data.get(
-                'new_session_window_seconds',
-            )
-        if 'seek_window_seconds' in data:
-            merged_global['emby_burst_seek_window_seconds'] = data.get(
-                'seek_window_seconds',
-            )
-        if 'priority_mode' in data:
-            merged_global['emby_burst_priority_mode'] = data.get('priority_mode')
-        if 'mode_switch_grace_seconds' in data:
-            merged_global['emby_mode_switch_grace_seconds'] = data.get(
-                'mode_switch_grace_seconds',
-            )
-        if 'm3_wan_pool_scale' in data:
-            merged_global['emby_m3_wan_pool_scale'] = data.get('m3_wan_pool_scale')
         if 'browse_upload_min_mb' in data:
             merged_global['emby_browse_upload_min_mb'] = data.get('browse_upload_min_mb')
         if 'preplay_burst_mbps' in data:
@@ -1620,14 +1580,6 @@ def api_emby_config_instances_test():
         test_type = data.get('test_type', 'connectivity')
         validated = config_manager.validate_emby_instance_for_test(
             data, test_type=test_type)
-
-        if test_type == 'docker':
-            result = emby_monitor.test_docker_container(
-                validated.get('container_name', ''),
-                validated.get('container_id', ''),
-            ) if emby_monitor else {'ok': False, 'error': 'Emby 模块未初始化'}
-            return jsonify({'success': result.get('ok', False), 'data': result,
-                            'error': result.get('error')})
 
         if test_type in ('lucky', 'lucky_rules', 'lucky_connect'):
             from emby.lucky.api import (

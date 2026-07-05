@@ -167,8 +167,6 @@ class EmbyClient:
         self.use_https = bool(config.get('use_https', False))
         self.verify_ssl = bool(config.get('verify_ssl', False))
         self.api_key = str(config.get('api_key') or '').strip()
-        self.container_name = str(config.get('container_name') or '').strip()
-        self.container_id = str(config.get('container_id') or '').strip()
         self.connection_timeout = float(config.get('connection_timeout') or DEFAULT_TIMEOUT)
         try:
             self.display_priority = max(1, min(99999, int(config.get('display_priority', 500))))
@@ -176,7 +174,7 @@ class EmbyClient:
             self.display_priority = 500
         self.wan_traffic_only = bool(config.get('wan_traffic_only', True))
         self.traffic_collect_mode = str(config.get('traffic_collect_mode') or '').strip().lower()
-        if self.traffic_collect_mode not in ('docker', 'lucky'):
+        if self.traffic_collect_mode != 'lucky':
             self.traffic_collect_mode = ''
         self.lucky_base_url = str(config.get('lucky_base_url') or '').strip()
         self.lucky_verify_ssl = bool(config.get('lucky_verify_ssl', False))
@@ -187,11 +185,10 @@ class EmbyClient:
         self.lucky_credit_browse_traffic = bool(
             config.get('lucky_credit_browse_traffic', False),
         )
-        self.estimate_upload_enabled = self.traffic_collect_mode == 'docker'
 
     @property
     def upload_tracking_enabled(self) -> bool:
-        return self.traffic_collect_mode in ('docker', 'lucky')
+        return self.traffic_collect_mode == 'lucky'
 
     def update_config(self, config: dict):
         self.__init__(config)

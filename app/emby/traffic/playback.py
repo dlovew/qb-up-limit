@@ -14,7 +14,6 @@ from emby.traffic.filter import (
     legacy_playback_accumulator_key,
     parse_endpoint_ip,
     playback_accumulator_key,
-    session_docker_share_bps,
     session_stream_bps,
 )
 
@@ -94,12 +93,6 @@ def set_browse_stream_burst_window_seconds(seconds) -> None:
         BROWSE_STREAM_BURST_WINDOW_SECONDS = val
 
 
-DEFAULT_NEW_SESSION_WINDOW_SECONDS = 8
-DEFAULT_SEEK_WINDOW_SECONDS = 6
-DEFAULT_PRIORITY_MODE = 'seek_first'
-_VALID_PRIORITY_MODES = frozenset({'seek_first', 'new_first'})
-_MAX_WINDOW_SECONDS = 30
-_SESSION_STATE_GRACE_SECONDS = 120
 _ACCUMULATOR_STALE_SECONDS = 30 * 60
 
 _hydrated_instances: Set[str] = set()
@@ -335,35 +328,6 @@ def _safe_int(value, default: int = 0) -> int:
         return default
 
 
-def _normalize_window_seconds(value, default_value: int) -> int:
-    parsed = _safe_int(value, default_value)
-    if parsed <= 0:
-        parsed = default_value
-    return max(1, min(_MAX_WINDOW_SECONDS, parsed))
-
-
-def _normalize_priority_mode(value) -> str:
-    mode = str(value or '').strip().lower()
-    if mode not in _VALID_PRIORITY_MODES:
-        return DEFAULT_PRIORITY_MODE
-    return mode
-
-
-def _session_runtime_lookup_key(session: dict, *, fallback: str = '') -> str:
-    sid = str(
-        session.get('emby_session_id')
-        or session.get('session_id')
-        or session.get('id')
-        or ''
-    ).strip()
-    if sid:
-        return f'sid:{sid}'
-    persist_key = playback_accumulator_key(session)
-    if persist_key:
-        return persist_key
-    return str(fallback or '').strip()
-
-
 def _migrate_accumulator_key(name: str, old_key: str, new_key: str,
                              now_mono: float) -> None:
     old_key = str(old_key or '').strip()
@@ -390,25 +354,6 @@ def _active_upload_sessions(sessions: list) -> List[dict]:
         and bool(s.get('is_playing'))
         and not bool(s.get('is_paused'))
     ]
-
-
-def _resolve_wan_pool(delta_up: int, active: List[dict], wan: List[dict],
-                      *, wan_pool_only: bool) -> int:
-    if delta_up <= 0 or not active or not wan:
-        return 0
-    if wan_pool_only:
-        return delta_up
-    lan = [s for s in active if not is_wan_playback_session(s)]
-    if not lan:
-        return delta_up
-    wan_bps = sum(max(0, session_stream_bps(s)) for s in wan)
-    total_bps = sum(max(0, session_stream_bps(s)) for s in active)
-    if total_bps <= 0:
-        ratio = len(wan) / len(active)
-    else:
-        ratio = wan_bps / total_bps
-    ratio = max(0.0, min(1.0, ratio))
-    return int(delta_up * ratio)
 
 
 def _distribute_weighted(pool: int, infos: List[dict]) -> Dict[str, int]:
@@ -439,113 +384,6 @@ def _distribute_weighted(pool: int, infos: List[dict]) -> Dict[str, int]:
             assigned += part
         result[key] = result.get(key, 0) + max(0, int(part))
     return result
-
-
-def _parse_iso_epoch_seconds(value: str) -> Optional[float]:
-    raw = str(value or '').strip()
-    if not raw:
-        return None
-    try:
-        if raw.endswith('Z'):
-            raw = raw[:-1] + '+00:00'
-        dt = datetime.fromisoformat(raw)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.timestamp()
-    except ValueError:
-        return None
-
-
-def _instance_runtime_state(name: str) -> dict:
-    state = _allocator_runtime.get(name)
-    if state is None:
-        state = {
-            'last_tick_mono': None,
-            'sessions': {},
-        }
-        _allocator_runtime[name] = state
-    return state
-
-
-def _session_runtime_state(state: dict, key: str, now_mono: float) -> dict:
-    sessions = state.setdefault('sessions', {})
-    entry = sessions.get(key)
-    if entry is None:
-        entry = {
-            'first_seen_mono': now_mono,
-            'last_seen_mono': now_mono,
-            'last_seek_count': 0,
-            'seek_active_until_mono': 0.0,
-            'live_last_upload_bytes': None,
-            'live_last_sample_mono': None,
-        }
-        sessions[key] = entry
-    return entry
-
-
-def _touch_session_flags(state: dict, key: str, session: dict,
-                         now_mono: float, now_epoch: float,
-                         new_window_seconds: int, seek_window_seconds: int) -> tuple:
-    entry = _session_runtime_state(state, key, now_mono)
-    entry['last_seen_mono'] = now_mono
-
-    seek_count = max(0, _safe_int(session.get('seek_count'), 0))
-    last_seek_count = max(0, _safe_int(entry.get('last_seek_count'), 0))
-    if seek_count > last_seek_count:
-        entry['seek_active_until_mono'] = now_mono + seek_window_seconds
-    entry['last_seek_count'] = seek_count
-
-    if seek_count > 0 and float(entry.get('seek_active_until_mono') or 0.0) <= now_mono:
-        last_seek_at = _parse_iso_epoch_seconds(session.get('last_seek_at') or '')
-        if last_seek_at is not None:
-            elapsed = now_epoch - last_seek_at
-            if elapsed < seek_window_seconds:
-                entry['seek_active_until_mono'] = now_mono + max(
-                    0.5, seek_window_seconds - max(0.0, elapsed),
-                )
-
-    is_new = (now_mono - float(entry.get('first_seen_mono') or now_mono)) <= new_window_seconds
-    is_seek = float(entry.get('seek_active_until_mono') or 0.0) > now_mono
-    return bool(is_new), bool(is_seek)
-
-
-def _cleanup_runtime_state(name: str, state: dict, now_mono: float,
-                           keep_seconds: int) -> None:
-    sessions = state.get('sessions') or {}
-    stale_after = max(30, int(keep_seconds))
-    for key, entry in list(sessions.items()):
-        last_seen = float(entry.get('last_seen_mono') or 0.0)
-        if now_mono - last_seen > stale_after:
-            sessions.pop(key, None)
-    _cleanup_stale_accumulators(name, now_mono)
-    if not sessions and not (_upload_accumulators.get(name) or {}):
-        _allocator_runtime.pop(name, None)
-    if not sessions and not (_live_tick_uploads.get(name) or {}):
-        _live_tick_uploads.pop(name, None)
-
-
-def _pick_burst_targets(infos: List[dict], priority_mode: str) -> List[dict]:
-    seek_infos = [i for i in infos if i.get('is_seek')]
-    new_infos = [i for i in infos if i.get('is_new')]
-    if priority_mode == 'new_first':
-        if new_infos:
-            return new_infos
-        if seek_infos:
-            return seek_infos
-        return []
-    if seek_infos:
-        return seek_infos
-    if new_infos:
-        return new_infos
-    return []
-
-
-def _estimate_expected_pool_bytes(infos: List[dict], elapsed_seconds: float) -> int:
-    elapsed = max(0.5, min(120.0, float(elapsed_seconds or 1.0)))
-    bps_total = sum(max(0, int(i.get('bps') or 0)) for i in infos)
-    if bps_total <= 0:
-        return 0
-    return max(0, int(bps_total * elapsed / 8))
 
 
 def _allocation_debug_payload(*, total_upload_bytes: int = 0, wan_upload_bytes: int = 0,
@@ -755,233 +593,6 @@ def _snapshot_upload_buckets(name: str) -> tuple:
         )
 
 
-def accumulate_wan_upload(instance_name: str, sessions: list, delta_up: int,
-                          wan_pool_only: bool = False,
-                          new_session_window_seconds: int = DEFAULT_NEW_SESSION_WINDOW_SECONDS,
-                          seek_window_seconds: int = DEFAULT_SEEK_WINDOW_SECONDS,
-                          priority_mode: str = DEFAULT_PRIORITY_MODE,
-                          tick_seconds: float = None) -> dict:
-    """将本采集周期上传按会话分摊，并累计外网会话分配结果。"""
-    name = (instance_name or '').strip()
-    delta_up = max(0, int(delta_up or 0))
-    if not name:
-        return _allocation_debug_payload()
-    now_mono = time.monotonic()
-    if delta_up <= 0 or not sessions:
-        with _lock:
-            _set_live_tick_uploads(name, {})
-            runtime = _allocator_runtime.get(name)
-            if runtime is not None:
-                _cleanup_runtime_state(
-                    name, runtime, now_mono, _SESSION_STATE_GRACE_SECONDS,
-                )
-            else:
-                _cleanup_stale_accumulators(name, now_mono)
-        return _allocation_debug_payload(
-            total_upload_bytes=delta_up,
-            remainder_bytes=delta_up,
-        )
-
-    new_window = _normalize_window_seconds(
-        new_session_window_seconds, DEFAULT_NEW_SESSION_WINDOW_SECONDS,
-    )
-    seek_window = _normalize_window_seconds(
-        seek_window_seconds, DEFAULT_SEEK_WINDOW_SECONDS,
-    )
-    mode = _normalize_priority_mode(priority_mode)
-    active = _active_upload_sessions(sessions)
-    if not active:
-        with _lock:
-            _set_live_tick_uploads(name, {})
-            runtime = _allocator_runtime.get(name)
-            keep_seconds = (
-                max(new_window, seek_window) + _SESSION_STATE_GRACE_SECONDS
-            )
-            if runtime is not None:
-                _cleanup_runtime_state(name, runtime, now_mono, keep_seconds)
-            else:
-                _cleanup_stale_accumulators(name, now_mono)
-        return _allocation_debug_payload(
-            total_upload_bytes=delta_up,
-            remainder_bytes=delta_up,
-        )
-
-    now_epoch = time.time()
-    with _lock:
-        runtime = _instance_runtime_state(name)
-        last_tick = runtime.get('last_tick_mono')
-        runtime['last_tick_mono'] = now_mono
-        if last_tick is None:
-            elapsed_seconds = float(tick_seconds or 1.0)
-        else:
-            elapsed_seconds = now_mono - float(last_tick)
-        elapsed_seconds = max(0.5, min(120.0, elapsed_seconds))
-
-        infos_all: List[dict] = []
-        wan_infos: List[dict] = []
-        key_meta: Dict[str, dict] = {}
-        lan_idx = 0
-        wan_idx = 0
-
-        for session in active:
-            is_wan = bool(is_wan_playback_session(session))
-            bps = max(0, int(session_docker_share_bps(session) or 0))
-            if bps <= 0:
-                bps = max(0, int(session_stream_bps(session) or 0))
-            if is_wan:
-                wan_idx += 1
-                sid = str(
-                    session.get('emby_session_id')
-                    or session.get('session_id')
-                    or session.get('id')
-                    or ''
-                ).strip()
-                persist_key = playback_accumulator_key(session)
-                if not persist_key and sid:
-                    persist_key = f'sid:{sid}'
-                runtime_key = _session_runtime_lookup_key(
-                    session, fallback=f'wan-ephemeral:{wan_idx}',
-                )
-                is_new, is_seek = _touch_session_flags(
-                    runtime,
-                    runtime_key,
-                    session,
-                    now_mono,
-                    now_epoch,
-                    new_window,
-                    seek_window,
-                )
-                sessions_state = runtime.setdefault('sessions', {})
-                runtime_entry = sessions_state.get(runtime_key) or {}
-                old_persist = str(runtime_entry.get('persist_key') or '').strip()
-                new_persist = str(persist_key or '').strip()
-                if old_persist and new_persist and old_persist != new_persist:
-                    _migrate_accumulator_key(name, old_persist, new_persist, now_mono)
-                if new_persist:
-                    runtime_entry['persist_key'] = new_persist
-                    sessions_state[runtime_key] = runtime_entry
-                info_key = runtime_key
-                info = {
-                    'key': info_key,
-                    'bps': bps,
-                    'is_new': is_new,
-                    'is_seek': is_seek,
-                }
-                infos_all.append(info)
-                wan_infos.append(info)
-                key_meta[info_key] = {
-                    'is_wan': True,
-                    'persist_key': persist_key if persist_key else None,
-                }
-                continue
-
-            lan_idx += 1
-            info_key = f'lan:{lan_idx}'
-            info = {
-                'key': info_key,
-                'bps': bps,
-                'is_new': False,
-                'is_seek': False,
-            }
-            infos_all.append(info)
-            key_meta[info_key] = {
-                'is_wan': False,
-                'persist_key': None,
-            }
-
-        if not infos_all:
-            _set_live_tick_uploads(name, {})
-            _cleanup_runtime_state(
-                name, runtime, now_mono, max(new_window, seek_window) + _SESSION_STATE_GRACE_SECONDS,
-            )
-            return _allocation_debug_payload(
-                total_upload_bytes=delta_up,
-                remainder_bytes=delta_up,
-            )
-
-        allocation_infos = wan_infos if wan_pool_only else infos_all
-        if not allocation_infos:
-            _set_live_tick_uploads(name, {})
-            _cleanup_runtime_state(
-                name, runtime, now_mono, max(new_window, seek_window) + _SESSION_STATE_GRACE_SECONDS,
-            )
-            return _allocation_debug_payload(
-                total_upload_bytes=delta_up,
-                remainder_bytes=delta_up,
-                target_session_count=len(infos_all),
-                wan_session_count=len(wan_infos),
-                lan_session_count=max(0, len(infos_all) - len(wan_infos)),
-            )
-
-        if wan_pool_only and wan_infos:
-            # 输入已是 filter 切出的 WAN 池，全量分给外网会话（突发优先新/seek 会话）。
-            burst_targets = _pick_burst_targets(wan_infos, mode)
-            primary = burst_targets if burst_targets else wan_infos
-            merged = _distribute_weighted(delta_up, primary)
-            assigned = sum(merged.values())
-            remainder = max(0, delta_up - assigned)
-            if remainder > 0:
-                extra = _distribute_weighted(remainder, wan_infos)
-                for key, amount in extra.items():
-                    merged[key] = merged.get(key, 0) + amount
-        else:
-            expected_pool = _estimate_expected_pool_bytes(allocation_infos, elapsed_seconds)
-            base_pool = min(delta_up, expected_pool)
-            base_shares = _distribute_weighted(base_pool, allocation_infos)
-            assigned_base = sum(base_shares.values())
-            burst_pool = max(0, delta_up - assigned_base)
-            burst_targets = _pick_burst_targets(wan_infos, mode)
-            burst_fallback = allocation_infos if wan_pool_only else infos_all
-            burst_shares = _distribute_weighted(
-                burst_pool,
-                burst_targets if burst_targets else burst_fallback,
-            )
-            merged: Dict[str, int] = {}
-            for mapping in (base_shares, burst_shares):
-                for key, amount in mapping.items():
-                    if amount <= 0:
-                        continue
-                    merged[key] = merged.get(key, 0) + amount
-
-        wan_upload = 0
-        lan_upload = 0
-        wan_tick_uploads: Dict[str, int] = {}
-        for key, amount in merged.items():
-            meta = key_meta.get(key) or {}
-            amount = max(0, int(amount or 0))
-            if amount <= 0:
-                continue
-            if meta.get('is_wan'):
-                wan_upload += amount
-                persist_key = str(meta.get('persist_key') or '').strip()
-                if persist_key:
-                    wan_tick_uploads[persist_key] = wan_tick_uploads.get(persist_key, 0) + amount
-            else:
-                lan_upload += amount
-
-        _set_live_tick_uploads(name, wan_tick_uploads)
-        if wan_tick_uploads:
-            bucket = _upload_accumulators.setdefault(name, {})
-            for key, amount in wan_tick_uploads.items():
-                bucket[key] = bucket.get(key, 0) + amount
-                _touch_accumulator_key(name, key, now_mono)
-
-        _cleanup_runtime_state(
-            name, runtime, now_mono, max(new_window, seek_window) + _SESSION_STATE_GRACE_SECONDS,
-        )
-        assigned_total = max(0, wan_upload + lan_upload)
-        return _allocation_debug_payload(
-            total_upload_bytes=delta_up,
-            wan_upload_bytes=wan_upload,
-            lan_upload_bytes=lan_upload,
-            assigned_bytes=assigned_total,
-            remainder_bytes=max(0, delta_up - assigned_total),
-            target_session_count=len(infos_all),
-            wan_session_count=len(wan_infos),
-            lan_session_count=max(0, len(infos_all) - len(wan_infos)),
-        )
-
-
 def _segment_traffic_key(record: dict) -> str:
     persist = playback_accumulator_key(record) or str(
         record.get('upload_accumulator_key') or '',
@@ -1067,6 +678,62 @@ def clear_lucky_bindings_for_persist_key(instance_name: str, persist_key: str) -
         for addr in list(hints.keys()):
             if str(hints.get(addr) or '').strip() == target:
                 hints.pop(addr, None)
+
+
+def release_segment_upload_state(instance_name: str, record: dict) -> None:
+    """程序重启结案：清除段级累加器与持久化，避免同一 sid 灌进新片/新集。"""
+    name = (instance_name or '').strip()
+    if not name or not isinstance(record, dict):
+        return
+    keys: Set[str] = set()
+    for factory in (playback_accumulator_key, legacy_playback_accumulator_key):
+        try:
+            k = factory(record)
+        except Exception:
+            k = ''
+        if k:
+            keys.add(str(k).strip())
+    sid = str(record.get('emby_session_id') or '').strip()
+    if sid:
+        keys.add(f'sid:{sid}')
+    keys = {k for k in keys if k}
+    if not keys:
+        return
+    with _lock:
+        bucket = _upload_accumulators.get(name) or {}
+        touched = _accumulator_touch_mono.get(name)
+        for key in keys:
+            bucket.pop(key, None)
+            if isinstance(touched, dict):
+                touched.pop(key, None)
+        if not bucket:
+            _upload_accumulators.pop(name, None)
+        if isinstance(touched, dict) and not touched:
+            _accumulator_touch_mono.pop(name, None)
+    _delete_persisted_upload_keys(name, list(keys))
+    for key in keys:
+        clear_lucky_bindings_for_persist_key(name, key)
+
+
+def _filter_shares_by_allowed_keys(
+    shares: Dict[str, int],
+    allowed_persist_keys: Optional[Set[str]],
+) -> Tuple[Dict[str, int], int]:
+    if not allowed_persist_keys:
+        return dict(shares or {}), 0
+    allowed = set(allowed_persist_keys)
+    kept: Dict[str, int] = {}
+    discarded = 0
+    for key, amount in (shares or {}).items():
+        k = str(key or '').strip()
+        val = max(0, int(amount or 0))
+        if not k or val <= 0:
+            continue
+        if k in allowed:
+            kept[k] = kept.get(k, 0) + val
+        else:
+            discarded += val
+    return kept, discarded
 
 
 def _lucky_runtime(instance_name: str) -> dict:
@@ -1535,6 +1202,7 @@ def accumulate_wan_upload_by_conn(
     tick_seconds: float = None,
     credit_browse: bool = False,
     ip_deltas: Dict[str, int] = None,
+    allowed_persist_keys: Optional[Set[str]] = None,
 ) -> dict:
     """Lucky：按 ConnsStatistics 连接级增量归属到外网会话。
 
@@ -1697,6 +1365,18 @@ def accumulate_wan_upload_by_conn(
             continue
         primary_pkey = next(iter(credited_pkeys))
         conn_shares[primary_pkey] = conn_shares.get(primary_pkey, 0) + shortfall
+
+    conn_shares, share_discarded = _filter_shares_by_allowed_keys(
+        conn_shares, allowed_persist_keys,
+    )
+    if share_discarded > 0:
+        remainder_total += share_discarded
+    browse_filtered, browse_discarded = _filter_shares_by_allowed_keys(
+        browse_shares, allowed_persist_keys,
+    )
+    browse_shares = browse_filtered
+    if browse_discarded > 0:
+        remainder_total += browse_discarded
 
     assigned_total = _apply_conn_deltas_to_accumulator(name, conn_shares)
     assigned_total += _apply_conn_deltas_to_browse_accumulator(name, browse_shares)
@@ -2007,7 +1687,13 @@ def take_accumulated_upload(instance_name: str, event: dict) -> Optional[int]:
     return raw
 
 
-def _assign_lucky_ip_upload(instance_name: str, sessions: list, delta_up: int) -> dict:
+def _assign_lucky_ip_upload(
+    instance_name: str,
+    sessions: list,
+    delta_up: int,
+    *,
+    allowed_persist_keys: Optional[Set[str]] = None,
+) -> dict:
     """Lucky 回退路径：同 IP 多会话时按码率权重分摊。"""
     name = (instance_name or '').strip()
     delta_up = max(0, int(delta_up or 0))
@@ -2023,13 +1709,22 @@ def _assign_lucky_ip_upload(instance_name: str, sessions: list, delta_up: int) -
         for s in active
     ]
     infos = [i for i in infos if i.get('key')]
+    if allowed_persist_keys:
+        allowed = set(allowed_persist_keys)
+        infos = [i for i in infos if i.get('key') in allowed]
+        if not infos:
+            return _allocation_debug_payload(
+                total_upload_bytes=delta_up,
+                remainder_bytes=delta_up,
+            )
     shares = _distribute_weighted(delta_up, infos)
+    shares, discarded = _filter_shares_by_allowed_keys(shares, allowed_persist_keys)
     assigned = _apply_conn_deltas_to_accumulator(name, shares)
     return _allocation_debug_payload(
         total_upload_bytes=delta_up,
         wan_upload_bytes=assigned,
         assigned_bytes=assigned,
-        remainder_bytes=max(0, delta_up - assigned),
+        remainder_bytes=max(0, delta_up - assigned) + discarded,
         target_session_count=len(active),
         wan_session_count=len(active),
     )
@@ -2041,6 +1736,7 @@ def accumulate_wan_upload_by_ip(
     ip_deltas: Dict[str, int],
     *,
     tick_seconds: float = None,
+    allowed_persist_keys: Optional[Set[str]] = None,
 ) -> dict:
     """Lucky 模式：按客户端 IP 增量分摊到对应外网会话。"""
     name = (instance_name or '').strip()
@@ -2073,7 +1769,10 @@ def accumulate_wan_upload_by_ip(
         if not ip_sessions:
             continue
         matched_ips.add(ip)
-        part = _assign_lucky_ip_upload(name, ip_sessions, delta)
+        part = _assign_lucky_ip_upload(
+            name, ip_sessions, delta,
+            allowed_persist_keys=allowed_persist_keys,
+        )
         assigned = int(
             part.get('wan_upload_bytes') or part.get('assigned_bytes') or 0,
         )
@@ -2100,7 +1799,10 @@ def accumulate_wan_upload_by_ip(
                 s for s in active_remote
                 if parse_endpoint_ip(s.get('remote_endpoint') or '') not in matched_ips
             ] or active_remote
-        part = _assign_lucky_ip_upload(name, fallback_sessions, unmatched_delta)
+        part = _assign_lucky_ip_upload(
+            name, fallback_sessions, unmatched_delta,
+            allowed_persist_keys=allowed_persist_keys,
+        )
         assigned = int(
             part.get('wan_upload_bytes') or part.get('assigned_bytes') or 0,
         )

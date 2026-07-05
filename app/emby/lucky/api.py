@@ -22,20 +22,20 @@ _MIN_STREAM_CONN_BYTES = 64 * 1024
 
 def normalize_traffic_collect_mode(value) -> str:
     mode = str(value or '').strip().lower()
-    if mode in ('docker', 'lucky'):
-        return mode
+    if mode == 'lucky':
+        return 'lucky'
     return ''
 
 
 def migrate_estimate_upload_flag(inst: dict) -> str:
-    """旧版 estimate_upload_enabled → traffic_collect_mode。"""
+    """旧版 estimate_upload_enabled / docker 模式 → 清空（仅保留 lucky）。"""
     if not isinstance(inst, dict):
         return ''
     mode = normalize_traffic_collect_mode(inst.get('traffic_collect_mode'))
     if mode:
         return mode
     if bool(inst.get('estimate_upload_enabled', False)):
-        return 'docker'
+        return ''
     return ''
 
 

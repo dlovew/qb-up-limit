@@ -464,8 +464,8 @@ def peek_snapshot_deltas(instance_name: str, tx_bytes: int, rx_bytes: int):
             conn.close()
 
 
-def has_docker_baseline(instance_name: str) -> bool:
-    """库内是否已有 Docker 计数基线（用于离线恢复补录）。"""
+def has_snapshot_baseline(instance_name: str) -> bool:
+    """库内是否已有流量快照基线（Lucky 离线恢复补录用）。"""
     with _lock:
         conn = get_conn()
         try:

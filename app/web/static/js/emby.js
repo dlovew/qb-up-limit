@@ -20,13 +20,6 @@ function isEmbyDebugModeEnabled() {
 }
 
 const EMBY_DEBUG_MODE_ENABLED = isEmbyDebugModeEnabled();
-const EMBY_DEBUG_NEW_WINDOW_DEFAULT = 8;
-const EMBY_DEBUG_SEEK_WINDOW_DEFAULT = 6;
-const EMBY_DEBUG_PRIORITY_DEFAULT = 'seek_first';
-const EMBY_DEBUG_MODE_SWITCH_GRACE_DEFAULT = 2;
-const EMBY_M3_WAN_POOL_SCALE_DEFAULT = 1.0;
-const EMBY_M3_WAN_POOL_SCALE_MIN = 0.5;
-const EMBY_M3_WAN_POOL_SCALE_MAX = 1.5;
 const EMBY_BROWSE_UPLOAD_MIN_MB_DEFAULT = 1.0;
 const EMBY_BROWSE_UPLOAD_MIN_MB_MIN = 0;
 const EMBY_BROWSE_UPLOAD_MIN_MB_MAX = 100;
@@ -43,13 +36,12 @@ let embyDebugFloatZIndex = 12000;
 
 function resolveEmbyInstanceCollectMode(inst) {
     const mode = String(inst?.traffic_collect_mode || '').trim().toLowerCase();
-    return mode === 'docker' || mode === 'lucky' ? mode : '';
+    return mode === 'lucky' ? 'lucky' : '';
 }
 
 function getEmbyDebugPanelTitle(inst) {
     const mode = resolveEmbyInstanceCollectMode(inst);
     if (mode === 'lucky') return 'Lucky模式 调试面板';
-    if (mode === 'docker') return 'docker模式 调试面板';
     return '未开启流量采集';
 }
 
@@ -122,29 +114,6 @@ function clampEmbyDebugWindowPosition(left, top, width, height) {
 
 function normalizeEmbyDebugTrafficConfig(raw = null) {
     const src = raw || {};
-    const newWindowRaw = parseInt(
-        src.new_session_window_seconds ?? src.emby_burst_new_session_window_seconds,
-        10,
-    );
-    const seekWindowRaw = parseInt(
-        src.seek_window_seconds ?? src.emby_burst_seek_window_seconds,
-        10,
-    );
-    const modeSwitchGraceRaw = parseInt(
-        src.mode_switch_grace_seconds ?? src.emby_mode_switch_grace_seconds,
-        10,
-    );
-    const priorityRaw = String(
-        src.priority_mode ?? src.emby_burst_priority_mode ?? EMBY_DEBUG_PRIORITY_DEFAULT,
-    ).trim().toLowerCase();
-    const newWindow = Number.isFinite(newWindowRaw) ? newWindowRaw : EMBY_DEBUG_NEW_WINDOW_DEFAULT;
-    const seekWindow = Number.isFinite(seekWindowRaw) ? seekWindowRaw : EMBY_DEBUG_SEEK_WINDOW_DEFAULT;
-    const modeSwitchGrace = Number.isFinite(modeSwitchGraceRaw)
-        ? modeSwitchGraceRaw
-        : EMBY_DEBUG_MODE_SWITCH_GRACE_DEFAULT;
-    const m3ScaleRaw = parseFloat(
-        src.m3_wan_pool_scale ?? src.emby_m3_wan_pool_scale,
-    );
     const browseMinMbRaw = parseFloat(
         src.browse_upload_min_mb ?? src.emby_browse_upload_min_mb,
     );
@@ -155,7 +124,6 @@ function normalizeEmbyDebugTrafficConfig(raw = null) {
         src.preplay_burst_window_seconds ?? src.emby_preplay_burst_window_seconds,
         10,
     );
-    const m3Scale = Number.isFinite(m3ScaleRaw) ? m3ScaleRaw : EMBY_M3_WAN_POOL_SCALE_DEFAULT;
     const browseMinMb = Number.isFinite(browseMinMbRaw)
         ? browseMinMbRaw
         : EMBY_BROWSE_UPLOAD_MIN_MB_DEFAULT;
@@ -166,10 +134,6 @@ function normalizeEmbyDebugTrafficConfig(raw = null) {
         ? preplayBurstWindowRaw
         : EMBY_PREPLAY_BURST_WINDOW_DEFAULT;
     return {
-        new_session_window_seconds: Math.max(1, Math.min(30, newWindow)),
-        seek_window_seconds: Math.max(1, Math.min(30, seekWindow)),
-        priority_mode: priorityRaw === 'new_first' ? 'new_first' : EMBY_DEBUG_PRIORITY_DEFAULT,
-        mode_switch_grace_seconds: Math.max(0, Math.min(10, modeSwitchGrace)),
         preplay_burst_mbps: Math.max(
             EMBY_PREPLAY_BURST_MBPS_MIN,
             Math.min(EMBY_PREPLAY_BURST_MBPS_MAX, Math.round(preplayBurstMbps * 100) / 100),
@@ -177,10 +141,6 @@ function normalizeEmbyDebugTrafficConfig(raw = null) {
         preplay_burst_window_seconds: Math.max(
             EMBY_PREPLAY_BURST_WINDOW_MIN,
             Math.min(EMBY_PREPLAY_BURST_WINDOW_MAX, Math.round(preplayBurstWindow)),
-        ),
-        m3_wan_pool_scale: Math.max(
-            EMBY_M3_WAN_POOL_SCALE_MIN,
-            Math.min(EMBY_M3_WAN_POOL_SCALE_MAX, Math.round(m3Scale * 100) / 100),
         ),
         browse_upload_min_mb: Math.max(
             EMBY_BROWSE_UPLOAD_MIN_MB_MIN,
@@ -274,13 +234,6 @@ function syncEmbyBrowseLogHintText() {
     hint.textContent = buildEmbyBrowseLogHintText();
 }
 
-function resolveEmbyModeSwitchRefreshSeconds(inst = null) {
-    const refreshRaw = parseInt(inst?.refresh_interval, 10);
-    return Number.isFinite(refreshRaw) && refreshRaw > 0
-        ? Math.max(1, Math.min(10, refreshRaw))
-        : 1;
-}
-
 function resolveEmbyRefreshInterval(inst) {
     const n = parseInt(inst?.refresh_interval, 10);
     if (Number.isFinite(n) && n > 0) return n;
@@ -303,10 +256,6 @@ function formatEmbyCollectIntervalLabel(inst) {
     const refreshSec = resolveEmbyRefreshInterval(inst);
     const collectSec = resolveEmbyCollectInterval(inst);
     return `${refreshSec}秒刷新 · ${collectSec}秒采集`;
-}
-
-function embyDebugPriorityLabel(mode) {
-    return mode === 'new_first' ? '新会话优先' : '跳转优先';
 }
 
 function inferEmbyDebugModeLabel(inst) {
@@ -1006,16 +955,13 @@ function isEmbyTrafficCollectEnabled(instanceName) {
 }
 
 function getEmbyUploadTrafficLabel(instanceName) {
-    return getEmbyTrafficCollectMode(instanceName) === 'lucky' ? '已上传' : '估算上传';
+    return getEmbyTrafficCollectMode(instanceName) === 'lucky' ? '已上传' : '';
 }
 
 function buildEmbyTrafficDataHint(inst) {
     const mode = getEmbyTrafficCollectMode(inst?.name);
-    if (mode !== 'lucky' && mode !== 'docker') {
+    if (mode !== 'lucky') {
         return '未开启流量采集';
-    }
-    if (mode === 'docker') {
-        return '按外网用户统计（docker估算模式），不统计局域网流量';
     }
     return '按外网用户统计，不统计局域网流量';
 }
@@ -1440,13 +1386,51 @@ function buildEmbySessionTrafficStatsHtml(session, instanceName = '', options = 
     return `<span class="${classNames}">${parts.join(sep)}</span>`;
 }
 
+function resolveEmbyUploadRestartHint(rec) {
+    if (!rec) return null;
+    const reason = String(rec?.settle_reason || '').trim();
+    if (reason === 'restart_recovery') {
+        if (rec.status === 'playing') return null;
+        return {
+            suffix: '（服务中断前）',
+            title: '服务中断前的上传量，离线期间已换集，部分流量未统计。',
+        };
+    }
+    if (rec.resumed_after_recovery) {
+        return {
+            suffix: '（续传）',
+            title: '服务恢复后续传，离线期间未换集，流量已补录。',
+        };
+    }
+    if (rec.started_after_recovery) {
+        return {
+            suffix: '（服务恢复后）',
+            title: '服务恢复后的上传量，离线期间已换集，部分流量未统计。',
+        };
+    }
+    return null;
+}
+
+function buildEmbyUploadTrafficBadgeHtml(instanceName, bytes, rec = null) {
+    const text = formatEmbyEstimatedUpload(bytes);
+    if (!text) return '';
+    const label = getEmbyUploadTrafficLabel(instanceName);
+    if (!label) return '';
+    const hint = resolveEmbyUploadRestartHint(rec);
+    const body = hint
+        ? `${label} ${text}${hint.suffix}`
+        : `${label} ${text}`;
+    const titleAttr = hint?.title
+        ? ` title="${escapeHtml(hint.title)}"`
+        : '';
+    return `<span class="emby-session-badge emby-event-badge--upload"${titleAttr}>${escapeHtml(body)}</span>`;
+}
+
 function buildEmbyPlaybackRecordTrafficHtml(rec) {
     if (rec?.status !== 'playing') return '';
     if (!shouldShowEmbySessionTrafficStats(rec, rec.instance_name)) return '';
     const { liveTotalBytes } = resolveEmbySessionTrafficBytes(rec, rec.instance_name);
-    const totalText = formatEmbyLiveUploadDebugText(liveTotalBytes);
-    const label = getEmbyUploadTrafficLabel(rec.instance_name);
-    return `<span class="emby-session-badge emby-event-badge--upload">${escapeHtml(label)} ${escapeHtml(totalText)}</span>`;
+    return buildEmbyUploadTrafficBadgeHtml(rec.instance_name, liveTotalBytes, rec);
 }
 
 /** @deprecated 保留别名，内部已改为常规展示 */
@@ -2601,11 +2585,7 @@ function formatLuckyHostPort(inst) {
 function getEmbyRecentDisplays(inst) {
     const refreshSec = resolveEmbyRefreshInterval(inst);
     const mode = String(inst?.traffic_collect_mode || '').trim().toLowerCase();
-    const collecting = mode === 'docker'
-        ? !!inst.docker_available
-        : mode === 'lucky'
-            ? !!inst.lucky_available
-            : false;
+    const collecting = mode === 'lucky' ? !!inst.lucky_available : false;
     if (!inst.api_online && !collecting) {
         return { upload: '--', download: '--', refreshSec };
     }
@@ -2619,7 +2599,6 @@ function getEmbyRecentDisplays(inst) {
 function formatEmbyCollectModeLabel(inst) {
     const mode = String(inst?.traffic_collect_mode || '').trim().toLowerCase();
     if (mode === 'lucky') return 'Lucky 准确模式';
-    if (mode === 'docker') return 'Docker 估算模式';
     return '未开启';
 }
 
@@ -2627,9 +2606,6 @@ function getEmbyDataPanelAccentClass(inst) {
     const mode = String(inst?.traffic_collect_mode || '').trim().toLowerCase();
     if (mode === 'lucky') {
         return inst.lucky_available ? 'panel-accent--ok' : 'panel-accent--offline';
-    }
-    if (mode === 'docker') {
-        return inst.docker_available ? 'panel-accent--ok' : 'panel-accent--offline';
     }
     return 'panel-accent--offline';
 }
@@ -2701,21 +2677,6 @@ function buildEmbyAddressEndpointHTML(inst) {
         </span>`;
 }
 
-function buildEmbyDockerPopoverContent(inst) {
-    const container = inst.container_name || inst.container_id || '未配置';
-    if (inst.docker_available) {
-        return `
-            <div class="badge-popover-title">Docker 流量采集正常</div>
-            <div class="badge-popover-meta badge-popover-meta--emph">${escapeHtml(container)}</div>
-            <div class="badge-popover-meta">页面刷新 ${resolveEmbyRefreshInterval(inst)} 秒</div>
-            <div class="badge-popover-meta">数据采集 ${resolveEmbyCollectInterval(inst)} 秒</div>`;
-    }
-    return `
-        <div class="badge-popover-title">Docker 未采集</div>
-        <div class="badge-popover-meta">${escapeHtml(container)}</div>
-        <div class="badge-popover-meta">请配置容器名/ID 并挂载 docker.sock</div>`;
-}
-
 function buildEmbyLuckyPopoverContent(inst) {
     const rule = inst.lucky_rule_label || '未选择规则';
     if (inst.lucky_available) {
@@ -2734,7 +2695,6 @@ function buildEmbyLuckyPopoverContent(inst) {
 function embyCollectBadgeSignature(inst) {
     const mode = String(inst?.traffic_collect_mode || '').trim().toLowerCase();
     if (mode === 'lucky') return `lucky:${inst.lucky_available ? 1 : 0}`;
-    if (mode === 'docker') return `docker:${inst.docker_available ? 1 : 0}`;
     return 'none:0';
 }
 
@@ -2745,14 +2705,6 @@ function buildEmbyCollectBadgeHTML(inst) {
         return wrapStatusBadgePopover(
             `<span class="status-badge ${ok ? 'online' : 'offline'} emby-badge-lucky">${buildInfoMetricIcon('upload')}<span data-field="badge-collect">Lucky ${ok ? '采集' : '未采集'}</span></span>`,
             buildEmbyLuckyPopoverContent(inst),
-            ok ? 'online' : 'offline',
-        );
-    }
-    if (mode === 'docker') {
-        const ok = !!inst.docker_available;
-        return wrapStatusBadgePopover(
-            `<span class="status-badge ${ok ? 'online' : 'offline'} emby-badge-docker">${buildInfoMetricIcon('upload')}<span data-field="badge-collect">Docker ${ok ? '采集' : '未采集'}</span></span>`,
-            buildEmbyDockerPopoverContent(inst),
             ok ? 'online' : 'offline',
         );
     }
@@ -2794,9 +2746,6 @@ function buildEmbyDebugWindowBodyHtml(inst, options = {}) {
     const metrics = normalizeEmbyDebugTrafficMetrics(inst);
     const isLucky = metrics.collectMode === 'lucky';
     const luckyIpRevealed = !!options.ipRevealed;
-    const modeSwitchRefreshSeconds = resolveEmbyModeSwitchRefreshSeconds(inst);
-    const modeSwitchGraceTip = `模式切换时若会话接口晚于 Docker 流量更新，可在这段时间（秒）内暂缓把上传计入程序余量，待会话确认再回放到目标模式，建议与页面刷新间隔 [[${modeSwitchRefreshSeconds}]] 秒一致，范围 0-10 秒。`;
-    const m3WanPoolScaleTip = `仅 M3（局域网+外网）生效：对码率权重切出的 WAN 池乘以该系数。分摊权重已按各会话 transcode_kind 与音视频分量码率自动计算（直串流/音视频转码/仅音频转码等组合无需逐个调参）。1.0 为默认；若 Emby 上报码率与路由仍有系统性偏差，可用 1.05～1.10 或 0.90～0.95 做全局微调（长时间播放可能漂移）。M2 不受影响。范围 ${EMBY_M3_WAN_POOL_SCALE_MIN}～${EMBY_M3_WAN_POOL_SCALE_MAX}。`;
     const browseUploadMinMbTip = '选片时产生的上传流量累计超过此值，才会记入选片记录和统计。设为 0 表示只要有上传就记录；用户已缓存、几乎不产生上传的浏览本身就不算。默认值1，范围 0～100 MB。';
     const preplayBurstMbpsTip = '与「开播突发窗口」配合使用：每次点击开播后，前 N 秒内上传速率 ≥ 本阈值的流量，视为推流突发，计入播放，不计为选片流量。填写参考：在调试面板观察该连接，点击播放瞬间留意前几秒的实时上传速率（+xxx/s），取略低于最低的突发速率。服务器上行带宽大、缓冲推得猛，可适当调高；带宽一般或选片阶段常有较大上传，可适当调低以免误判。默认 1.5 MB/s，范围 0.5～10。';
     const preplayBurstWindowTip = '与「开播突发阈值」配合使用：每次点击开播后，往前回溯本窗口秒数；该时段内上传速率达到阈值的流量，视为推流突发，计入播放，不计为选片流量。填写参考：点击播放后，观察推流突发通常持续几秒（多数 1～3 秒，慢网或高码率可能 4～5 秒），窗口略大于实际突发时长即可，不必过长以免把真选片流量算进去。默认 3 秒，范围 1～10。';
@@ -2870,78 +2819,14 @@ function buildEmbyDebugWindowBodyHtml(inst, options = {}) {
                     </div>
                 </div>
             </div>`
-        : '';
-    const trafficSectionHtml = isLucky
-        ? luckyLayoutHtml
         : `
-                <div class="emby-debug-section">
-                    <div class="emby-debug-section-title">实时流量拆分</div>
-                    <div class="emby-debug-traffic-grid">
-                        <div class="emby-debug-traffic-item" data-accent="upload">
-                            <span class="emby-debug-traffic-label">总上传流量</span>
-                            <strong class="emby-debug-traffic-value" data-field="total-upload">${escapeHtml(formatEmbyTrafficText(metrics.totalUploadBytes))}</strong>
-                        </div>
-                        <div class="emby-debug-traffic-item" data-accent="wan">
-                            <span class="emby-debug-traffic-label">总 WAN 流量</span>
-                            <strong class="emby-debug-traffic-value" data-field="total-wan">${escapeHtml(formatEmbyTrafficText(metrics.wanUploadBytes))}</strong>
-                        </div>
-                        <div class="emby-debug-traffic-item" data-accent="lan">
-                            <span class="emby-debug-traffic-label">总 LAN 流量</span>
-                            <strong class="emby-debug-traffic-value" data-field="total-lan">${escapeHtml(formatEmbyTrafficText(metrics.lanUploadBytes))}</strong>
-                        </div>
-                        <div class="emby-debug-traffic-item" data-accent="remainder">
-                            <span class="emby-debug-traffic-label">程序余量</span>
-                            <strong class="emby-debug-traffic-value" data-field="program-remainder">${escapeHtml(formatEmbyTrafficText(metrics.programRemainderBytes))}</strong>
-                        </div>
-                    </div>
-                    <div class="emby-debug-traffic-meta">
-                        <span class="emby-debug-traffic-meta-item">待判定挂起 <strong data-field="mode-switch-pending">${escapeHtml(formatEmbyTrafficText(metrics.modeSwitchPendingBytes))}</strong></span>
-                        <span class="emby-debug-traffic-meta-item">累计回放 <strong data-field="mode-switch-replay-total">${escapeHtml(formatEmbyTrafficText(metrics.modeSwitchReplayTotalBytes))}</strong></span>
-                        <span class="emby-debug-traffic-meta-item">累计回放入分摊 <strong data-field="mode-switch-replay-alloc-total">${escapeHtml(formatEmbyTrafficText(metrics.modeSwitchReplayAllocTotalBytes))}</strong></span>
-                        <span class="emby-debug-traffic-meta-item">分摊 backlog <strong data-field="wan-alloc-backlog">${escapeHtml(formatEmbyTrafficText(metrics.wanAllocBacklogBytes))}</strong></span>
-                        <span class="emby-debug-traffic-meta-item">本 tick 分摊 backlog <strong data-field="wan-alloc-backlog-applied">${escapeHtml(formatEmbyTrafficText(metrics.wanAllocBacklogAppliedBytes))}</strong></span>
-                        <span class="emby-debug-traffic-meta-item">M1 首段捕获 <strong data-field="m1-wan-capture">${escapeHtml(formatEmbyTrafficText(metrics.m1WanCaptureBytes))}</strong></span>
-                    </div>
-                </div>`;
-    const paramSectionHtml = isLucky
-        ? ''
-        : `
-                <div class="emby-debug-section">
-                    <div class="emby-debug-section-title">
-                        分摊参数
-                        <span class="emby-debug-section-hint" data-field="config-save-hint">保存后立即生效</span>
-                    </div>
-                    <div class="emby-debug-config-grid">
-                        <label class="emby-debug-config-field">
-                            <span class="emby-debug-config-field-label">新会话突发窗口<span class="emby-debug-help" tabindex="0" data-tip="新会话开始播放后的这段时间（秒）内视为突发期，瞬时上传增量优先计入突发流量池分摊，建议8秒，范围 1-30 秒。">?</span></span>
-                            <input type="number" min="1" max="30" step="1" value="${cfg.new_session_window_seconds}" data-field="new-window" />
-                        </label>
-                        <label class="emby-debug-config-field">
-                            <span class="emby-debug-config-field-label">跳转突发窗口<span class="emby-debug-help" tabindex="0" data-tip="会话发生进度跳转（Seek）后的这段时间（秒）内视为突发期，瞬时上传增量优先计入突发流量池分摊，建议6秒，范围 1-30 秒。">?</span></span>
-                            <input type="number" min="1" max="30" step="1" value="${cfg.seek_window_seconds}" data-field="seek-window" />
-                        </label>
-                        <label class="emby-debug-config-field">
-                            <span class="emby-debug-config-field-label">突发优先级<span class="emby-debug-help" tabindex="0" data-tip="当同时存在新会话与跳转会话时，决定突发流量池优先分摊给哪一类会话：Seek 优先 或 新会话优先。">?</span></span>
-                            <select data-field="priority-mode">
-                                <option value="seek_first" ${cfg.priority_mode === 'seek_first' ? 'selected' : ''}>${embyDebugPriorityLabel('seek_first')}</option>
-                                <option value="new_first" ${cfg.priority_mode === 'new_first' ? 'selected' : ''}>${embyDebugPriorityLabel('new_first')}</option>
-                            </select>
-                        </label>
-                        <label class="emby-debug-config-field">
-                            <span class="emby-debug-config-field-label">切换缓冲窗口<span class="emby-debug-help" tabindex="0" data-tip="${escapeHtml(modeSwitchGraceTip)}">?</span></span>
-                            <input type="number" min="0" max="10" step="1" value="${cfg.mode_switch_grace_seconds}" data-field="mode-switch-grace" />
-                        </label>
-                        <label class="emby-debug-config-field">
-                            <span class="emby-debug-config-field-label">M3 WAN 池系数<span class="emby-debug-help" tabindex="0" data-tip="${escapeHtml(m3WanPoolScaleTip)}">?</span></span>
-                            <input type="number" min="${EMBY_M3_WAN_POOL_SCALE_MIN}" max="${EMBY_M3_WAN_POOL_SCALE_MAX}" step="0.01" value="${cfg.m3_wan_pool_scale}" data-field="m3-wan-pool-scale" />
-                        </label>
-                    </div>
-                    <div class="emby-debug-config-actions">
-                        <button type="button" class="emby-debug-config-save" onclick="saveEmbyDebugTrafficConfig(this)">保存并应用</button>
-                        <button type="button" class="emby-debug-config-exit" onclick="exitEmbyDebugMode()">退出调试模式</button>
-                    </div>
-                </div>`;
-    return `${trafficSectionHtml}${paramSectionHtml}`;
+            <div class="emby-debug-section emby-debug-section--empty">
+                <p class="form-hint form-hint--field">请在该设备的流量采集中开启 Lucky 反代模式后，再使用调试面板。</p>
+                <div class="emby-debug-config-actions">
+                    <button type="button" class="emby-debug-config-exit" onclick="exitEmbyDebugMode()">退出调试</button>
+                </div>
+            </div>`;
+    return luckyLayoutHtml;
 }
 
 function bindEmbyDebugFloatWindowDrag(win) {
@@ -3014,9 +2899,7 @@ function ensureEmbyDebugFloatWindow(inst) {
         win.dataset.mode = resolveEmbyInstanceCollectMode(inst);
         win.hidden = true;
         const isLuckyWin = win.dataset.mode === 'lucky';
-        const isDockerWin = win.dataset.mode === 'docker';
         if (isLuckyWin) win.classList.add('emby-debug-float-window--lucky');
-        if (isDockerWin) win.classList.add('emby-debug-float-window--docker');
         win.innerHTML = `
             <div class="emby-debug-float-header" data-field="debug-drag-handle">
                 <div class="emby-debug-float-title-wrap">
@@ -3057,9 +2940,7 @@ function openEmbyDebugFloatWindow(instanceName) {
     if (win.dataset.mode !== currentMode) {
         win.dataset.mode = currentMode;
         const isLuckyWin = currentMode === 'lucky';
-        const isDockerWin = currentMode === 'docker';
         win.classList.toggle('emby-debug-float-window--lucky', isLuckyWin);
-        win.classList.toggle('emby-debug-float-window--docker', isDockerWin);
         if (!isLuckyWin) {
             win.querySelectorAll('[data-resize-edge]').forEach((handle) => handle.remove());
             win.style.height = '';
@@ -3340,18 +3221,10 @@ function applyEmbyDebugTrafficConfigToPanel(panel, cfg) {
         const el = panel.querySelector(`[data-field="${field}"]`);
         if (el && value != null) el.value = value;
     };
-    setValue('new-window', normalized.new_session_window_seconds);
-    setValue('seek-window', normalized.seek_window_seconds);
-    setValue('mode-switch-grace', normalized.mode_switch_grace_seconds);
-    setValue('m3-wan-pool-scale', normalized.m3_wan_pool_scale);
     setValue('browse-upload-min-mb', normalized.browse_upload_min_mb);
     setValue('preplay-burst-mbps', normalized.preplay_burst_mbps);
     setValue('preplay-burst-window', normalized.preplay_burst_window_seconds);
     syncPreplayBurstSummaryHint(panel);
-    const priorityEl = panel.querySelector('[data-field="priority-mode"]');
-    if (priorityEl && normalized.priority_mode) {
-        priorityEl.value = normalized.priority_mode;
-    }
 }
 
 async function saveEmbyDebugTrafficConfig(button) {
@@ -3365,62 +3238,10 @@ async function saveEmbyDebugTrafficConfig(button) {
         return;
     }
     const payload = {};
-    const newWindowEl = panel.querySelector('[data-field="new-window"]');
-    const seekWindowEl = panel.querySelector('[data-field="seek-window"]');
-    const modeSwitchGraceEl = panel.querySelector('[data-field="mode-switch-grace"]');
-    const m3WanPoolScaleEl = panel.querySelector('[data-field="m3-wan-pool-scale"]');
-    const priorityModeEl = panel.querySelector('[data-field="priority-mode"]');
     const browseMinMbEl = panel.querySelector('[data-field="browse-upload-min-mb"]');
     const preplayBurstMbpsEl = panel.querySelector('[data-field="preplay-burst-mbps"]');
     const preplayBurstWindowEl = panel.querySelector('[data-field="preplay-burst-window"]');
 
-    if (newWindowEl) {
-        const newWindow = parseInt(newWindowEl.value, 10);
-        if (!Number.isFinite(newWindow) || newWindow < 1 || newWindow > 30) {
-            showEmbyDebugToast('新会话突发窗口请输入 1-30 秒', 'error');
-            return;
-        }
-        payload.new_session_window_seconds = newWindow;
-    }
-    if (seekWindowEl) {
-        const seekWindow = parseInt(seekWindowEl.value, 10);
-        if (!Number.isFinite(seekWindow) || seekWindow < 1 || seekWindow > 30) {
-            showEmbyDebugToast('跳转突发窗口请输入 1-30 秒', 'error');
-            return;
-        }
-        payload.seek_window_seconds = seekWindow;
-    }
-    if (priorityModeEl) {
-        const priorityMode = String(priorityModeEl.value || EMBY_DEBUG_PRIORITY_DEFAULT).trim().toLowerCase();
-        if (priorityMode !== 'seek_first' && priorityMode !== 'new_first') {
-            showEmbyDebugToast('突发优先级无效', 'error');
-            return;
-        }
-        payload.priority_mode = priorityMode;
-    }
-    if (modeSwitchGraceEl) {
-        const modeSwitchGrace = parseInt(modeSwitchGraceEl.value, 10);
-        if (!Number.isFinite(modeSwitchGrace) || modeSwitchGrace < 0 || modeSwitchGrace > 10) {
-            showEmbyDebugToast('切换缓冲窗口请输入 0-10 秒', 'error');
-            return;
-        }
-        payload.mode_switch_grace_seconds = modeSwitchGrace;
-    }
-    if (m3WanPoolScaleEl) {
-        const m3WanPoolScale = parseFloat(m3WanPoolScaleEl.value);
-        if (
-            !Number.isFinite(m3WanPoolScale)
-            || m3WanPoolScale < EMBY_M3_WAN_POOL_SCALE_MIN
-            || m3WanPoolScale > EMBY_M3_WAN_POOL_SCALE_MAX
-        ) {
-            showEmbyDebugToast(
-                `M3 WAN 池系数请输入 ${EMBY_M3_WAN_POOL_SCALE_MIN}～${EMBY_M3_WAN_POOL_SCALE_MAX}`,
-                'error',
-            );
-            return;
-        }
-        payload.m3_wan_pool_scale = Math.round(m3WanPoolScale * 100) / 100;
-    }
     if (browseMinMbEl) {
         const browseMinMb = parseFloat(browseMinMbEl.value);
         if (
@@ -3914,7 +3735,6 @@ function buildEmbyInstanceForm(inst, mode) {
     const priorityMax = typeof DISPLAY_PRIORITY_MAX !== 'undefined' ? DISPLAY_PRIORITY_MAX : 99999;
     const displayPriority = inst?.display_priority ?? (mode === 'add' ? cachedEmbyInstances.length + 1 : 1);
     const collectMode = String(inst?.traffic_collect_mode || '').trim().toLowerCase();
-    const dockerCollectEnabled = collectMode === 'docker';
     const luckyCollectEnabled = collectMode === 'lucky';
     const luckyConn = parseLuckyBaseUrl(inst);
     const luckyHostPort = formatLuckyHostPort(inst);
@@ -3993,16 +3813,9 @@ function buildEmbyInstanceForm(inst, mode) {
                             </span>
                             <span class="emby-traffic-mode-option__desc">准确采集外网播放/选片流量</span>
                         </label>
-                        <label class="emby-traffic-mode-option">
-                            <span class="emby-traffic-mode-option__head">
-                                <input type="checkbox" id="${prefix}EmbyDockerCollectEnabled" ${dockerCollectEnabled ? 'checked' : ''} />
-                                <span class="emby-traffic-mode-option__title">开启 Docker 容器模式</span>
-                            </span>
-                            <span class="emby-traffic-mode-option__desc">容器网络估算，不保证准确</span>
-                        </label>
                     </div>
                 </div>
-                <p id="${prefix}EmbyTrafficModeEmptyHint" class="form-hint form-hint--field emby-traffic-mode-empty-hint" ${luckyCollectEnabled || dockerCollectEnabled ? 'hidden' : ''}>未开启流量采集，播放事件与设备卡片均不展示上传相关数据</p>
+                <p id="${prefix}EmbyTrafficModeEmptyHint" class="form-hint form-hint--field emby-traffic-mode-empty-hint" ${luckyCollectEnabled ? 'hidden' : ''}>未开启流量采集，播放事件与设备卡片均不展示上传相关数据</p>
                 <div id="${prefix}EmbyLuckyPanel" class="emby-traffic-panel emby-traffic-panel--lucky" ${luckyCollectEnabled ? '' : 'hidden'}>
                     <h4 class="emby-traffic-subtitle emby-traffic-subtitle--lucky">Lucky 连接设置</h4>
                     <div class="emby-traffic-panel__body">
@@ -4054,33 +3867,6 @@ function buildEmbyInstanceForm(inst, mode) {
                         </div>
                     </div>
                 </div>
-                <div id="${prefix}EmbyDockerPanel" class="emby-traffic-panel emby-traffic-panel--docker" ${dockerCollectEnabled ? '' : 'hidden'}>
-                    <h4 class="emby-traffic-subtitle emby-traffic-subtitle--docker">Docker 采集设置</h4>
-                    <div class="emby-traffic-panel__body">
-                        <div class="form-row">
-                            <div class="form-field">
-                                <label>Docker 容器名
-                                    <input type="text" id="${prefix}EmbyContainerName" value="${escapeHtml(inst?.container_name || '')}"
-                                           placeholder="emby" />
-                                </label>
-                                <p class="form-hint form-hint--field">与容器 ID 二选一，用于读取网络统计</p>
-                            </div>
-                            <div class="form-field">
-                                <label>Docker 容器 ID
-                                    <input type="text" id="${prefix}EmbyContainerId" value="${escapeHtml(inst?.container_id || '')}"
-                                           placeholder="可选" />
-                                </label>
-                            </div>
-                        </div>
-                        <p class="form-hint form-hint--field">开启前提：Docker 部署 Emby，并映射 docker.sock 至本容器 <code>/var/run/docker.sock:ro</code>，仅估算，不保证准确</p>
-                        <div class="connection-test-panel">
-                            <div class="test-actions">
-                                <button type="button" class="btn-secondary btn-sm" id="${prefix}EmbyDockerTestBtn">🐳 Docker 容器测试</button>
-                            </div>
-                            <div id="${prefix}EmbyDockerTestResult" class="test-result"></div>
-                        </div>
-                    </div>
-                </div>
             </div>
             <div class="modal-actions">
                 <button type="button" class="btn-primary" id="saveEmbyInstanceBtn">✔ 保存</button>
@@ -4091,28 +3877,17 @@ function buildEmbyInstanceForm(inst, mode) {
 
 function bindEmbyTrafficCollectToggles(prefix) {
     const luckyEl = document.getElementById(`${prefix}EmbyLuckyCollectEnabled`);
-    const dockerEl = document.getElementById(`${prefix}EmbyDockerCollectEnabled`);
     const luckyPanel = document.getElementById(`${prefix}EmbyLuckyPanel`);
-    const dockerPanel = document.getElementById(`${prefix}EmbyDockerPanel`);
     const emptyHint = document.getElementById(`${prefix}EmbyTrafficModeEmptyHint`);
-    if (!luckyEl || !dockerEl) return;
+    if (!luckyEl) return;
 
     const syncPanels = () => {
         const luckyOn = luckyEl.checked;
-        const dockerOn = dockerEl.checked;
         if (luckyPanel) luckyPanel.hidden = !luckyOn;
-        if (dockerPanel) dockerPanel.hidden = !dockerOn;
-        if (emptyHint) emptyHint.hidden = luckyOn || dockerOn;
+        if (emptyHint) emptyHint.hidden = luckyOn;
     };
 
-    luckyEl.addEventListener('change', () => {
-        if (luckyEl.checked) dockerEl.checked = false;
-        syncPanels();
-    });
-    dockerEl.addEventListener('change', () => {
-        if (dockerEl.checked) luckyEl.checked = false;
-        syncPanels();
-    });
+    luckyEl.addEventListener('change', syncPanels);
     syncPanels();
 }
 
@@ -4161,7 +3936,6 @@ function collectEmbyLuckyFormFields(prefix) {
 
 function readEmbyTrafficCollectMode(prefix) {
     if (document.getElementById(`${prefix}EmbyLuckyCollectEnabled`)?.checked) return 'lucky';
-    if (document.getElementById(`${prefix}EmbyDockerCollectEnabled`)?.checked) return 'docker';
     return '';
 }
 
@@ -4221,73 +3995,6 @@ function payloadNameFromForm(prefix) {
     return String(document.getElementById(`${prefix}EmbyName`)?.value || '').trim();
 }
 
-function promptEmbyTrafficModeSwitchIfNeeded(baseline, updated) {
-    const prevMode = String(baseline?.traffic_collect_mode || '').trim().toLowerCase();
-    const nextMode = String(updated?.traffic_collect_mode || '').trim().toLowerCase();
-    if (!prevMode || !nextMode || prevMode === nextMode) {
-        return Promise.resolve(null);
-    }
-    if (!['docker', 'lucky'].includes(prevMode) || !['docker', 'lucky'].includes(nextMode)) {
-        return Promise.resolve(null);
-    }
-    return new Promise((resolve) => {
-        const modal = document.getElementById('confirmModal');
-        if (!modal) {
-            resolve(null);
-            return;
-        }
-        const prevLabel = prevMode === 'lucky' ? 'Lucky 准确采集' : 'Docker 估算采集';
-        const nextLabel = nextMode === 'lucky' ? 'Lucky 准确采集' : 'Docker 估算采集';
-        document.getElementById('confirmModalTitle').textContent = '切换流量采集模式';
-        document.getElementById('confirmModalBody').innerHTML = `
-            <div class="modal-form modal-form--confirm">
-                <p class="confirm-message">将从 <b>${escapeHtml(prevLabel)}</b> 切换为 <b>${escapeHtml(nextLabel)}</b>，请选择是否保留该设备已有流量统计。</p>
-                <div class="confirm-option">
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="embyTrafficModeKeepData">
-                        保留数据
-                    </label>
-                </div>
-                <div class="confirm-option">
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="embyTrafficModeClearData">
-                        不保留数据（清空统计）
-                    </label>
-                    <p class="form-hint form-hint-error">将清空该设备全部流量数据并重新累计，此操作不可恢复。</p>
-                </div>
-                <div class="modal-actions">
-                    <button type="button" class="btn-primary" id="embyTrafficModeConfirmBtn" disabled>✔ 确认</button>
-                    <button type="button" class="btn-secondary" id="embyTrafficModeCancelBtn">✖ 取消</button>
-                </div>
-            </div>`;
-        const keepEl = document.getElementById('embyTrafficModeKeepData');
-        const clearEl = document.getElementById('embyTrafficModeClearData');
-        const confirmBtn = document.getElementById('embyTrafficModeConfirmBtn');
-        const syncChoice = (picked) => {
-            if (picked === 'keep') {
-                keepEl.checked = true;
-                clearEl.checked = false;
-            } else if (picked === 'clear') {
-                clearEl.checked = true;
-                keepEl.checked = false;
-            }
-            confirmBtn.disabled = !(keepEl.checked || clearEl.checked);
-        };
-        keepEl.onchange = () => syncChoice(keepEl.checked ? 'keep' : '');
-        clearEl.onchange = () => syncChoice(clearEl.checked ? 'clear' : '');
-        document.getElementById('embyTrafficModeCancelBtn').onclick = () => {
-            if (typeof closeConfirmModal === 'function') closeConfirmModal();
-            resolve(false);
-        };
-        confirmBtn.onclick = () => {
-            if (confirmBtn.disabled) return;
-            if (typeof closeConfirmModal === 'function') closeConfirmModal();
-            resolve(clearEl.checked ? 'clear' : 'keep');
-        };
-        modal.style.display = 'block';
-    });
-}
-
 function bindEmbyLuckyHttpsSslToggle(prefix) {
     const httpsEl = document.getElementById(`${prefix}EmbyLuckyHttps`);
     const sslEl = document.getElementById(`${prefix}EmbyLuckyVerifySsl`);
@@ -4323,7 +4030,6 @@ function bindEmbyHttpsSslToggle(prefix) {
 function bindEmbyTestBtns(mode, originalName) {
     const connectBtn = document.getElementById(`${mode}EmbyConnectivityTestBtn`);
     const apiBtn = document.getElementById(`${mode}EmbyApiTestBtn`);
-    const dockerBtn = document.getElementById(`${mode}EmbyDockerTestBtn`);
     const luckyTestBtn = document.getElementById(`${mode}EmbyLuckyTestBtn`);
     const luckyConnectBtn = document.getElementById(`${mode}EmbyLuckyConnectTestBtn`);
     if (connectBtn) {
@@ -4331,9 +4037,6 @@ function bindEmbyTestBtns(mode, originalName) {
     }
     if (apiBtn) {
         apiBtn.onclick = () => runEmbyInstanceTest(mode, originalName, 'api');
-    }
-    if (dockerBtn) {
-        dockerBtn.onclick = () => runEmbyInstanceTest(mode, originalName, 'docker');
     }
     if (luckyTestBtn) {
         luckyTestBtn.onclick = () => runEmbyInstanceTest(mode, originalName, 'lucky');
@@ -4356,7 +4059,6 @@ function setEmbyTestButtonsState(prefix, activeType, running) {
     const meta = {
         connectivity: { btn: `${prefix}EmbyConnectivityTestBtn`, running: '⏳ 连通性测试中…', label: '🔍 连通性测试' },
         api: { btn: `${prefix}EmbyApiTestBtn`, running: '⏳ API 测试中…', label: '🔑 API 测试' },
-        docker: { btn: `${prefix}EmbyDockerTestBtn`, running: '⏳ Docker 测试中…', label: '🐳 Docker 容器测试' },
         lucky: { btn: `${prefix}EmbyLuckyTestBtn`, running: '⏳ 流量接口测试中…', label: '📊 流量接口测试' },
         lucky_connect: { btn: `${prefix}EmbyLuckyConnectTestBtn`, running: '⏳ 连通性测试中…', label: '🔍 连通性测试' },
     };
@@ -4368,14 +4070,6 @@ function setEmbyTestButtonsState(prefix, activeType, running) {
         btn.disabled = connectionBusy;
         btn.textContent = connectionBusy && activeType === type ? info.running : info.label;
     });
-    const dockerInfo = meta.docker;
-    const dockerBtn = document.getElementById(dockerInfo.btn);
-    if (dockerBtn) {
-        dockerBtn.disabled = running && activeType === 'docker';
-        dockerBtn.textContent = running && activeType === 'docker'
-            ? dockerInfo.running
-            : dockerInfo.label;
-    }
     const luckyBusy = running && (activeType === 'lucky_connect' || activeType === 'lucky');
     ['lucky', 'lucky_connect'].forEach((type) => {
         const info = meta[type];
@@ -4395,11 +4089,9 @@ function buildEmbyTestStepHtml(ok, label, message) {
 }
 
 function showEmbyTestResult(data, prefix, testType) {
-    const resultId = testType === 'docker'
-        ? `${prefix}EmbyDockerTestResult`
-        : testType === 'lucky'
-            ? `${prefix}EmbyLuckyConnectTestResult`
-            : `${prefix}EmbyConnectTestResult`;
+    const resultId = testType === 'lucky'
+        ? `${prefix}EmbyLuckyConnectTestResult`
+        : `${prefix}EmbyConnectTestResult`;
     const resultDiv = document.getElementById(resultId);
     const passText = '测试通过';
     const failText = '测试失败';
@@ -4421,14 +4113,6 @@ function showEmbyTestResult(data, prefix, testType) {
         ].filter(Boolean);
         const msg = parts.length ? parts.join(' · ') : escapeHtml(d.message || 'API 验证成功');
         detailHtml = buildEmbyTestStepHtml(true, 'API', msg);
-    } else if (data.success && testType === 'docker' && data.data) {
-        const d = data.data;
-        const label = d.container_name || d.container_id || '容器';
-        detailHtml = buildEmbyTestStepHtml(
-            true,
-            'Docker',
-            `${escapeHtml(label)}（${escapeHtml(d.state || 'running')}）`,
-        );
     } else if (data.success && testType === 'lucky' && data.data) {
         const d = data.data;
         const msg = d.message || `IP ${d.ip_total || 0} · 连接 ${d.connection_total || 0}`;
@@ -4437,7 +4121,6 @@ function showEmbyTestResult(data, prefix, testType) {
         const failLabels = {
             connectivity: '连通性',
             api: 'API',
-            docker: 'Docker',
             lucky: 'Lucky',
         };
         const label = failLabels[testType] || '测试';
@@ -4505,10 +4188,6 @@ function validateEmbySaveForm(data, mode) {
     }
     if (mode === 'add' && !data.api_key) {
         if (typeof showToast === 'function') showToast('请填写 API Key', 'error');
-        return false;
-    }
-    if (data.traffic_collect_mode === 'docker' && !data.container_name && !data.container_id) {
-        if (typeof showToast === 'function') showToast('Docker 采集需填写容器名或容器 ID', 'error');
         return false;
     }
     if (data.traffic_collect_mode === 'lucky') {
@@ -4614,10 +4293,6 @@ async function runEmbyInstanceTest(mode, originalName, testType) {
     const data = collectEmbyFormData(mode);
     if ((testType === 'connectivity' || testType === 'api') && !validateEmbyTestForm(data)) return;
     if (testType === 'api' && !validateEmbyApiTestForm(data, mode)) return;
-    if (testType === 'docker' && !data.container_name && !data.container_id) {
-        if (typeof showToast === 'function') showToast('请填写 Docker 容器名或容器 ID', 'error');
-        return;
-    }
     if (testType === 'lucky') {
         if (!data.lucky_base_url) {
             if (typeof showToast === 'function') showToast('请填写 Lucky 地址与端口', 'error');
@@ -4634,16 +4309,13 @@ async function runEmbyInstanceTest(mode, originalName, testType) {
     }
 
     embyRunningTests.add(prefix);
-    const resultId = testType === 'docker'
-        ? `${prefix}EmbyDockerTestResult`
-        : testType === 'lucky'
-            ? `${prefix}EmbyLuckyConnectTestResult`
-            : `${prefix}EmbyConnectTestResult`;
+    const resultId = testType === 'lucky'
+        ? `${prefix}EmbyLuckyConnectTestResult`
+        : `${prefix}EmbyConnectTestResult`;
     const resultDiv = document.getElementById(resultId);
     const runningHints = {
         connectivity: '正在测试连通性，请稍候…',
         api: '正在测试 API Key，请稍候…',
-        docker: '正在测试 Docker 容器，请稍候…',
         lucky: '正在测试 Lucky 流量接口，请稍候…',
     };
     const runningHint = runningHints[testType] || '正在测试，请稍候…';
@@ -4719,8 +4391,6 @@ function collectEmbyFormData(mode) {
         verify_ssl: !!document.getElementById(`${prefix}EmbyVerifySsl`)?.checked,
         api_key: String(document.getElementById(`${prefix}EmbyApiKey`)?.value || '').trim(),
         traffic_collect_mode: trafficCollectMode,
-        container_name: String(document.getElementById(`${prefix}EmbyContainerName`)?.value || '').trim(),
-        container_id: String(document.getElementById(`${prefix}EmbyContainerId`)?.value || '').trim(),
         ...collectEmbyLuckyFormFields(prefix),
     };
 }
@@ -4735,8 +4405,6 @@ function collectEmbyBaselineFromInst(inst) {
         port: inst?.port ?? 8096,
         use_https: !!inst?.use_https,
         verify_ssl: !!inst?.verify_ssl,
-        container_name: inst?.container_name || '',
-        container_id: inst?.container_id || '',
         traffic_collect_mode: inst?.traffic_collect_mode || '',
         lucky_base_url: inst?.lucky_base_url || '',
         lucky_verify_ssl: !!inst?.lucky_verify_ssl,
@@ -4754,7 +4422,7 @@ function embyInstanceOnlyBasicsChanged(baseline, updated) {
     if (String(updated.lucky_open_token || '').trim()) return false;
     const keys = [
         'host', 'port', 'use_https', 'verify_ssl',
-        'container_name', 'container_id', 'traffic_collect_mode',
+        'traffic_collect_mode',
         'lucky_base_url', 'lucky_verify_ssl', 'lucky_rule_key', 'lucky_sub_key',
         'lucky_rule_label', 'lucky_frontend_host', 'lucky_credit_browse_traffic',
     ];
@@ -4783,17 +4451,6 @@ async function saveEmbyInstanceSettings(mode, originalName) {
         const resolved = await promptOrphanDataPolicyIfNeeded(mode, originalName, payload, 'emby');
         if (resolved === false) return;
         dataPolicy = resolved;
-    }
-
-    if (mode === 'edit' && _embyInstanceEditBaseline) {
-        const modeDecision = await promptEmbyTrafficModeSwitchIfNeeded(
-            _embyInstanceEditBaseline,
-            payload,
-        );
-        if (modeDecision === false) return;
-        if (modeDecision === 'clear') {
-            payload.clear_traffic_data = true;
-        }
     }
 
     const saveBtn = document.getElementById('saveEmbyInstanceBtn');
@@ -6360,10 +6017,11 @@ function buildEmbyEventUploadBadgeHtml(event, options = {}) {
     const remoteOk = uploadAnyRemote != null ? uploadAnyRemote : event.is_remote;
     if (!remoteOk) return '';
     if (!isEmbyEstimateUploadEnabled(event.instance_name)) return '';
-    const text = formatEmbyEstimatedUpload(event.estimated_upload_bytes);
-    if (!text) return '';
-    const label = getEmbyUploadTrafficLabel(event.instance_name);
-    return `<span class="emby-session-badge emby-event-badge--upload">${escapeHtml(label)}${escapeHtml(text)}</span>`;
+    return buildEmbyUploadTrafficBadgeHtml(
+        event.instance_name,
+        event.estimated_upload_bytes,
+        event,
+    );
 }
 
 function buildEmbyPlaybackRecordStatusBadgeHtml(rec) {

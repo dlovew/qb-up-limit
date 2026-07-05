@@ -222,7 +222,27 @@ def _runtime_bucket(instance_name: str) -> dict:
         bucket.setdefault('offline_since', None)
         bucket.setdefault('was_api_online', True)
         bucket.setdefault('pending_stop_since', {})
+        bucket.setdefault('post_recovery_playback_window', False)
         return bucket
+
+
+def begin_post_recovery_playback_window(instance_name: str) -> None:
+    """Recovery tick：标记后续新建段为「服务恢复后」会话。"""
+    name = (instance_name or '').strip()
+    if not name:
+        return
+    bucket = _runtime_bucket(name)
+    bucket['post_recovery_playback_window'] = True
+
+
+def end_post_recovery_playback_window(instance_name: str) -> None:
+    name = (instance_name or '').strip()
+    if not name:
+        return
+    with _lock:
+        bucket = _runtime.get(name)
+        if isinstance(bucket, dict):
+            bucket['post_recovery_playback_window'] = False
 
 
 def _pending_stop_map(bucket: dict) -> Dict[int, float]:
@@ -320,11 +340,8 @@ def _apply_session_meta(record: dict, session: dict) -> None:
         or record.get('traffic_collect_mode')
         or '',
     ).strip().lower()
-    enabled = mode in ('docker', 'lucky') or bool(
-        prepared.get('estimate_upload_enabled', record.get('estimate_upload_enabled', False)),
-    )
-    record['traffic_collect_mode'] = mode if mode in ('docker', 'lucky') else ''
-    record['estimate_upload_enabled'] = enabled
+    record['traffic_collect_mode'] = mode if mode == 'lucky' else ''
+    record['estimate_upload_enabled'] = mode == 'lucky'
     pos = prepared.get('position_seconds')
     if pos is not None and record.get('status') == 'playing':
         record['end_position_seconds'] = max(0, int(pos))
@@ -349,7 +366,7 @@ def _resolve_upload_bytes(instance_name: str, record: dict) -> None:
     if not record.get('is_remote'):
         return
     mode = str(record.get('traffic_collect_mode') or '').strip().lower()
-    if mode not in ('docker', 'lucky') and not record.get('estimate_upload_enabled'):
+    if mode != 'lucky':
         return
     emby_playback_upload_sync.resolve_upload_bytes(
         instance_name,
@@ -499,6 +516,8 @@ def _new_record(instance_name: str, store: dict, session: dict) -> dict:
     _apply_watch_snapshot(record, snap)
     bucket = _runtime_bucket(instance_name)
     sid = record.get('emby_session_id')
+    if bucket.get('post_recovery_playback_window'):
+        record['started_after_recovery'] = True
     if sid:
         bucket[f'sid:{sid}'] = rid
     bucket[f'track:{_segment_key(record)}'] = rid
@@ -911,6 +930,161 @@ def _transfer_browse_on_item_change(instance_name: str, session: dict) -> None:
         )
 
 
+def _record_persist_key(record: dict) -> str:
+    from emby.traffic.filter import playback_accumulator_key
+    key = str(record.get('upload_accumulator_key') or '').strip()
+    if not key:
+        key = playback_accumulator_key(record) or ''
+    return key
+
+
+def _pre_restart_upload_total(instance_name: str, record: dict) -> int:
+    """程序重启结案：仅取重启前已统计的上行（不含停机窗口 Lucky 补录）。"""
+    booked = max(0, int(record.get('estimated_upload_bytes') or 0))
+    chk = max(0, int(record.get('live_upload_checkpoint_bytes') or 0))
+    restorable = max(0, chk - booked)
+    key = _record_persist_key(record)
+    db_extra = 0
+    if key:
+        try:
+            import emby.traffic.db as emby_traffic_db
+            db_upload = emby_traffic_db.load_session_upload_accumulators(
+                instance_name,
+            )
+            db_val = max(0, int(db_upload.get(key) or 0))
+            db_extra = max(0, db_val - restorable)
+        except Exception:
+            pass
+    return max(booked + restorable + db_extra, chk, booked)
+
+
+def _session_matches_recovery_continuing(record: dict, session: dict) -> bool:
+    """重启后续传：同用户、同 sid、同 item，且 Emby 仍为当前播放会话。"""
+    if not record or not session:
+        return False
+    rec_item = str(record.get('item_id') or '').strip()
+    live_item = str(session.get('item_id') or '').strip()
+    if rec_item and live_item and rec_item != live_item:
+        return False
+    rec_sid = str(record.get('emby_session_id') or '').strip()
+    live_sid = str(session.get('id') or '').strip()
+    if rec_sid and live_sid and rec_sid != live_sid:
+        return False
+    rec_uid = str(record.get('user_id') or '').strip()
+    live_uid = str(session.get('user_id') or '').strip()
+    if rec_uid and live_uid and rec_uid != live_uid:
+        return False
+    rec_user = str(record.get('user_name') or '').strip().casefold()
+    live_user = str(session.get('user_name') or '').strip().casefold()
+    if rec_user and live_user and rec_user != live_user:
+        return False
+    if not EmbyClient.is_current_playback_session(session):
+        return False
+    return bool(rec_sid or rec_item or (rec_user and rec_uid))
+
+
+def _find_continuing_session_for_record(
+    sessions: list,
+    record: dict,
+) -> Optional[dict]:
+    for raw in sessions or []:
+        prepared = _prepare_session(raw)
+        if _session_matches_recovery_continuing(record, prepared):
+            return prepared
+    return None
+
+
+def _restart_recovery_finalize_unlocked(
+    instance_name: str,
+    store: dict,
+    record: dict,
+) -> None:
+    """程序重启：非续传 open 段按重启前流量结案，不吸收停机 Lucky 增量。"""
+    if record.get('status') != 'playing':
+        return
+    pre_total = _pre_restart_upload_total(instance_name, record)
+    if pre_total > 0:
+        record['estimated_upload_bytes'] = pre_total
+    record['status'] = 'ended'
+    record['stopped_at'] = _utc_now_iso()
+    record['settle_reason'] = 'restart_recovery'
+    snap = emby_watch_progress.snapshot_for_record(instance_name, record)
+    if snap:
+        _apply_watch_snapshot(record, snap)
+    emby_watch_progress.finalize_watch_to_event(instance_name, record)
+    if not record.get('played_seconds'):
+        wall = _estimate_played_wall_seconds(record)
+        if wall:
+            record['played_seconds'] = wall
+    start_pos = record.get('start_position_seconds')
+    end_pos = record.get('end_position_seconds')
+    if start_pos is not None and (end_pos is None or int(end_pos or 0) <= 0):
+        played = int(record.get('played_seconds') or 0)
+        if played > 0:
+            record['end_position_seconds'] = max(0, int(start_pos)) + played
+    if pre_total > 0:
+        _persist_upload_fact(instance_name, record)
+    try:
+        import emby.traffic.playback as emby_playback_traffic
+        emby_playback_traffic.on_playback_segment_finalized(
+            instance_name, record,
+        )
+        emby_playback_traffic.release_segment_upload_state(
+            instance_name, record,
+        )
+    except Exception as e:
+        logger.debug(
+            f'[Playback:{instance_name}] 程序重启结案清理失败: {e}',
+        )
+    emby_watch_progress.reset_tracker_for_record(instance_name, record)
+    bucket = _runtime_bucket(instance_name)
+    _clear_pending_stop(bucket, record)
+    if record.get('emby_session_id'):
+        bucket.pop(f'sid:{record["emby_session_id"]}', None)
+    record.pop('live_upload_checkpoint_bytes', None)
+    logger.info(
+        f'[Playback:{instance_name}] 播放段程序重启结案 rid={record.get("id")} '
+        f'sid={record.get("emby_session_id") or "?"} upload={pre_total}',
+    )
+
+
+def run_recovery_scan(instance_name: str, sessions: list) -> Set[str]:
+    """进程重启后：匹配则续传；否则按重启前流量立即结案。返回续传 persist_key 集合。"""
+    name = (instance_name or '').strip()
+    if not name:
+        return set()
+    continuing_keys: Set[str] = set()
+    changed = False
+    with _lock:
+        store = _load_store(name)
+        for record in list(store.get('records') or []):
+            if record.get('status') != 'playing':
+                continue
+            if not record.get('is_remote'):
+                continue
+            mode = str(record.get('traffic_collect_mode') or '').strip().lower()
+            if mode != 'lucky':
+                continue
+            if _find_continuing_session_for_record(sessions, record) is not None:
+                key = _record_persist_key(record)
+                if key:
+                    continuing_keys.add(key)
+                if not record.get('resumed_after_recovery'):
+                    record['resumed_after_recovery'] = True
+                    changed = True
+                continue
+            _restart_recovery_finalize_unlocked(name, store, record)
+            changed = True
+        if changed:
+            records = store.get('records') or []
+            playing = [r for r in records if r.get('status') == 'playing']
+            others = [r for r in records if r.get('status') != 'playing']
+            others.sort(key=_ended_record_sort_key, reverse=True)
+            store['records'] = (playing + others)[:MAX_STORED_RECORDS]
+            _save_store(store, immediate=True)
+    return continuing_keys
+
+
 def tick_from_sessions(instance_name: str, sessions: list, *,
                        api_online: bool = True,
                        return_store: bool = False):
@@ -996,11 +1170,7 @@ def tick_from_sessions(instance_name: str, sessions: list, *,
             if (
                 record.get('status') == 'playing'
                 and record.get('is_remote')
-                and (
-                    record.get('estimate_upload_enabled')
-                    or str(record.get('traffic_collect_mode') or '').strip().lower()
-                    in ('docker', 'lucky')
-                )
+                and str(record.get('traffic_collect_mode') or '').strip().lower() == 'lucky'
             ):
                 try:
                     import emby.traffic.playback as emby_playback_traffic

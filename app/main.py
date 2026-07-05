@@ -4,7 +4,7 @@ import signal
 import logging
 from logging.handlers import RotatingFileHandler
 
-from log_reader import resolve_app_log_path
+from core.log_reader import resolve_app_log_path
 
 _LOG_LEVEL_NAME = os.environ.get('APP_LOG_LEVEL', 'INFO').upper()
 _LOG_LEVEL = getattr(logging, _LOG_LEVEL_NAME, logging.INFO)
@@ -33,13 +33,13 @@ logger = logging.getLogger(__name__)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import traffic_db
-import emby_traffic_db
-import playback_record_store
-from scheduler import TrafficMonitor
-from emby_scheduler import EmbyMonitor
+import qb.traffic_db as traffic_db
+import emby.traffic.db as emby_traffic_db
+import emby.records.store as playback_record_store
+from qb.scheduler import TrafficMonitor
+from emby.scheduler import EmbyMonitor
 from web.server import init_web_server, run_web_server
-import config_manager
+import core.config_manager as config_manager
 
 _runtime = {}
 

@@ -63,10 +63,10 @@ def logout_user():
 
 
 def verify_credentials(username: str, password: str) -> bool:
-    from secrets_store import get_web_username, verify_web_password
+    from core.secrets_store import get_web_username, verify_web_password
     return username == get_web_username() and verify_web_password(password)
 
 
 def get_session_username() -> str:
-    from secrets_store import get_web_username
+    from core.secrets_store import get_web_username
     return str(session.get('username') or get_web_username() or '').strip()

@@ -28,6 +28,7 @@ env/
 # 日志
 *.log
 *.log.*
+app/debug*.log
 
 # 本地/敏感配置
 .env

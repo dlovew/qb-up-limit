@@ -9561,7 +9561,11 @@ function renderGlobalSettingsForm(g) {
                     <tbody>
                         <tr>
                             <td><code>data/traffic.db</code></td>
-                            <td>存采集流量的数据库，备份前先停止服务</td>
+                            <td>qB 数据库；备份前请先停止服务</td>
+                        </tr>
+                        <tr>
+                            <td><code>data/emby_traffic.db</code></td>
+                            <td>Emby 数据库；备份前请先停止服务</td>
                         </tr>
                         <tr>
                             <td><code>data/config.yaml</code></td>
@@ -9569,7 +9573,7 @@ function renderGlobalSettingsForm(g) {
                         </tr>
                         <tr>
                             <td><code>data/app.log</code></td>
-                            <td>日志文件</td>
+                            <td>系统运行日志</td>
                         </tr>
                     </tbody>
                 </table>

@@ -7,26 +7,26 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import traffic_db
-import emby_traffic_db
-import emby_user_sync
-import playback_record_store
-import config_manager
-from scheduler import clamp_interval
-from log_reader import get_system_logs
-from cycle import iter_cycle_periods
+import qb.traffic_db as traffic_db
+import emby.traffic.db as emby_traffic_db
+import emby.user_sync as emby_user_sync
+import emby.records.store as playback_record_store
+import core.config_manager as config_manager
+from qb.scheduler import clamp_interval
+from core.log_reader import get_system_logs
+from core.cycle import iter_cycle_periods
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
-from qb_monitor import (
+from qb.monitor import (
     run_connection_test,
     run_speed_limit_test,
     estimate_test_timeout,
 )
 from web.auth import init_auth, login_user, logout_user, verify_credentials, get_session_username
 
-from emby_client import EmbyClient, is_playback_browse_server_log_message, parse_emby_log_line, DEFAULT_SESSION_MESSAGE_TIMEOUT_MS
-from syslog_localize import localize_system_log_entry
+from emby.client import EmbyClient, is_playback_browse_server_log_message, parse_emby_log_line, DEFAULT_SESSION_MESSAGE_TIMEOUT_MS
+from core.syslog_localize import localize_system_log_entry
 
 logger = logging.getLogger(__name__)
 
@@ -894,7 +894,7 @@ def api_user_device_prefs_get():
         username = get_session_username()
         if not username:
             return jsonify({'success': False, 'error': '未登录', 'auth_required': True}), 401
-        import user_prefs_store
+        import core.user_prefs_store as user_prefs_store
         return jsonify({
             'success': True,
             'data': user_prefs_store.get_device_prefs(username),
@@ -913,7 +913,7 @@ def api_user_device_prefs_update():
         data = request.get_json()
         if not isinstance(data, dict):
             return jsonify({'success': False, 'error': '请求无效'}), 400
-        import user_prefs_store
+        import core.user_prefs_store as user_prefs_store
         saved = user_prefs_store.update_device_prefs(username, data)
         return jsonify({'success': True, 'data': saved})
     except ValueError as e:
@@ -1217,7 +1217,7 @@ def api_emby_playback_records():
     if err:
         return err
     try:
-        import playback_record_store
+        import emby.records.store as playback_record_store
         instance_name = request.args.get('instance')
         limit = min(int(request.args.get('limit', 200)), playback_record_store.MAX_STORED_RECORDS)
         if instance_name:
@@ -1335,7 +1335,7 @@ def api_emby_playback_stats(instance_name, period):
         if not inst:
             return jsonify({'success': False, 'error': '设备不存在'}), 404
         all_users = user_name == emby_traffic_db.PLAYBACK_ALL_USERS_TOKEN
-        import emby_browse_upload_stats as browse_stats
+        import emby.browse.stats as browse_stats
         credit_browse = browse_stats.resolve_instance_credit_browse(inst)
         browse_kw = {'credit_browse': credit_browse}
         if period == 'hourly':
@@ -1415,8 +1415,8 @@ def api_emby_playback_stats(instance_name, period):
                     **browse_kw,
                 )
         elif period == 'cycle':
-            from config_manager import DEFAULT_CYCLE, get_global_config
-            from cycle import iter_cycle_periods
+            from core.config_manager import DEFAULT_CYCLE, get_global_config
+            from core.cycle import iter_cycle_periods
             from zoneinfo import ZoneInfo
             tz_name = get_global_config(emby_monitor.config).get(
                 'timezone', 'Asia/Shanghai',
@@ -1630,7 +1630,7 @@ def api_emby_config_instances_test():
                             'error': result.get('error')})
 
         if test_type in ('lucky', 'lucky_rules', 'lucky_connect'):
-            from emby_lucky import (
+            from emby.lucky.api import (
                 LuckyClient,
                 auto_match_candidate,
                 build_rule_label,

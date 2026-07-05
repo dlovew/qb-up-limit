@@ -726,6 +726,9 @@ function switchTab(tab) {
     const prevTab = currentTab;
     currentTab = tab;
     sessionStorage.setItem(TAB_STORAGE_KEY, tab);
+    if (prevTab === 'stats' && tab !== 'stats') {
+        destroyTrafficCharts();
+    }
     if (tab === 'devices' && typeof handleDevicesTabViewOnSwitch === 'function') {
         handleDevicesTabViewOnSwitch(prevTab);
     }
@@ -7044,6 +7047,7 @@ function mountTrafficPieCharts({
         responsive: true,
         maintainAspectRatio: false,
         animation: animate ? { duration: 650, easing: 'easeInOutQuart' } : false,
+        animations: { resize: { duration: 0 } },
         cutout: pieMetrics.cutout,
         layout: { padding: pieMetrics.piePad },
         plugins: {
@@ -7263,6 +7267,7 @@ function renderChart(uploadData, downloadData, period, instanceName, animate = f
         responsive: true,
         maintainAspectRatio: false,
         animation: animate,
+        animations: { resize: { duration: 0 } },
         layout: { padding: layoutPadding },
         interaction: { mode: 'index', intersect: false },
         plugins: {

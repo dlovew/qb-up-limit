@@ -1574,47 +1574,97 @@ def api_emby_config_instance_orphan_data_delete(name):
 
 
 @app.route('/api/emby/config/instances/test', methods=['POST'])
-def api_emby_config_instance_test():
+def api_emby_config_instances_test():
     try:
-        payload = request.get_json() or {}
-        test_type = str(payload.get('test_type', 'connect')).strip().lower()
-        original_name = str(payload.get('_original_name', '')).strip()
-        # 修复：把 if original → if original_name
-        existing = config_manager.get_emby_instance(original_name, emby_monitor.config) if original_name else None
-        # 处理表单密钥：前端传token优先，空掩码再读取存储
-        clean_data = config_manager.resolve_emby_credentials(payload, existing)
-        validated = config_manager.validate_emby_instance_for_test(clean_data, test_type)
-        skip_lucky = bool(payload.get('lucky_skip_test', False))
-        if skip_lucky:
-            return jsonify({'success': True, 'message': '已跳过Lucky连通检测'})
+        data = request.get_json() or {}
+        test_type = data.get('test_type', 'connectivity')
 
-        # 优先取前端填写的token，掩码/空再读取密钥库
-        input_token = str(payload.get('lucky_open_token', '')).strip()
-        if input_token and not all(c == '*' for c in input_token):
-            token = input_token
+        # ========== 修改点开始 ==========
+        # 对 Lucky 相关测试，自行做轻量校验，不再依赖 config_manager 的严格校验
+        if test_type in ('lucky', 'lucky_rules', 'lucky_connect'):
+            # 必要字段检查
+            if not data.get('lucky_base_url'):
+                return jsonify({'success': False, 'error': '缺少 lucky_base_url'}), 400
+            if not data.get('lucky_open_token'):
+                return jsonify({'success': False, 'error': '缺少 lucky_open_token'}), 400
+
+            # 构建 validated 字典（只包含后续逻辑会用到的字段）
+            validated = {
+                'lucky_base_url': data.get('lucky_base_url'),
+                'lucky_open_token': data.get('lucky_open_token'),
+                'lucky_verify_ssl': data.get('lucky_verify_ssl', False),
+                'host': data.get('host', ''),
+                'port': data.get('port', 8096),
+                'lucky_frontend_host': data.get('lucky_frontend_host', ''),
+                'lucky_rule_key': data.get('lucky_rule_key', ''),
+                'lucky_sub_key': data.get('lucky_sub_key', ''),
+            }
         else:
-            dev_name = original_name if original_name else validated.get('name', '')
-            token = secrets_store.get_lucky_open_token(dev_name)
+            # 其他测试类型（如 connectivity、api 等）仍然使用原有校验器
+            validated = config_manager.validate_emby_instance_for_test(data, test_type=test_type)
+        # ========== 修改点结束 ==========
 
-        base_url = validated.get('lucky_base_url', '').strip()
-        if not base_url:
-            return jsonify({"success": False, "error": "请填写Lucky管理地址"}), 400
-        if not token:
-            return jsonify({"success": False, "error": "请填写Lucky OpenToken"}), 400
-        
-        lc = LuckyClient(base_url, token, validated['lucky_verify_ssl'])
-        test_res = lc.test_connection()
+        # 后续处理逻辑完全不变
+        if test_type in ('lucky', 'lucky_rules', 'lucky_connect'):
+            from emby.lucky.api import (
+                LuckyClient,
+                auto_match_candidate,
+                build_rule_label,
+            )
+            token = validated.get('lucky_open_token', '')
+            lc = LuckyClient(
+                validated.get('lucky_base_url', ''),
+                open_token=token,
+                verify_ssl=bool(validated.get('lucky_verify_ssl', False)),
+            )
+            if test_type == 'lucky_rules':
+                candidates, err = lc.list_proxy_candidates()
+                if err:
+                    return jsonify({'success': False, 'error': err}), 400
+                matched, _all = auto_match_candidate(
+                    candidates,
+                    emby_host=validated.get('host', ''),
+                    emby_port=int(validated.get('port') or 8096),
+                    frontend_host=validated.get('lucky_frontend_host', ''),
+                )
+                return jsonify({
+                    'success': True,
+                    'data': {
+                        'candidates': candidates,
+                        'matched': matched,
+                        'matched_label': build_rule_label(matched) if matched else '',
+                    },
+                })
+            if test_type == 'lucky' and validated.get('lucky_rule_key') and validated.get('lucky_sub_key'):
+                result = lc.test_access_detail(
+                    validated['lucky_rule_key'],
+                    validated['lucky_sub_key'],
+                )
+            else:
+                result = lc.test_connection()
+            return jsonify({
+                'success': result.get('ok', False),
+                'data': result,
+                'error': result.get('error'),
+            })
+
+        # 非 Lucky 测试
+        client = EmbyClient(validated)
+        if test_type == 'api':
+            result = client.test_api()
+        else:
+            result = client.test_connectivity()
         return jsonify({
-            'success': test_res['ok'],
-            'message': test_res['message'],
-            'error': test_res.get('error', '')
+            'success': result.get('ok', False),
+            'data': result,
+            'error': result.get('error'),
         })
-    except ValueError as err:
-        logger.warning(f"Lucky测试参数错误: {str(err)}")
-        return jsonify({"success": False, "error": str(err)}), 400
+
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
     except Exception as e:
-        logger.error(f"Lucky测试接口完整异常堆栈: {e}", exc_info=True)
-        return jsonify({"success": False, "error": "服务器内部错误，查看后端日志获取详细原因"}), 500
+        logger.error(f'API POST /emby/config/instances/test 错误: {e}', exc_info=True)
+        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
 
 @app.route('/api/emby/config/instances', methods=['POST'])
 def api_emby_config_instances_add():

@@ -1577,18 +1577,33 @@ def api_emby_config_instance_orphan_data_delete(name):
 def api_emby_config_instance_test():
     try:
         payload = request.get_json() or {}
-        test_type = str(payload.get('test_type', 'connect')).strip().lower()
+        test_type = str(payload.get('connect', 'connect')).strip().lower()
         original_name = str(payload.get('_original_name', '')).strip()
         existing = config_manager.get_emby_instance(original_name, emby_monitor.config) if original else None
+        # 处理表单密钥：前端传了token就用前端值，没传再去secrets读取
         clean_data = config_manager.resolve_emby_credentials(payload, existing)
-        # 无Lucky参数直接跳过检测，不抛400
-        if not clean_data.get('lucky_base_url') or not clean_data.get('lucky_open_token'):
-            return jsonify({"success": True, "message": "未填写Lucky配置，已跳过连通检测"})
-        validated = config_manager.validate_emby_instance(clean_data, test_type)
+        validated = config_manager.validate_emby_instance_for_test(clean_data, test_type)
         skip_lucky = bool(payload.get('lucky_skip_test', False))
         if skip_lucky:
             return jsonify({'success': True, 'message': '已跳过Lucky连通检测'})
-        lc = LuckyClient(validated['lucky_base_url'], secrets_store.get_lucky_open_token(original_name or validated['name']), validated['lucky_verify_ssl'])
+
+        # 优先使用前端提交的token，前端掩码/空时再读取存储
+        input_token = str(payload.get('lucky_open_token', '')).strip()
+        if input_token and not all(c == '*' for c in input_token):
+            token = input_token
+        else:
+            # 取设备名兜底
+            dev_name = original_name if original_name else validated.get('name', '')
+            token = secrets_store.get_lucky_open_token(dev_name)
+
+        base_url = validated.get('lucky_base_url', '').strip()
+        if not base_url:
+            return jsonify({"success": False, "error": "请填写Lucky管理地址"}), 400
+        if not token:
+            return jsonify({"success": False, "error": "请填写Lucky OpenToken"}), 400
+        
+        # 正常创建客户端测试，不跳过逻辑
+        lc = LuckyClient(base_url, token, validated['lucky_verify_ssl'])
         test_res = lc.test_connection()
         return jsonify({
             'success': test_res['ok'],
@@ -1596,10 +1611,11 @@ def api_emby_config_instance_test():
             'error': test_res.get('error', '')
         })
     except ValueError as err:
+        logger.warning(f"Lucky测试参数错误: {str(err)}")
         return jsonify({"success": False, "error": str(err)}), 400
     except Exception as e:
-        logger.error(f"Emby Lucky测试异常: {e}", exc_info=True)
-        return jsonify({"success": False, "error": _GENERIC_API_ERROR}), 500
+        logger.error(f"Lucky测试接口完整异常堆栈: {e}", exc_info=True)
+        return jsonify({"success": False, "error": "服务器内部错误，查看后端日志获取详细原因"}), 500
 
 @app.route('/api/emby/config/instances', methods=['POST'])
 def api_emby_config_instances_add():

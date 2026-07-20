@@ -1574,72 +1574,32 @@ def api_emby_config_instance_orphan_data_delete(name):
 
 
 @app.route('/api/emby/config/instances/test', methods=['POST'])
-def api_emby_config_instances_test():
+def api_emby_config_instance_test():
     try:
-        data = request.get_json() or {}
-        test_type = data.get('test_type', 'connectivity')
-        validated = config_manager.validate_emby_instance_for_test(
-            data, test_type=test_type)
-
-        if test_type in ('lucky', 'lucky_rules', 'lucky_connect'):
-            from emby.lucky.api import (
-                LuckyClient,
-                auto_match_candidate,
-                build_rule_label,
-            )
-            token = validated.get('lucky_open_token', '')
-            lc = LuckyClient(
-                validated.get('lucky_base_url', ''),
-                open_token=token,
-                verify_ssl=bool(validated.get('lucky_verify_ssl', False)),
-            )
-            if test_type == 'lucky_rules':
-                candidates, err = lc.list_proxy_candidates()
-                if err:
-                    return jsonify({'success': False, 'error': err}), 400
-                matched, _all = auto_match_candidate(
-                    candidates,
-                    emby_host=validated.get('host', ''),
-                    emby_port=int(validated.get('port') or 8096),
-                    frontend_host=validated.get('lucky_frontend_host', ''),
-                )
-                return jsonify({
-                    'success': True,
-                    'data': {
-                        'candidates': candidates,
-                        'matched': matched,
-                        'matched_label': build_rule_label(matched) if matched else '',
-                    },
-                })
-            if test_type == 'lucky' and validated.get('lucky_rule_key') and validated.get('lucky_sub_key'):
-                result = lc.test_access_detail(
-                    validated['lucky_rule_key'],
-                    validated['lucky_sub_key'],
-                )
-            else:
-                result = lc.test_connection()
-            return jsonify({
-                'success': result.get('ok', False),
-                'data': result,
-                'error': result.get('error'),
-            })
-
-        client = EmbyClient(validated)
-        if test_type == 'api':
-            result = client.test_api()
-        else:
-            result = client.test_connectivity()
+        payload = request.get_json() or {}
+        test_type = str(payload.get('test_type', 'connect')).strip().lower()
+        original_name = str(payload.get('_original_name', '')).strip()
+        existing = config_manager.get_emby_instance(original_name, emby_monitor.config) if original else None
+        clean_data = config_manager.resolve_emby_credentials(payload, existing)
+        # 无Lucky参数直接跳过检测，不抛400
+        if not clean_data.get('lucky_base_url') or not clean_data.get('lucky_open_token'):
+            return jsonify({"success": True, "message": "未填写Lucky配置，已跳过连通检测"})
+        validated = config_manager.validate_emby_instance(clean_data, test_type)
+        skip_lucky = bool(payload.get('lucky_skip_test', False))
+        if skip_lucky:
+            return jsonify({'success': True, 'message': '已跳过Lucky连通检测'})
+        lc = LuckyClient(validated['lucky_base_url'], secrets_store.get_lucky_open_token(original_name or validated['name']), validated['lucky_verify_ssl'])
+        test_res = lc.test_connection()
         return jsonify({
-            'success': result.get('ok', False),
-            'data': result,
-            'error': result.get('error'),
+            'success': test_res['ok'],
+            'message': test_res['message'],
+            'error': test_res.get('error', '')
         })
-    except ValueError as e:
-        return jsonify({'success': False, 'error': str(e)}), 400
+    except ValueError as err:
+        return jsonify({"success": False, "error": str(err)}), 400
     except Exception as e:
-        logger.error(f'API POST /emby/config/instances/test 错误: {e}', exc_info=True)
-        return jsonify({'success': False, 'error': _GENERIC_API_ERROR}), 500
-
+        logger.error(f"Emby Lucky测试异常: {e}", exc_info=True)
+        return jsonify({"success": False, "error": _GENERIC_API_ERROR}), 500
 
 @app.route('/api/emby/config/instances', methods=['POST'])
 def api_emby_config_instances_add():

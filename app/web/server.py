@@ -1577,22 +1577,22 @@ def api_emby_config_instance_orphan_data_delete(name):
 def api_emby_config_instance_test():
     try:
         payload = request.get_json() or {}
-        test_type = str(payload.get('connect', 'connect')).strip().lower()
+        test_type = str(payload.get('test_type', 'connect')).strip().lower()
         original_name = str(payload.get('_original_name', '')).strip()
-        existing = config_manager.get_emby_instance(original_name, emby_monitor.config) if original else None
-        # 处理表单密钥：前端传了token就用前端值，没传再去secrets读取
+        # 修复：把 if original → if original_name
+        existing = config_manager.get_emby_instance(original_name, emby_monitor.config) if original_name else None
+        # 处理表单密钥：前端传token优先，空掩码再读取存储
         clean_data = config_manager.resolve_emby_credentials(payload, existing)
         validated = config_manager.validate_emby_instance_for_test(clean_data, test_type)
         skip_lucky = bool(payload.get('lucky_skip_test', False))
         if skip_lucky:
             return jsonify({'success': True, 'message': '已跳过Lucky连通检测'})
 
-        # 优先使用前端提交的token，前端掩码/空时再读取存储
+        # 优先取前端填写的token，掩码/空再读取密钥库
         input_token = str(payload.get('lucky_open_token', '')).strip()
         if input_token and not all(c == '*' for c in input_token):
             token = input_token
         else:
-            # 取设备名兜底
             dev_name = original_name if original_name else validated.get('name', '')
             token = secrets_store.get_lucky_open_token(dev_name)
 
@@ -1602,7 +1602,6 @@ def api_emby_config_instance_test():
         if not token:
             return jsonify({"success": False, "error": "请填写Lucky OpenToken"}), 400
         
-        # 正常创建客户端测试，不跳过逻辑
         lc = LuckyClient(base_url, token, validated['lucky_verify_ssl'])
         test_res = lc.test_connection()
         return jsonify({

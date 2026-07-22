@@ -188,6 +188,18 @@ def detect_external_limit_change(qb_client, cycle_uploaded_bytes: int,
     if current_kbps == expected_kbps:
         return False
 
+    # 实际限速值属于某条达量规则的设定值（即便来自已被超越的低档规则，
+    # 例如当前已触发 10GB→128 的规则、但 qB 实际仍是上一步程序设的 256），
+    # 说明仍是程序自身设置的限速，应交由 check_and_apply_limit 按当前流量校正，
+    # 而不应误判为手动修改 —— 否则跨档升级(256→128)会被永久锁定在旧档限速。
+    rule_limit_values = {
+        int(r.get('speed_limit_kbps') or 0)
+        for r in qb_client.speed_rules
+        if int(r.get('speed_limit_kbps') or 0) > 0
+    }
+    if current_kbps in rule_limit_values:
+        return False
+
     if threshold_gb is not None and rule_limit_kbps == current_kbps:
         return _restore_auto_from_rule_match(
             qb_client,

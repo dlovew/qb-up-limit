@@ -160,17 +160,30 @@ def build_rule_label(candidate: dict) -> str:
 
 
 class LuckyClient:
+    # Lucky「面板安全入口」会在整个 API 路径前插入一段前缀（如 /lucky666）。
+    # 该前缀由用户在实例配置中填写（lucky_api_prefix），旧版无前缀则留空。
     def __init__(
         self,
         base_url: str,
         open_token: str = '',
         verify_ssl: bool = False,
         timeout: float = _DEFAULT_TIMEOUT,
+        api_prefix: str = '',
     ):
         self.base_url = normalize_lucky_base_url(base_url)
         self.open_token = str(open_token or '').strip()
         self.verify_ssl = bool(verify_ssl)
         self.timeout = float(timeout or _DEFAULT_TIMEOUT)
+        # 安全入口前缀，形如 "/lucky666"；空串表示无安全入口（旧版行为）
+        self.api_prefix = self._normalize_prefix(api_prefix)
+
+    @staticmethod
+    def _normalize_prefix(value: str) -> str:
+        """把安全入口字符串规范化为 '/xxx' 形式；空或非法返回 ''。"""
+        raw = str(value or '').strip().strip('/')
+        if not raw:
+            return ''
+        return f'/{raw}'
 
     def _headers(self) -> dict:
         headers = {'Accept': 'application/json'}
@@ -183,7 +196,8 @@ class LuckyClient:
             return None, '请填写 Lucky 管理地址'
         if not self.open_token:
             return None, '请填写 OpenToken'
-        url = urljoin(f'{self.base_url}/', path.lstrip('/'))
+        full_path = f'{self.api_prefix}{path}' if self.api_prefix else path
+        url = urljoin(f'{self.base_url}/', full_path.lstrip('/'))
         query = dict(params or {})
         query['openToken'] = self.open_token
         try:
@@ -197,11 +211,13 @@ class LuckyClient:
         except requests.exceptions.SSLError:
             return None, 'SSL 证书验证失败，可取消勾选「验证 SSL 证书」'
         except requests.RequestException as exc:
-            logger.debug('Lucky 请求失败 %s: %s', path, exc)
+            logger.debug('Lucky 请求失败 %s: %s', full_path, exc)
             return None, f'无法连接 Lucky 管理接口（{exc.__class__.__name__}）'
         if resp.status_code >= 400:
             body = (resp.text or '').strip()[:120]
             detail = f'：{body}' if body else ''
+            if resp.status_code == 404 and self.api_prefix:
+                detail = f'：接口路径不存在，请检查「安全入口」是否填写正确{detail}'
             return None, f'Lucky HTTP {resp.status_code}{detail}'
         try:
             data = resp.json()

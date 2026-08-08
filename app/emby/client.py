@@ -178,6 +178,7 @@ class EmbyClient:
             self.traffic_collect_mode = ''
         self.lucky_base_url = str(config.get('lucky_base_url') or '').strip()
         self.lucky_verify_ssl = bool(config.get('lucky_verify_ssl', False))
+        self.lucky_api_prefix = str(config.get('lucky_api_prefix') or '').strip()
         self.lucky_rule_key = str(config.get('lucky_rule_key') or '').strip()
         self.lucky_sub_key = str(config.get('lucky_sub_key') or '').strip()
         self.lucky_rule_label = str(config.get('lucky_rule_label') or '').strip()

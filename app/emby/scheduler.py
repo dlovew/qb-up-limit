@@ -224,6 +224,7 @@ class EmbyInstanceWorker:
             client.lucky_base_url,
             open_token=token,
             verify_ssl=client.lucky_verify_ssl,
+            api_prefix=client.lucky_api_prefix,
         )
 
     def _lucky_wan_totals(self, res_list: list) -> tuple:

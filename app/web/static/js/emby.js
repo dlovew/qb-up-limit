@@ -3738,6 +3738,7 @@ function buildEmbyInstanceForm(inst, mode) {
     const luckyCollectEnabled = collectMode === 'lucky';
     const luckyConn = parseLuckyBaseUrl(inst);
     const luckyHostPort = formatLuckyHostPort(inst);
+    const luckyApiPrefix = String(inst?.lucky_api_prefix || '').trim();
     const luckyTokenPlaceholder = mode === 'edit' ? '留空表示不修改已保存的 OpenToken' : '必填';
     const luckyRuleOptions = (inst?.has_lucky_rule_keys || (inst?.lucky_rule_key && inst?.lucky_sub_key))
         ? `<option value="__saved__" selected>${escapeHtml(inst.lucky_rule_label || '已选规则')}</option>`
@@ -3833,6 +3834,13 @@ function buildEmbyInstanceForm(inst, mode) {
                             <p class="form-hint form-hint--field">Lucky 管理后台生成的 OpenToken；编辑时留空表示不修改</p>
                         </div>
                         <div class="form-field">
+                            <label>安全入口
+                                <input type="text" id="${prefix}EmbyLuckyApiPrefix" value="${escapeHtml(luckyApiPrefix)}"
+                                       placeholder="如 lucky666，无则留空" />
+                            </label>
+                            <p class="form-hint form-hint--field">Lucky 面板「安全入口」设置。若配置了入口前缀（如 /lucky666），此处需填写，接口请求将自动拼接为 /lucky666/api/...；无安全入口则留空</p>
+                        </div>
+                        <div class="form-field">
                             <div class="form-row form-row--checkboxes">
                                 <label class="checkbox-label">
                                     <input type="checkbox" id="${prefix}EmbyLuckyHttps" ${luckyConn.use_https ? 'checked' : ''} /> 使用 HTTPS
@@ -3926,6 +3934,7 @@ function collectEmbyLuckyFormFields(prefix) {
     const luckyBaseUrl = host ? `${useHttps ? 'https' : 'http'}://${host}:${port}` : '';
     return {
         lucky_base_url: luckyBaseUrl,
+        lucky_api_prefix: String(document.getElementById(`${prefix}EmbyLuckyApiPrefix`)?.value || '').trim(),
         lucky_verify_ssl: !!document.getElementById(`${prefix}EmbyLuckyVerifySsl`)?.checked,
         lucky_frontend_host: String(document.getElementById(`${prefix}EmbyLuckyFrontendHost`)?.value || '').trim(),
         lucky_open_token: String(document.getElementById(`${prefix}EmbyLuckyOpenToken`)?.value || '').trim(),

@@ -112,6 +112,7 @@ DEFAULT_EMBY_INSTANCE = {
     'wan_traffic_only': True,
     'traffic_collect_mode': '',
     'lucky_base_url': '',
+    'lucky_api_prefix': '',
     'lucky_verify_ssl': False,
     'lucky_rule_key': '',
     'lucky_sub_key': '',
@@ -1105,7 +1106,7 @@ def instance_only_basics_changed(existing: dict, updated: dict) -> bool:
 _EMBY_CONNECTION_KEYS = (
     'host', 'port', 'use_https', 'verify_ssl',
     'traffic_collect_mode',
-    'lucky_base_url', 'lucky_verify_ssl', 'lucky_rule_key', 'lucky_sub_key',
+    'lucky_base_url', 'lucky_api_prefix', 'lucky_verify_ssl', 'lucky_rule_key', 'lucky_sub_key',
     'lucky_rule_label', 'lucky_frontend_host', 'lucky_credit_browse_traffic',
 )
 

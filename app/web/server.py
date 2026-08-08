@@ -1592,6 +1592,7 @@ def api_emby_config_instances_test():
             validated = {
                 'lucky_base_url': data.get('lucky_base_url'),
                 'lucky_open_token': data.get('lucky_open_token'),
+                'lucky_api_prefix': data.get('lucky_api_prefix', ''),
                 'lucky_verify_ssl': data.get('lucky_verify_ssl', False),
                 'host': data.get('host', ''),
                 'port': data.get('port', 8096),
@@ -1616,6 +1617,7 @@ def api_emby_config_instances_test():
                 validated.get('lucky_base_url', ''),
                 open_token=token,
                 verify_ssl=bool(validated.get('lucky_verify_ssl', False)),
+                api_prefix=validated.get('lucky_api_prefix', ''),
             )
             if test_type == 'lucky_rules':
                 candidates, err = lc.list_proxy_candidates()

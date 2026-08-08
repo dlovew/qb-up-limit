@@ -81,7 +81,7 @@
 ```bash
 services:
   qb-up-limit:
-    image: luowenfu/qb-up-limit:latest
+    image: ghcr.io/dlovew/qb-up-limit:main
     container_name: qb-up-limit
     restart: unless-stopped
     network_mode: host
